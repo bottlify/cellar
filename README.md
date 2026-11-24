@@ -74,10 +74,22 @@ const later = await client.call(request);
 ```
 
 One asking side and one serving side; answers come back in order, as many requests out at once as
-there are slots. `examples/call-a-worker.mjs` calls a function in a worker both ways; on a 4-core
-x86 VM, node 22: a small call 42-44 us by postMessage, 13 us by a blocking ask to a worker that
-also keeps an event loop, 3.5 us to a worker sleeping on the channel itself; a sum of 8 MiB of
-samples 4.6-5.6 ms copied by postMessage, 0.9-1.4 ms read in place.
+there are slots. A blocking ask makes no garbage: the request and answer are read where they lie.
+
+`examples/memory.mjs` calls a function in a worker by postMessage and by the channel, each arm in a
+process of its own (node 22, a 4-core x86 VM, 3 runs an arm, medians):
+
+| | postMessage | channel |
+| --- | --- | --- |
+| a small call (100 000): time | 40 us | 2.1 us |
+| collections, asking thread / worker | 80 / 34 | 8 / 0 (the 8: the process's start) |
+| peak resident memory | 99 MiB | 79 MiB |
+| 8 MiB of samples summed (200): time | 5.6 ms | 1.3 ms |
+| collections in the worker | 52 | 0 |
+| the worker's buffers at most | 32 MiB (copies) | 0 |
+| peak resident memory | 140 MiB | 77 MiB |
+
+`examples/call-a-worker.mjs` shows the same calls as a page would write them.
 
 ## Requirements
 

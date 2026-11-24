@@ -14,6 +14,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { PerformanceObserver } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
 import { ChannelClosed, createChannel, openClient, openServer } from './channel.js';
 import { GATE_SLOT_BYTES, answerTo, requestOf } from './channel-gate.fixture.js';
@@ -99,3 +100,36 @@ test('calls of a thread with an event loop, served by one that blocks', { timeou
     assert.equal((await served).served, COUNT);
     await server.terminate();
 });
+
+test('an ask makes no garbage: a call by the channel collects nothing on the asking thread',
+    { timeout: 120_000 }, async()=>{
+        // Each look at the clock while waiting was a number made on the heap:
+        // ~400 bytes a call, a collection every 20 000 calls.
+        const memory = createChannel({ slots: 4, slotBytes: 16 });
+        const server = new Worker(WORKER, { workerData: { role: 'server', memory } });
+        const served = resultOf(server);
+        const client = openClient(memory);
+        const request = new Uint8Array([1, 0, 0, 0, 2, 0, 0, 0]);
+        const options = { read: (/** @type {Uint8Array} */ answer)=>answer[0] };
+        for (let n = 0; n < 10_000; n++)
+        {
+            client.ask(request, options);
+        }
+        let collections = 0;
+        const observer = new PerformanceObserver(list=>{
+            collections += list.getEntries().length;
+        });
+        observer.observe({ entryTypes: ['gc'] });
+        let sum = 0;
+        for (let n = 0; n < 200_000; n++)
+        {
+            sum += client.ask(request, options);
+        }
+        await new Promise(resolve=>setTimeout(resolve, 50));
+        observer.disconnect();
+        client.close();
+        await served;
+        await server.terminate();
+        assert.equal(sum, 200_000 * 2, 'every answer');
+        assert.ok(collections <= 2, `${collections} collections in 200 000 asks`);
+    });

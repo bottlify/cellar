@@ -56,6 +56,8 @@ const SLOT_BYTES = 8;
 
 /** How long a side looks before it sleeps, in ms: an answer often comes sooner. */
 const SPIN_MS = 0.05;
+/** Looks between two readings of the clock while it spins, less one (a mask). */
+const SPIN_LOOKS = 255;
 
 /**
  * @typedef {Object} ChannelOptions
@@ -115,9 +117,24 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} base @param {number} n
      */
     const slotAt = (base, n)=>{
-        const at = base + ((n >>> 0) % slots) * stride;
-        return bytes.subarray(at + 4, at + 4 + words[at >> 2]);
+        const slot = (n >>> 0) % slots;
+        const at = base + slot * stride;
+        const length = words[at >> 2];
+        // A view a slot, made again only when its length changes: a call
+        // makes no garbage of its own on either side.
+        const views = base === requests ? requestViews : answerViews;
+        let view = views[slot];
+        if (view === undefined || view.length !== length)
+        {
+            view = bytes.subarray(at + 4, at + 4 + length);
+            views[slot] = view;
+        }
+        return view;
     };
+    /** @type {Uint8Array[]} */
+    const requestViews = [];
+    /** @type {Uint8Array[]} */
+    const answerViews = [];
 
     /**
      * Writes the `n`th slot of a side.
@@ -157,16 +174,27 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} seen @param {number} sleeps @param {number} deadline
      */
     const waitFor = (counter, seen, sleeps, deadline)=>{
-        const spinUntil = Math.min(deadline, clock.now() + spinMs);
-        while (!moved(counter, seen))
+        // The clock is asked once in a while, and not at all before the first
+        // few hundred looks: each answer of it is a number made on the heap,
+        // and an answer often comes sooner.
+        let spinUntil = -1;
+        for (let looks = 1; !moved(counter, seen); looks++)
         {
-            if (Atomics.load(words, CLOSED) !== 0)
+            if ((looks & SPIN_LOOKS) === 0)
             {
-                throw new ChannelClosed();
-            }
-            if (clock.now() >= spinUntil)
-            {
-                break;
+                if (Atomics.load(words, CLOSED) !== 0)
+                {
+                    throw new ChannelClosed();
+                }
+                const now = clock.now();
+                if (spinUntil < 0)
+                {
+                    spinUntil = Math.min(deadline, now + spinMs);
+                }
+                else if (now >= spinUntil)
+                {
+                    break;
+                }
             }
         }
         while (!moved(counter, seen))
@@ -307,6 +335,16 @@ export function openClient(memory, options = {}){
         taker.resolve(value);
     };
 
+    /**
+     * An ask that ran out of time: its answer, when it comes, goes to nobody.
+     *
+     * @param {number | undefined} timeoutMs @returns {never}
+     */
+    const noAnswer = timeoutMs=>{
+        waiting.push(DROPPED);
+        throw new Error(`channel: no answer in ${timeoutMs} ms`);
+    };
+
     /** @param {ArrayLike<number>} message */
     const send = message=>{
         end.writeSlot(end.requests, asked, message);
@@ -365,34 +403,33 @@ export function openClient(memory, options = {}){
                 }
                 takeAnswer();
             }
-            /** @type {{ done: boolean, value: any, failed: boolean }} */
-            const outcome = { done: false, value: undefined, failed: false };
-            const taker = {
-                read: readAnswer,
-                resolve: (/** @type {any} */ value)=>Object.assign(outcome, { done: true, value }),
-                reject: (/** @type {any} */ reason)=>
-                    Object.assign(outcome, { done: true, failed: true, value: reason }),
-            };
-            // Sent before it waits: a request refused leaves no taker behind
-            // to take the next request's answer.
+            // Sent before it waits: a request refused leaves nothing behind.
             send(message);
-            waiting.push(taker);
-            while (!outcome.done)
+            // Calls out before it are answered first: hand them theirs.
+            while (waiting.length > 0)
             {
                 if (Atomics.load(words, ANSWERED) === read
                     && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
                 {
-                    // Left in its place: the answer, when it comes, is dropped.
-                    Object.assign(taker, { read: ()=>undefined, resolve: ()=>{}, reject: ()=>{} });
-                    throw new Error(`channel: no answer in ${timeoutMs} ms`);
+                    return noAnswer(timeoutMs);
                 }
                 takeAnswer();
             }
-            if (outcome.failed)
+            if (Atomics.load(words, ANSWERED) === read
+                && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
             {
-                throw outcome.value;
+                return noAnswer(timeoutMs);
             }
-            return outcome.value;
+            const answer = end.slotAt(end.answers, read);
+            try
+            {
+                return readAnswer(answer);
+            }
+            finally
+            {
+                read = (read + 1) | 0;
+                Atomics.store(words, READ, read);
+            }
         },
 
         /**
@@ -429,6 +466,9 @@ export function openClient(memory, options = {}){
 
 /** @param {Uint8Array} bytes */
 const copy = bytes=>bytes.slice();
+
+/** Who takes the answer of an ask that gave up waiting for it. */
+const DROPPED = Object.freeze({ read: ()=>undefined, resolve: ()=>{}, reject: ()=>{} });
 
 /**
  * @typedef {(request: Uint8Array) => ArrayLike<number> | undefined | void} Handler
