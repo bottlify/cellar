@@ -1,0 +1,42 @@
+name: ci
+
+# Every push to main: the checks, the build, and, for a version no release
+# carries yet, a release with the built files.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:integration
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cellar-dist
+          path: dist/
+      - name: Release the version if it is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="v$(node -p "require('./package.json').version")"
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "$version is released already"
+            exit 0
+          fi
+          (cd dist && tar czf ../cellar-types.tar.gz types)
+          gh release create "$version" --target "$GITHUB_SHA" --title "Cellar $version" \
+            --notes "Built from $GITHUB_SHA." \
+            dist/cellar.js dist/cellar.min.js dist/checksums.json cellar-types.tar.gz
