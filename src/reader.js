@@ -34,6 +34,18 @@ import {
  * @property {(name: string) => void} drop
  */
 
+/** What a read of a hot body came to. */
+const DONE = 0;
+/** The body is cold: on the disk, not in a segment. */
+const NOT_HERE_COLD = 1;
+/** The body is in no state to be read (written, moved, retired). */
+const NOT_HOT = 2;
+/** The body is in a segment this reader has not been told of yet. */
+const UNSEEN = 3;
+
+/** Names a reader remembers the records of, at most: past it it forgets them all. */
+const KNOWN_MOST = 1 << 16;
+
 /**
  * @param {Object} options
  * @param {import('./shared.js').SharedIndex} options.shared
@@ -51,16 +63,54 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
-     * Reads `name`'s body inside `read`, where it is hot here.
+     * Names this reader found, by their record. A record is never used again
+     * for another name: one still hot or cold is still its name's (a name
+     * written anew gets a new record, and the old one is retired at its
+     * commit), and any other state sends the name to the index again. Asked
+     * first, it spares a hit the hash and the walk over the shared index.
      *
-     * @template T
-     * @param {number} id @param {(body: Uint8Array) => T} read
-     * @returns {{ done: true, value: T } | { done: false, state: 'cold' | 'unseen' | 'none' }}
+     * @type {Map<string, number>}
+     */
+    const known = new Map();
+
+    /** @param {string} name @returns {number} its record, or -1 */
+    const idOf = name=>{
+        const id = known.get(name);
+        if (id !== undefined)
+        {
+            const state = index.state(id);
+            if (state === HOT || state === COLD)
+            {
+                return id;
+            }
+            known.delete(name);
+        }
+        const found = index.find(name);
+        if (found >= 0)
+        {
+            if (known.size >= KNOWN_MOST)
+            {
+                known.clear();
+            }
+            known.set(name, found);
+        }
+        return found;
+    };
+
+    /** What the last `readHot` read, when it answered DONE. @type {any} */
+    let readValue;
+
+    /**
+     * Reads `name`'s body inside `read`, where it is hot here: DONE with the
+     * value in `readValue`, or why not. A hit makes no object of its own.
+     *
+     * @param {number} id @param {(body: Uint8Array) => any} read
+     * @returns {number} DONE, NOT_HERE_COLD, NOT_HOT or UNSEEN
      */
     const readHot = (id, read)=>{
         if (!index.enter(id))
         {
-            return { done: false, state: index.state(id) === COLD ? 'cold' : 'none' };
+            return index.state(id) === COLD ? NOT_HERE_COLD : NOT_HOT;
         }
         try
         {
@@ -68,12 +118,12 @@ export function createReader({ shared, segments = [], keeper }){
             const view = views[index.words[base + R_SEGMENT]];
             if (view === undefined || view === null)
             {
-                return { done: false, state: 'unseen' };
+                return UNSEEN;
             }
             const offset = index.words[base + R_OFFSET];
-            const value = read(view.subarray(offset, offset + index.words[base + R_LENGTH]));
+            readValue = read(view.subarray(offset, offset + index.words[base + R_LENGTH]));
             index.stamp(id);
-            return { done: true, value };
+            return DONE;
         }
         finally {
             index.leave(id);
@@ -108,7 +158,7 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name @returns {'hot' | 'cold' | null}
          */
         look(name){
-            const id = index.find(name);
+            const id = idOf(name);
             if (id < 0)
             {
                 return null;
@@ -129,25 +179,27 @@ export function createReader({ shared, segments = [], keeper }){
          * @returns {T | undefined}
          */
         with(name, read, { wait = false } = {}){
-            const id = index.find(name);
+            const id = idOf(name);
             if (id < 0)
             {
                 counts.misses++;
                 return undefined;
             }
             let got = readHot(id, read);
-            if (!got.done && got.state === 'cold' && wait && keeper.raise(name))
+            if (got === NOT_HERE_COLD && wait && keeper.raise(name))
             {
                 counts.raisedWaiting++;
                 got = readHot(id, read);
             }
-            if (got.done)
+            if (got === DONE)
             {
                 counts.hits++;
-                return got.value;
+                const value = readValue;
+                readValue = undefined;
+                return value;
             }
             counts.misses++;
-            if (got.state === 'cold')
+            if (got === NOT_HERE_COLD)
             {
                 counts.cold++;
                 if (!wait)
@@ -155,7 +207,7 @@ export function createReader({ shared, segments = [], keeper }){
                     keeper.raiseLater(name);
                 }
             }
-            else if (got.state === 'unseen')
+            else if (got === UNSEEN)
             {
                 counts.unseen++;
             }
