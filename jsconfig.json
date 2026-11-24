@@ -12,5 +12,5 @@
     "lib": ["ES2022", "DOM"],
     "types": ["node"]
   },
-  "include": ["src/**/*.js", "scripts/**/*.mjs"]
+  "include": ["src/**/*.js", "scripts/**/*.mjs", "examples/**/*.mjs"]
 }

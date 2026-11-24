@@ -6,7 +6,7 @@ bodies to the disk (the Origin Private File System) and brings them back when as
 [Bottlify](https://github.com/bottlify/bottlify), whose processes share one cache across their
 workers; nothing in it is Bottlify's.
 
-Status: the core and its concurrency gate; not yet on npm. Every version is built into a
+Status: the cache and its concurrency gate, the channel and its gate; not yet on npm. Every version is built into a
 [release](https://github.com/bottlify/cellar/releases): `cellar.js`, `cellar.min.js`, the
 declarations and their checksums.
 
@@ -49,6 +49,35 @@ cache.commit('blocks/43');
 
 A body is read only inside `with`: the keeper never takes a body a reader is in. A body that can
 be made again goes away when there is no room and no disk; one marked `onlyCopy` never does.
+
+## Channel
+
+Calls between two threads without a message: a request is written where the other thread reads it,
+the answer where the asking thread reads it, each side sleeping on a shared word until rung. A
+message clones what it carries and waits for the other thread's event loop; a channel copies a
+request once and need not wait for anything but the answer. What is large is not sent at all: the
+request names where it lies (a body in the cache, a range of a shared buffer).
+
+```js
+import { createChannel, openClient, openServer } from '@bottlify/cellar';
+
+const channel = createChannel({ slots: 16, slotBytes: 4096 });   // hand it to both threads
+
+// In the worker: answer each request, read in place.
+const server = openServer(channel);
+for (;;) server.serve(request=>answerTo(request));   // blocks; serveAsync keeps the event loop
+
+// In the asking thread: blocking (a worker) or not (any thread, a page's own too).
+const client = openClient(channel);
+const answer = client.ask(request);                  // a copy, or { read } reads it in place
+const later = await client.call(request);
+```
+
+One asking side and one serving side; answers come back in order, as many requests out at once as
+there are slots. `examples/call-a-worker.mjs` calls a function in a worker both ways; on a 4-core
+x86 VM, node 22: a small call 42-44 us by postMessage, 13 us by a blocking ask to a worker that
+also keeps an event loop, 3.5 us to a worker sleeping on the channel itself; a sum of 8 MiB of
+samples 4.6-5.6 ms copied by postMessage, 0.9-1.4 ms read in place.
 
 ## Requirements
 

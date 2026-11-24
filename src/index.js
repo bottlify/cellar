@@ -12,6 +12,7 @@
 
 export { openKeeper } from './keeper.js';
 export { createReader } from './reader.js';
+export { ChannelClosed, createChannel, openClient, openServer } from './channel.js';
 
 /** @typedef {import('./keeper.js').Keeper} Keeper */
 /** @typedef {import('./keeper.js').KeeperOptions} KeeperOptions */
@@ -20,3 +21,5 @@ export { createReader } from './reader.js';
 /** @typedef {import('./reader.js').Reader} Reader */
 /** @typedef {import('./reader.js').KeeperCalls} KeeperCalls */
 /** @typedef {import('./shared.js').SharedIndex} SharedIndex */
+/** @typedef {import('./channel.js').ChannelOptions} ChannelOptions */
+/** @typedef {import('./channel.js').Handler} ChannelHandler */
