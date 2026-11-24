@@ -34,6 +34,7 @@ import {
     COLD, F_DROP, F_ONLY_COPY, F_ON_DISK, GONE, HEADER_WORDS, HOT, H_COUNT, H_NAMES, H_TICK,
     MOVING, RECORD_WORDS, RETIRED, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME, R_NAME_LENGTH,
     R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING, growableShared,
+    growTo, sharedBuffer,
     hashName, readersOf, stateOf, stateWord, viewIndex,
 } from './shared.js';
 
@@ -92,7 +93,7 @@ export async function openKeeper(options){
         records: growableShared((HEADER_WORDS + 1024 * RECORD_WORDS) * 4,
             (HEADER_WORDS + MAX_RECORDS * RECORD_WORDS) * 4),
         names: growableShared(64 * 1024, MAX_NAME_UNITS * 2),
-        table: new SharedArrayBuffer(FIRST_TABLE * 4),
+        table: sharedBuffer(FIRST_TABLE * 4),
     };
     const index = viewIndex(shared);
     const { words } = index;
@@ -138,7 +139,7 @@ export async function openKeeper(options){
         const units = shared.names.byteLength / 2;
         if (need > units)
         {
-            shared.names.grow(Math.min(MAX_NAME_UNITS, Math.max(need, units * 2)) * 2);
+            growTo(shared.names, Math.min(MAX_NAME_UNITS, Math.max(need, units * 2)) * 2);
         }
     };
 
@@ -184,7 +185,7 @@ export async function openKeeper(options){
         const bytesNeeded = (HEADER_WORDS + (id + 1) * RECORD_WORDS) * 4;
         if (bytesNeeded > shared.records.byteLength)
         {
-            shared.records.grow(Math.min(shared.records.maxByteLength,
+            growTo(shared.records, Math.min(shared.records.maxByteLength,
                 Math.max(bytesNeeded, shared.records.byteLength * 2)));
         }
         set(id, R_HASH_A, a);
@@ -241,7 +242,7 @@ export async function openKeeper(options){
         let table = index.table();
         if ((words[H_COUNT] + 1) * 2 > table.length)
         {
-            const larger = new SharedArrayBuffer(table.length * 2 * 4);
+            const larger = sharedBuffer(table.length * 2 * 4);
             const into = new Int32Array(larger);
             const mask = into.length - 1;
             for (let other = 0; other < words[H_COUNT]; other++)
@@ -280,7 +281,7 @@ export async function openKeeper(options){
         {
             return -1;
         }
-        const buffer = new SharedArrayBuffer(segmentBytes);
+        const buffer = sharedBuffer(segmentBytes);
         // A number is never given to a second buffer: a thread that has not
         // heard a segment was let go still reads through its old view, and
         // under the same number it would read another body.

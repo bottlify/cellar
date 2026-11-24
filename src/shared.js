@@ -117,11 +117,45 @@ export function hashName(name){
  */
 
 /**
+ * Whether this page can share memory between threads. Without it (a page not
+ * cross-origin isolated) every buffer is an ArrayBuffer of this thread's own,
+ * and the cache is one thread's: the keeper's and its readers', all of them
+ * here. Asked when a buffer is made, not when this module is loaded.
+ */
+export const canShare = ()=>typeof SharedArrayBuffer === 'function';
+
+/**
+ * A buffer every reader of the cache reads: shared where memory can be.
+ *
+ * @param {number} bytes @returns {SharedArrayBuffer}
+ */
+export const sharedBuffer = bytes=>/** @type {SharedArrayBuffer} */ (canShare()
+    ? new SharedArrayBuffer(bytes) : new ArrayBuffer(bytes));
+
+/**
  * @param {number} bytes @param {number} most
  * @returns {Growable}
  */
-export const growableShared = (bytes, most)=>/** @type {Growable} */ (
-    new /** @type {any} */ (SharedArrayBuffer)(bytes, { maxByteLength: most }));
+export const growableShared = (bytes, most)=>/** @type {Growable} */ (canShare()
+    ? new /** @type {any} */ (SharedArrayBuffer)(bytes, { maxByteLength: most })
+    : new /** @type {any} */ (ArrayBuffer)(bytes, { maxByteLength: most }));
+
+/**
+ * Grows a buffer of `growableShared` in place: a shared one grows, a thread's
+ * own resizes.
+ *
+ * @param {Growable} buffer @param {number} bytes
+ */
+export const growTo = (buffer, bytes)=>{
+    if (typeof buffer.grow === 'function')
+    {
+        buffer.grow(bytes);
+    }
+    else
+    {
+        /** @type {any} */ (buffer).resize(bytes);
+    }
+};
 
 /**
  * @typedef {Object} SharedIndex

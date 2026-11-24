@@ -93,8 +93,9 @@ process of its own (node 22, a 4-core x86 VM, 3 runs an arm, medians):
 
 ## Requirements
 
-`SharedArrayBuffer` (a cross-origin isolated page), growable shared buffers and
-`Atomics.waitAsync`. The disk is optional.
+`SharedArrayBuffer` (a cross-origin isolated page) and growable shared buffers for a cache every
+thread reads; without them the cache is one thread's, on buffers of its own, and works the same
+there. `Atomics.waitAsync` for a channel's asynchronous waits. The disk is optional.
 
 ## Develop
 

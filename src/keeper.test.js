@@ -226,3 +226,38 @@ test('a body larger than a segment is refused and said so', async()=>{
     assert.equal(reader.put('big', new Uint8Array(65 * KIB)), false);
     assert.equal(keeper.figures().refusedLarge, 1);
 });
+
+test('where memory cannot be shared the cache is one thread\'s, every part of it the same', async()=>{
+    // A page not cross-origin isolated has no SharedArrayBuffer: the keeper
+    // and its readers are one thread, on buffers of their own.
+    const shared = globalThis.SharedArrayBuffer;
+    // @ts-ignore -- removed for the test, put back below
+    delete globalThis.SharedArrayBuffer;
+    try
+    {
+        // Room for every body (a body takes a unit of the buddy at least).
+        const { keeper, reader, step } = await cacheOf({ disk: memoryDisk(),
+            budget: 16 * KIB * KIB, segmentBytes: KIB * KIB });
+        assert.equal(keeper.shared.records instanceof ArrayBuffer, true, 'a buffer of its own');
+        // Enough names to grow the records, the names and the table.
+        for (let n = 0; n < 3000; n++)
+        {
+            assert.equal(reader.put(`name with a long tail ${n}`, bodyOf(32, n)), true);
+        }
+        for (const n of [0, 1499, 2999])
+        {
+            assert.deepEqual(reader.with(`name with a long tail ${n}`, body=>[...body]),
+                [...bodyOf(32, n)], `body ${n} read back`);
+        }
+        // The only copy of a body cooled to the disk and raised again.
+        assert.equal(reader.put('only', bodyOf(5000, 9), { onlyCopy: true }), true);
+        step(150);
+        assert.ok(keeper.figures().cooled > 0, 'cooled');
+        assert.equal(reader.look('only'), 'cold');
+        assert.deepEqual(reader.with('only', body=>[...body], { wait: true }), [...bodyOf(5000, 9)]);
+    }
+    finally
+    {
+        globalThis.SharedArrayBuffer = shared;
+    }
+});
