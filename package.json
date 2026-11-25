@@ -13,13 +13,18 @@
     "url": "https://github.com/bottlify/cellar/issues"
   },
   "keywords": [
+    "javascript",
+    "multithreading",
+    "concurrency",
+    "shared-memory",
     "sharedarraybuffer",
     "atomics",
-    "multithreading",
+    "web-workers",
+    "worker-threads",
     "ring-buffer",
+    "zero-copy",
     "cache",
     "opfs",
-    "workers",
     "browser"
   ],
   "engines": {
