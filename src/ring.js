@@ -18,7 +18,9 @@
  * fit is refused, and the writer either tries again or waits for the reader
  * to make room. Records are bytes of any length up to `maxRecord`, each one
  * whole in the buffer -- one that would run past the end is put at the start,
- * behind a marker that says so -- so the reader is handed a view, not a copy.
+ * behind a marker that says so -- so the reader is handed a view, not a copy,
+ * and the writer may build a record where it will be read (`reserve`,
+ * `commit`) rather than copy one in.
  *
  * The indices are counts of bytes ever written and ever read, not positions:
  * the difference is what the ring holds, and an empty ring cannot be mistaken
@@ -127,27 +129,50 @@ export function openRing(memory){
     /** The reader is inside `drain`'s `take`. */
     let draining = false;
 
+    /**
+     * The reservation `reserve` holds until `commit` or `abandon`: the bytes
+     * it may publish (-1: none held), the count of bytes written it was made
+     * at, and the tail of the buffer it skips to stay whole.
+     */
+    let reserved = -1;
+    let reservedFrom = 0;
+    let reservedSkip = 0;
+
     const self = {
         capacity,
         maxRecord,
         bell,
+        /**
+         * The whole buffer of records, for the writer to build a record in
+         * where `reserve` says: `bytes[at]` up to `bytes[at + length]`.
+         */
+        bytes,
 
         /**
-         * The writer's: puts one record in, and rings the doorbell. False,
-         * and nothing written, when there is not room for it now; `RingClosed`
-         * once the ring is closed.
+         * The writer's: room for one record of up to `length` bytes, at
+         * `bytes[at]`, the offset it returns, or -1 and nothing held when
+         * there is not room now; `RingClosed` once the ring is closed. The
+         * writer fills the bytes and publishes them with `commit`, or gives
+         * the room back with `abandon`; the reader sees nothing of it before.
+         * One reservation at a time: a second before the first is committed
+         * throws.
          *
-         * @param {ArrayLike<number>} record
-         * @returns {boolean}
+         * @param {number} length
+         * @returns {number}
          */
-        write(record){
+        reserve(length){
             if (Atomics.load(control, CLOSED) !== 0)
             {
                 throw new RingClosed();
             }
-            // The bytes as long as they are now, which is what is copied.
-            const taken = bytesOf(record, 'ring');
-            const length = taken.length;
+            if (reserved >= 0)
+            {
+                throw new Error('ring: reserved again before the last reservation was committed');
+            }
+            if (!Number.isInteger(length) || length < 0)
+            {
+                throw new RangeError(`ring: a record of ${length} bytes`);
+            }
             if (length > maxRecord)
             {
                 throw new RangeError(`ring: a record of ${length} bytes is longer than ${maxRecord}`);
@@ -155,45 +180,79 @@ export function openRing(memory){
             const written = load(WRITTEN);
             const free = capacity - ((written - load(READ)) >>> 0);
             const at = written & mask;
-            const need = ALIGN + aligned(length);
             // What runs past the end is put at the start, and the tail it
             // skips is spent: a record is always whole, so it is read in place.
             const tail = capacity - at;
+            const need = ALIGN + aligned(length);
             const skip = tail < need ? tail : 0;
             if (skip + need > free)
             {
-                return false;
+                return -1;
             }
-            if (skip > 0)
-            {
-                words.setUint32(at, WRAP, true);
-            }
-            const start = (at + skip) & mask;
-            words.setUint32(start, length, true);
-            bytes.set(taken, start + ALIGN);
-            // The record is published by the index, and the index by the store
-            // being atomic: a reader that sees the new count sees the bytes.
-            Atomics.store(control, WRITTEN, (written + skip + need) | 0);
-            bell.ring();
-            return true;
+            reserved = length;
+            reservedFrom = written;
+            reservedSkip = skip;
+            return ((at + skip) & mask) + ALIGN;
         },
 
         /**
-         * The writer's, where it may block: puts one record in, waiting up to
-         * `timeoutMs` in all for the reader to make room.
+         * The writer's: publishes the first `length` bytes of the room
+         * `reserve` gave (all of it by default) as one record, and rings the
+         * doorbell. Throws where nothing is reserved or `length` is more than
+         * was; `RingClosed`, the reservation let go, once the ring is closed.
          *
-         * @param {ArrayLike<number>} record
-         * @param {number} [timeoutMs]
-         * @returns {boolean} whether it was written
+         * @param {number} [length]
          */
-        writeWaiting(record, timeoutMs){
+        commit(length = reserved){
+            if (reserved < 0)
+            {
+                throw new Error('ring: commit with nothing reserved');
+            }
+            if (!Number.isInteger(length) || length < 0 || length > reserved)
+            {
+                throw new RangeError(`ring: a commit of ${length} bytes, ${reserved} reserved`);
+            }
+            reserved = -1;
+            if (Atomics.load(control, CLOSED) !== 0)
+            {
+                throw new RingClosed();
+            }
+            const at = reservedFrom & mask;
+            // The tail skipped is marked only now: until the count moves, the
+            // reader looks at none of these bytes.
+            if (reservedSkip > 0)
+            {
+                words.setUint32(at, WRAP, true);
+            }
+            words.setUint32((at + reservedSkip) & mask, length, true);
+            // The record is published by the index, and the index by the store
+            // being atomic: a reader that sees the new count sees the bytes.
+            Atomics.store(control, WRITTEN, (reservedFrom + reservedSkip + ALIGN + aligned(length)) | 0);
+            bell.ring();
+        },
+
+        /** The writer's: gives back the room `reserve` gave, nothing published. */
+        abandon(){
+            reserved = -1;
+        },
+
+        /**
+         * The writer's, where it may block: `reserve`, waiting up to
+         * `timeoutMs` in all for the reader to make room. -1 when it timed out.
+         *
+         * @param {number} length
+         * @param {number} [timeoutMs]
+         * @returns {number}
+         */
+        reserveWaiting(length, timeoutMs){
             const deadline = deadlineOf(timeoutMs);
             for (;;)
             {
                 const room = Atomics.load(control, ROOM);
-                if (self.write(record))
+                const at = self.reserve(length);
+                if (at >= 0)
                 {
-                    return true;
+                    return at;
                 }
                 const end = waitFor(control, ROOM, room, ROOM_SLEEPS, deadline, undefined, CLOSED);
                 if (end === 'closed')
@@ -202,27 +261,28 @@ export function openRing(memory){
                 }
                 if (end === 'timed-out')
                 {
-                    return false;
+                    return -1;
                 }
             }
         },
 
         /**
-         * `writeWaiting` without blocking the thread: for a writer with an
+         * `reserveWaiting` without blocking the thread: for a writer with an
          * event loop to keep, a page's own above all.
          *
-         * @param {ArrayLike<number>} record
+         * @param {number} length
          * @param {number} [timeoutMs]
-         * @returns {Promise<boolean>} whether it was written
+         * @returns {Promise<number>}
          */
-        async writeWaitingAsync(record, timeoutMs){
+        async reserveWaitingAsync(length, timeoutMs){
             const deadline = deadlineOf(timeoutMs);
             for (;;)
             {
                 const room = Atomics.load(control, ROOM);
-                if (self.write(record))
+                const at = self.reserve(length);
+                if (at >= 0)
                 {
-                    return true;
+                    return at;
                 }
                 const end = await waitForAsync(control, ROOM, room, ROOM_SLEEPS, deadline, CLOSED);
                 if (end === 'closed')
@@ -231,9 +291,69 @@ export function openRing(memory){
                 }
                 if (end === 'timed-out')
                 {
-                    return false;
+                    return -1;
                 }
             }
+        },
+
+        /**
+         * The writer's: puts one record in, a copy of `record` as long as it
+         * is now, and rings the doorbell -- `reserve`, the copy, `commit`.
+         * False, and nothing written, when there is not room for it now;
+         * `RingClosed` once the ring is closed.
+         *
+         * @param {ArrayLike<number>} record
+         * @returns {boolean}
+         */
+        write(record){
+            const taken = bytesOf(record, 'ring');
+            const at = self.reserve(taken.length);
+            if (at < 0)
+            {
+                return false;
+            }
+            bytes.set(taken, at);
+            self.commit();
+            return true;
+        },
+
+        /**
+         * The writer's, where it may block: `write`, waiting up to
+         * `timeoutMs` in all for the reader to make room.
+         *
+         * @param {ArrayLike<number>} record
+         * @param {number} [timeoutMs]
+         * @returns {boolean} whether it was written
+         */
+        writeWaiting(record, timeoutMs){
+            const taken = bytesOf(record, 'ring');
+            const at = self.reserveWaiting(taken.length, timeoutMs);
+            if (at < 0)
+            {
+                return false;
+            }
+            bytes.set(taken, at);
+            self.commit();
+            return true;
+        },
+
+        /**
+         * `writeWaiting` without blocking the thread.
+         *
+         * @param {ArrayLike<number>} record
+         * @param {number} [timeoutMs]
+         * @returns {Promise<boolean>} whether it was written
+         */
+        async writeWaitingAsync(record, timeoutMs){
+            const taken = bytesOf(record, 'ring');
+            const at = await self.reserveWaitingAsync(taken.length, timeoutMs);
+            if (at < 0)
+            {
+                return false;
+            }
+            bytes.set(taken, at);
+            self.commit();
+            return true;
         },
 
         /**

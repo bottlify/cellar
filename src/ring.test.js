@@ -348,14 +348,21 @@ test('a record that is not bytes is refused, not cut or written as nothing', ()=
 });
 
 test('a ring\'s methods work taken off it', async()=>{
-    const { write, writeWaiting, writeWaitingAsync, drain } = openRing(createRingMemory(256));
+    const { write, writeWaiting, writeWaitingAsync, reserve, reserveWaiting, reserveWaitingAsync,
+        commit, abandon, bytes, drain } = openRing(createRingMemory(256));
     assert.equal(write(Uint8Array.of(1)), true);
+    reserve(1);
+    abandon();
+    bytes[reserveWaiting(1, 10)] = 4;
+    commit();
+    bytes[await reserveWaitingAsync(1, 10)] = 5;
+    commit();
     assert.equal(writeWaiting(Uint8Array.of(2), 10), true);
     assert.equal(await writeWaitingAsync(Uint8Array.of(3), 10), true);
     /** @type {number[]} */
     const taken = [];
-    assert.equal(drain(record=>void taken.push(record[0])), 3);
-    assert.deepEqual(taken, [1, 2, 3]);
+    assert.equal(drain(record=>void taken.push(record[0])), 5);
+    assert.deepEqual(taken, [1, 4, 5, 2, 3]);
 });
 
 test('a ring of a capacity that is not a number of bytes is refused', ()=>{
@@ -415,4 +422,150 @@ test('bytes over a buffer that cannot grow are copied as they are, nothing made 
     const taken = bytesOf(growing, 'test');
     assert.notEqual(taken, growing);
     assert.equal(taken.length, 8);
+});
+
+test('records built in the ring come out in order, whole and as long as committed, across every'
+    + ' wrap, beside records copied in', ()=>{
+    for (let seed = 1; seed <= 50; seed++)
+    {
+        const next = random(seed);
+        const ring = openRing(createRingMemory(256));
+        /** @type {Uint8Array[]} */
+        const queued = [];
+        let sent = 0;
+        for (let step = 0; step < 2000; step++)
+        {
+            const roll = next();
+            if (roll < 0.3)
+            {
+                // Room for more than is written: a record's size is what is committed.
+                const asked = Math.floor(next() * (ring.maxRecord + 1));
+                const length = Math.floor(next() * (asked + 1));
+                const at = ring.reserve(asked);
+                if (at < 0)
+                {
+                    assert.ok(queued.length > 0, 'refused only while something is held');
+                    continue;
+                }
+                assert.ok(at + asked <= ring.capacity, `seed ${seed} step ${step}: room whole`);
+                const bytes = record(sent, length);
+                ring.bytes.set(bytes, at);
+                if (next() < 0.1)
+                {
+                    ring.abandon();
+                    continue;
+                }
+                ring.commit(length);
+                queued.push(bytes);
+                sent++;
+            }
+            else if (roll < 0.55)
+            {
+                const bytes = record(sent, Math.floor(next() * (ring.maxRecord + 1)));
+                if (ring.write(bytes))
+                {
+                    queued.push(bytes);
+                    sent++;
+                }
+            }
+            else
+            {
+                const got = ring.peek();
+                assert.deepEqual(got, queued.shift() ?? null, `seed ${seed} step ${step}`);
+                if (got)
+                {
+                    ring.release();
+                }
+            }
+        }
+        ring.drain(got=>assert.deepEqual(got, queued.shift()));
+        assert.equal(queued.length, 0);
+        assert.equal(ring.held(), 0);
+    }
+});
+
+test('a reservation that would run past the end starts the buffer again, and a writer fills it'
+    + ' where it is read', ()=>{
+    const ring = openRing(createRingMemory(64));
+    // 16 bytes taken and read, then 24 more: 24 left before the end.
+    assert.equal(ring.write(new Uint8Array(12)), true);
+    ring.drain(()=>{});
+    assert.equal(ring.reserve(20), 20, 'room right after the record read');
+    ring.commit();
+    ring.drain(()=>{});
+    // A record of 24 needs 28: it starts at 0, the tail spent.
+    const at = ring.reserve(24);
+    assert.equal(at, 4, 'the record whole, at the start, behind its length');
+    ring.bytes.fill(9, at, at + 24);
+    ring.commit();
+    const got = ring.peek();
+    assert.deepEqual(got, new Uint8Array(24).fill(9));
+    assert.equal(got?.byteOffset, at, 'read where it was built');
+});
+
+test('one reservation at a time, a commit of no more than was reserved, and an abandoned one'
+    + ' gives its room back', ()=>{
+    const ring = openRing(createRingMemory(64));
+    assert.throws(()=>ring.commit(), /nothing reserved/);
+    const at = ring.reserve(ring.maxRecord);
+    assert.ok(at >= 0);
+    assert.throws(()=>ring.reserve(1), /reserved again/);
+    assert.throws(()=>ring.write(Uint8Array.of(1)), /reserved again/);
+    assert.throws(()=>ring.commit(ring.maxRecord + 1), RangeError);
+    assert.equal(ring.held(), 0, 'nothing published by a refused commit');
+    ring.abandon();
+    assert.equal(ring.held(), 0);
+    assert.throws(()=>ring.commit(), /nothing reserved/, 'nothing held after the abandon');
+    // The room is back: the largest record fits again, twice.
+    assert.ok(ring.reserve(ring.maxRecord) >= 0);
+    ring.commit(ring.maxRecord);
+    assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+    assert.equal(ring.reserve(1), -1, 'full: no room, and nothing held');
+    assert.equal(ring.drain(record=>assert.equal(record.length, ring.maxRecord)), 2);
+    assert.ok(ring.reserve(1) >= 0);
+    for (const length of [ring.maxRecord + 1, -1, 1.5, NaN, /** @type {any} */ ('4')])
+    {
+        ring.abandon();
+        assert.throws(()=>ring.reserve(length), RangeError);
+    }
+});
+
+test('a reservation the ring was closed under is published by no commit', ()=>{
+    const ring = openRing(createRingMemory(64));
+    const at = ring.reserve(8);
+    ring.bytes.fill(1, at, at + 8);
+    ring.close();
+    assert.throws(()=>ring.commit(), RingClosed);
+    assert.equal(ring.peek(), null, 'nothing to read');
+    assert.equal(ring.held(), 0);
+    assert.throws(()=>ring.reserve(8), RingClosed, 'not a second reservation: the ring is closed');
+});
+
+test('a writer waiting for room for a reservation gives up after its time holding nothing, and a'
+    + ' close ends an asynchronous wait', async()=>{
+    const ring = openRing(createRingMemory(64));
+    assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+    assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+    assert.equal(ring.reserveWaiting(1, 5), -1);
+    assert.equal(await ring.reserveWaitingAsync(1, 5), -1);
+    ring.drain(()=>{}, 1);
+    assert.ok(ring.reserveWaiting(ring.maxRecord, 5) >= 0, 'no reservation left by the waits');
+    ring.commit();
+    const waiting = ring.reserveWaitingAsync(1);
+    ring.close();
+    await assert.rejects(waiting, RingClosed);
+});
+
+test('a record growing while its writer waits for room is written as long as it was', async()=>{
+    const ring = openRing(createRingMemory(64));
+    assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+    assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+    const shared = new /** @type {any} */ (SharedArrayBuffer)(4, { maxByteLength: 64 });
+    const growing = new Uint8Array(shared);
+    const waiting = ring.writeWaitingAsync(growing);
+    shared.grow(16);
+    ring.drain(()=>{}, 1);
+    assert.equal(await waiting, true);
+    ring.drain(()=>{}, 1);
+    assert.equal(ring.peek()?.length, 4);
 });
