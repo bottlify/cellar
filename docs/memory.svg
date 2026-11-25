@@ -12,26 +12,26 @@
 </style>
 <rect class="bg" width="100%" height="100%" rx="8"/>
 <text class="title" x="16" y="30">Summing 8 MiB of samples in a worker, 200 times</text>
-<text class="note" x="16" y="52">node 22, a 4-core x86 VM, medians of 3 runs · lower is better</text>
-<text class="what" x="16" y="88">Peak resident (MiB)<tspan class="ratio" dx="10">1.8x less</tspan></text>
+<text class="note" x="16" y="52">Cellar 0.5.9, node 22, a 4-core x86 VM, medians of 3 runs · lower is better</text>
+<text class="what" x="16" y="88">Peak resident (MiB)<tspan class="ratio" dx="10">1.7x less</tspan></text>
 <text class="arm" x="112" y="114" text-anchor="end">postMessage</text>
 <rect class="plain" x="120" y="98" width="470" height="18" rx="3"/>
-<text class="value" x="598" y="114">140 </text>
+<text class="value" x="598" y="114">133 </text>
 <text class="arm" x="112" y="142" text-anchor="end">Cellar</text>
-<rect class="cellar" x="120" y="126" width="259" height="18" rx="3"/>
-<text class="value" x="387" y="142">77 </text>
-<text class="what" x="16" y="186">Worker collections<tspan class="ratio" dx="10">52 to 0</tspan></text>
+<rect class="cellar" x="120" y="126" width="272" height="18" rx="3"/>
+<text class="value" x="400" y="142">77 </text>
+<text class="what" x="16" y="186">Worker collections<tspan class="ratio" dx="10">50 to 0</tspan></text>
 <text class="arm" x="112" y="212" text-anchor="end">postMessage</text>
 <rect class="plain" x="120" y="196" width="470" height="18" rx="3"/>
-<text class="value" x="598" y="212">52 </text>
+<text class="value" x="598" y="212">50 </text>
 <text class="arm" x="112" y="240" text-anchor="end">Cellar</text>
 <rect class="cellar" x="120" y="224" width="2" height="18" rx="3"/>
 <text class="value" x="130" y="240">0 </text>
-<text class="what" x="16" y="284">Time a sum (ms)<tspan class="ratio" dx="10">4.3x less</tspan></text>
+<text class="what" x="16" y="284">Time a sum (ms)<tspan class="ratio" dx="10">4.5x less</tspan></text>
 <text class="arm" x="112" y="310" text-anchor="end">postMessage</text>
 <rect class="plain" x="120" y="294" width="470" height="18" rx="3"/>
-<text class="value" x="598" y="310">5.6 </text>
+<text class="value" x="598" y="310">5.8 </text>
 <text class="arm" x="112" y="338" text-anchor="end">Cellar</text>
-<rect class="cellar" x="120" y="322" width="109" height="18" rx="3"/>
-<text class="value" x="237" y="338">1.3 </text>
+<rect class="cellar" x="120" y="322" width="105" height="18" rx="3"/>
+<text class="value" x="233" y="338">1.3 </text>
 </svg>

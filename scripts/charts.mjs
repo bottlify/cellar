@@ -88,23 +88,23 @@ ${parts.join('\n')}
 await mkdir(DOCS, { recursive: true });
 await writeFile(join(DOCS, 'latency.svg'), chartOf({
     title: 'A round trip between two threads',
-    note: 'node 22, a 4-core x86 VM, medians of 3 runs',
+    note: 'Cellar 0.5.9, node 22, a 4-core x86 VM, medians of 3 runs',
     better: 'lower is better',
     unit: 'us',
     pairs: [
-        { what: 'A small call', plain: 40, cellar: 2.1 },
-        { what: 'An event and its answer', plain: 50, cellar: 1.6 },
+        { what: 'A small call', plain: 38, cellar: 2.2 },
+        { what: 'An event and its answer', plain: 38, cellar: 1.5 },
     ],
 }));
 await writeFile(join(DOCS, 'memory.svg'), chartOf({
     title: 'Summing 8 MiB of samples in a worker, 200 times',
-    note: 'node 22, a 4-core x86 VM, medians of 3 runs',
+    note: 'Cellar 0.5.9, node 22, a 4-core x86 VM, medians of 3 runs',
     better: 'lower is better',
     unit: '',
     pairs: [
-        { what: 'Peak resident (MiB)', plain: 140, cellar: 77 },
-        { what: 'Worker collections', plain: 52, cellar: 0 },
-        { what: 'Time a sum (ms)', plain: 5.6, cellar: 1.3 },
+        { what: 'Peak resident (MiB)', plain: 133, cellar: 77 },
+        { what: 'Worker collections', plain: 50, cellar: 0 },
+        { what: 'Time a sum (ms)', plain: 5.8, cellar: 1.3 },
     ],
 }));
 console.log('charts: docs/latency.svg, docs/memory.svg');

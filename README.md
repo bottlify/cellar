@@ -30,7 +30,7 @@ several threads. No runtime dependencies, the browser's own primitives (`SharedA
 ![Memory of a worker summing shared samples: postMessage against a channel](docs/memory.svg)
 
 The figures are `examples/call-a-worker.mjs`, `examples/memory.mjs` and `examples/ring.mjs`
-(node 22, a 4-core x86 VM, 3 runs an arm, medians); the tables below give every number. How each
+(Cellar 0.5.9, node 22, a 4-core x86 VM, 3 runs an arm, medians); the tables below give every number. How each
 mechanism works, drawn: [examples/README.md](examples/README.md).
 
 Status: the bell, the ring, the channel and the cache, each with its gate.
@@ -137,13 +137,13 @@ process of its own (node 22, a 4-core x86 VM, 3 runs an arm, medians):
 
 | | postMessage | channel |
 | --- | --- | --- |
-| a small call (100 000): time | 40 us | 2.1 us |
+| a small call (100 000): time | 38 us | 2.2 us |
 | collections, asking thread / worker | 80 / 34 | 8 / 0 (the 8: the process's start) |
-| peak resident memory | 99 MiB | 79 MiB |
-| 8 MiB of samples summed (200): time | 5.6 ms | 1.3 ms |
-| collections in the worker | 52 | 0 |
+| peak resident memory | 88 MiB | 80 MiB |
+| 8 MiB of samples summed (200): time | 5.8 ms | 1.3 ms |
+| collections in the worker | 50 | 0 |
 | the worker's buffers at most | 32 MiB (copies) | 0 |
-| peak resident memory | 140 MiB | 77 MiB |
+| peak resident memory | 133 MiB | 77 MiB |
 
 `examples/call-a-worker.mjs` shows the same calls as a page would write them.
 
@@ -195,8 +195,8 @@ terminated while asleep stays counted, and every move after notifies once for it
 
 | | postMessage | ring |
 | --- | --- | --- |
-| a step of the busy worker (it yields after each to hear a message) | 206 us | 183 us |
-| an event there and back, the worker idle | 50 us | 1.6 us |
+| a step of the busy worker (it yields after each to hear a message) | 190 us | 164 us |
+| an event there and back, the worker idle | 38 us | 1.5 us |
 
 ## Requirements
 
