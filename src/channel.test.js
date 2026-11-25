@@ -7,7 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { BELLS, COUNTS, ChannelClosed, createChannel, openClient, openServer } from './channel.js';
+import { BELLS, COUNTS, ChannelClosed, ChannelFailed, createChannel, openClient, openServer }
+    from './channel.js';
 
 /** A handler answering each request with its bytes reversed. @param {Uint8Array} request */
 const reversed = request=>request.slice().reverse();
@@ -120,7 +121,7 @@ test('closing ends every wait on either side', async()=>{
     await assert.rejects(serving, ChannelClosed);
 });
 
-test('a handler that throws fails its own call alone, through the reader', async()=>{
+test('a reader that throws fails its own call alone', async()=>{
     const memory = createChannel({ slots: 2, slotBytes: 4 });
     const client = openClient(memory);
     const server = openServer(memory);
@@ -217,3 +218,141 @@ test('a call waiting for a slot of a full channel is failed by the close, the th
         ]);
         assert.deepEqual(ends, Array(3).fill('rejected:ChannelClosed'));
     });
+
+test('a handler that throws, or answers more than a slot holds, fails its own request alone, on'
+    + ' the asking side', async()=>{
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const client = openClient(memory);
+    const server = openServer(memory);
+    const thrown = client.call([1]);
+    const large = client.call([2]);
+    const good = client.call([3]);
+    /** @type {number[]} */
+    const handled = [];
+    assert.equal(server.serve(request=>{
+        handled.push(request[0]);
+        if (request[0] === 1)
+        {
+            throw new Error('no such thing');
+        }
+        return request[0] === 2 ? new Uint8Array(65) : reversed(request);
+    }, { timeoutMs: 0 }), 3);
+    await assert.rejects(thrown, (e)=>e instanceof ChannelFailed && /no such thing/.test(e.message));
+    await assert.rejects(large, ChannelFailed);
+    assert.deepEqual([...await good], [3]);
+    assert.equal(server.serve(()=>[0], { timeoutMs: 0 }), 0, 'nothing handled again');
+    assert.deepEqual(handled, [1, 2, 3]);
+    // An ask, which blocks, sees the failure too: a serving side in another thread.
+    const own = createChannel({ slots: 2, slotBytes: 64 });
+    const thread = new Worker(`
+        const { workerData } = require('node:worker_threads');
+        import(workerData.channel).then(({ openServer })=>{
+            openServer(workerData.memory).serve(()=>{ throw new Error('again'); }, { timeoutMs: 10000 });
+        });`, { eval: true, workerData: { channel: new URL('./channel.js', import.meta.url).href,
+        memory: own } });
+    const asking = openClient(own);
+    assert.throws(()=>asking.ask([4], { timeoutMs: 10000 }),
+        (e)=>e instanceof ChannelFailed && /again/.test(e.message));
+    await thread.terminate();
+});
+
+test('a serve from inside its own handler, or an ask or a call from inside the reading of an'
+    + ' answer, throws and leaves every answer to its own asker', async()=>{
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const client = openClient(memory);
+    const server = openServer(memory);
+    const nested = client.call([7]);
+    /** @type {number[]} */
+    const handled = [];
+    server.serve(request=>{
+        handled.push(request[0]);
+        server.serve(reversed, { timeoutMs: 0 });
+        return [request[0]];
+    }, { timeoutMs: 0 });
+    await assert.rejects(nested, /from inside its own handler/);
+    assert.deepEqual(handled, [7], 'handled once');
+    const words = new Int32Array(memory);
+    assert.equal(Atomics.load(words, COUNTS[2]), Atomics.load(words, COUNTS[0]), 'answered as asked');
+
+    /** @type {any[]} */
+    const inner = [];
+    const a = client.call([1], {
+        read: answer=>{
+            inner.push(client.call([9]));
+            return answer[0];
+        },
+    });
+    const b = client.call([2]);
+    server.serve(reversed, { timeoutMs: 0 });
+    assert.equal(await a, 1);
+    assert.deepEqual([...await b], [2]);
+    await assert.rejects(inner[0], /inside the reading of an answer/);
+    const c = client.call([3]);
+    server.serve(reversed, { timeoutMs: 0 });
+    assert.deepEqual([...await c], [3]);
+});
+
+test('an ask whose wait throws (a thread that may not block) leaves its request answered to'
+    + ' nobody: the next call gets its own answer', async()=>{
+    const memory = createChannel({ slots: 4, slotBytes: 8 });
+    const client = openClient(memory, { spinMs: 0 });
+    const server = openServer(memory);
+    const wait = Atomics.wait;
+    Atomics.wait = ()=>{
+        throw new TypeError('Atomics.wait cannot be called in this context');
+    };
+    try
+    {
+        assert.throws(()=>client.ask([1]), TypeError);
+    }
+    finally
+    {
+        Atomics.wait = wait;
+    }
+    const words = new Int32Array(memory);
+    assert.equal(Atomics.load(words, 2), 0, 'its sleep is not counted any more');
+    const next = client.call([2]);
+    server.serve(request=>[request[0] + 100], { timeoutMs: 0 });
+    assert.deepEqual([...await next], [102]);
+    assert.equal(client.out(), 0);
+});
+
+test('a call waiting for room goes out as soon as one answer frees a slot', { timeout: 30000 },
+    async()=>{
+        const memory = createChannel({ slots: 4, slotBytes: 8 });
+        // A serving side that takes 300 ms over each request.
+        const thread = new Worker(`
+            const { workerData } = require('node:worker_threads');
+            import(workerData.channel).then(({ openServer })=>{
+                const server = openServer(workerData.memory);
+                const nap = new Int32Array(new SharedArrayBuffer(4));
+                for (let served = 0; served < 6;)
+                {
+                    served += server.serve(request=>{
+                        Atomics.wait(nap, 0, 0, 300);
+                        return [request[0]];
+                    }, { timeoutMs: 10000 });
+                }
+            });`, { eval: true, workerData: { channel: new URL('./channel.js', import.meta.url).href,
+            memory } });
+        const client = openClient(memory);
+        const words = new Int32Array(memory);
+        const calls = [1, 2, 3, 4, 5, 6].map(n=>client.call([n]));
+        // How many were answered when the fifth went out: one frees its slot,
+        // and the next answer is 300 ms after it.
+        while (Atomics.load(words, COUNTS[0]) < 5)
+        {
+            await new Promise(resolve=>setTimeout(resolve, 1));
+        }
+        const answered = Atomics.load(words, COUNTS[2]);
+        assert.deepEqual((await Promise.all(calls)).map(answer=>answer[0]), [1, 2, 3, 4, 5, 6]);
+        await thread.terminate();
+        assert.ok(answered < 4, `the fifth went out with ${answered} answered`);
+    });
+
+test('a request that is not bytes is refused', ()=>{
+    const memory = createChannel({ slots: 2, slotBytes: 8 });
+    const client = openClient(memory);
+    assert.throws(()=>client.ask(/** @type {any} */ (new DataView(new ArrayBuffer(4)))), TypeError);
+    assert.equal(openServer(memory).waiting(), 0);
+});

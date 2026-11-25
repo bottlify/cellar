@@ -180,6 +180,7 @@ test('a reader asleep on the doorbell is woken by each write from another thread
 test('a writer that may block waits for the reader to make room, and gives up after its time',
     { timeout: 30000 }, async()=>{
         const memory = createRingMemory(64);
+        const stopped = new SharedArrayBuffer(4);
         const writer = inWorker(`
         const w = ring.openRing(memory);
         const bytes = new Uint8Array(w.maxRecord);
@@ -189,8 +190,15 @@ test('a writer that may block waits for the reader to make room, and gives up af
             if (!w.writeWaiting(bytes, 5000)) throw new Error('timed out at ' + n);
             written++;
         }
-        const late = w.write(bytes) && w.write(bytes) && w.writeWaiting(bytes, 20);
-        return { written, late };`, { memory });
+        // Filled to the brim once the reader stopped: nobody makes room now.
+        Atomics.wait(new Int32Array(data.stopped), 0, 0);
+        while (w.write(bytes))
+        {
+            // Filling.
+        }
+        const from = performance.now();
+        const late = w.writeWaiting(bytes, 20);
+        return { written, late, waited: performance.now() - from };`, { memory, stopped });
         const result = new Promise((resolve, reject)=>{
             writer.once('message', resolve);
             writer.once('error', reject);
@@ -202,9 +210,13 @@ test('a writer that may block waits for the reader to make room, and gives up af
             read += reader.drain(()=>{});
             await new Promise(resolve=>setTimeout(resolve, 1));
         }
-        const { written, late } = /** @type {any} */ (await result);
+        const words = new Int32Array(stopped);
+        Atomics.store(words, 0, 1);
+        Atomics.notify(words, 0);
+        const { written, late, waited } = /** @type {any} */ (await result);
         assert.equal(written, 50);
         assert.equal(late, false, 'with nobody reading, a full ring times out');
+        assert.ok(waited >= 19, `it waited for its time first: ${waited} ms`);
         await writer.terminate();
     });
 
@@ -297,4 +309,51 @@ test('a close moves the word a writer sleeps on: a wait that looked before the c
     const room = Atomics.load(words, ROOM_WORD);
     openRing(memory).close();
     assert.equal(Atomics.wait(words, ROOM_WORD, room, 1000), 'not-equal');
+});
+
+test('a take that drains its own ring, or a release with no record peeked, throws and leaves the'
+    + ' ring whole', ()=>{
+    const ring = openRing(createRingMemory(256));
+    ring.write(Uint8Array.of(1));
+    ring.write(Uint8Array.of(2));
+    assert.throws(()=>ring.release(), /no record peeked/);
+    /** @type {number[]} */
+    const taken = [];
+    assert.throws(()=>ring.drain(record=>{
+        taken.push(record[0]);
+        ring.drain(()=>{});
+    }), /inside its own take/);
+    assert.deepEqual(taken, [1]);
+    // The record taken when it threw is still there: taken again, then the next.
+    assert.equal(ring.drain(record=>void taken.push(record[0])), 2);
+    assert.deepEqual(taken, [1, 1, 2]);
+    assert.equal(ring.held(), 0);
+    assert.equal(ring.write(Uint8Array.of(3)), true);
+    assert.equal(ring.peek()?.[0], 3);
+    ring.release();
+    assert.throws(()=>ring.release(), /no record peeked/);
+    assert.equal(ring.held(), 0);
+});
+
+test('a record that is not bytes is refused, not cut or written as nothing', ()=>{
+    const ring = openRing(createRingMemory(256));
+    for (const record of [Uint32Array.of(0x12345678), new Float64Array(1),
+        new DataView(new ArrayBuffer(4)), new ArrayBuffer(4), null])
+    {
+        assert.throws(()=>ring.write(/** @type {any} */ (record)), TypeError);
+    }
+    assert.equal(ring.held(), 0);
+    assert.equal(ring.write([1, 2, 3]), true);
+    assert.equal(ring.write(Uint8Array.of(4)), true);
+});
+
+test('a ring\'s methods work taken off it', async()=>{
+    const { write, writeWaiting, writeWaitingAsync, drain } = openRing(createRingMemory(256));
+    assert.equal(write(Uint8Array.of(1)), true);
+    assert.equal(writeWaiting(Uint8Array.of(2), 10), true);
+    assert.equal(await writeWaitingAsync(Uint8Array.of(3), 10), true);
+    /** @type {number[]} */
+    const taken = [];
+    assert.equal(drain(record=>void taken.push(record[0])), 3);
+    assert.deepEqual(taken, [1, 2, 3]);
 });

@@ -136,9 +136,17 @@ export const sharedBuffer = bytes=>/** @type {SharedArrayBuffer} */ (canShare()
  * @param {number} bytes @param {number} most
  * @returns {Growable}
  */
-export const growableShared = (bytes, most)=>/** @type {Growable} */ (canShare()
-    ? new /** @type {any} */ (SharedArrayBuffer)(bytes, { maxByteLength: most })
-    : new /** @type {any} */ (ArrayBuffer)(bytes, { maxByteLength: most }));
+export const growableShared = (bytes, most)=>{
+    const Buffer = canShare() ? SharedArrayBuffer : ArrayBuffer;
+    // An engine of shared memory but not of growable buffers takes the
+    // maximum and makes a buffer that never grows: the index would stop at
+    // its first size.
+    if (!('maxByteLength' in Buffer.prototype))
+    {
+        throw new Error(`cache: this engine's ${Buffer.name} cannot grow, which the index needs`);
+    }
+    return /** @type {Growable} */ (new /** @type {any} */ (Buffer)(bytes, { maxByteLength: most }));
+};
 
 /**
  * Grows a buffer of `growableShared` in place: a shared one grows, a thread's

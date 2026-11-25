@@ -64,8 +64,26 @@ const NODE = typeof (/** @type {any} */ (globalThis).process)?.versions?.node ==
  *
  * @param {number | undefined} timeoutMs
  */
-export const deadlineOf = timeoutMs=>(timeoutMs === undefined || timeoutMs === Infinity
-    ? Infinity : clock.now() + timeoutMs);
+export const deadlineOf = timeoutMs=>{
+    if (timeoutMs === undefined || timeoutMs === Infinity)
+    {
+        return Infinity;
+    }
+    // NaN compares false to every time: a wait on it would never end, nor sleep.
+    if (typeof timeoutMs !== 'number' || Number.isNaN(timeoutMs))
+    {
+        throw new RangeError(`bell: a timeout of ${timeoutMs} ms`);
+    }
+    return clock.now() + timeoutMs;
+};
+
+/** @param {number} deadline @param {number} spinMs */
+const checkTimes = (deadline, spinMs)=>{
+    if (Number.isNaN(deadline) || Number.isNaN(spinMs))
+    {
+        throw new RangeError(`bell: a deadline of ${deadline}, a spin of ${spinMs} ms`);
+    }
+};
 
 /**
  * Blocks until `words[index]` is no longer `seen`: for a thread that may
@@ -82,6 +100,7 @@ export const deadlineOf = timeoutMs=>(timeoutMs === undefined || timeoutMs === I
 export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs = SPIN_MS,
     closed = -1, bell = index){
     seen |= 0;
+    checkTimes(deadline, spinMs);
     if (spinMs <= 0)
     {
         return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
@@ -137,12 +156,19 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
         // The bell read after the count rose and before the last looks: a
         // move or a close after it moves the bell, and the sleep returns.
         const rung = bell === index ? seen : Atomics.load(words, bell);
-        if (Atomics.load(words, index) === seen
-            && (closed < 0 || Atomics.load(words, closed) === 0))
+        try
         {
-            Atomics.wait(words, bell, rung, left === Infinity ? undefined : left);
+            if (Atomics.load(words, index) === seen
+                && (closed < 0 || Atomics.load(words, closed) === 0))
+            {
+                // Throws on a thread that may not block, a page's own.
+                Atomics.wait(words, bell, rung, left === Infinity ? undefined : left);
+            }
         }
-        Atomics.sub(words, sleeps, 1);
+        finally
+        {
+            Atomics.sub(words, sleeps, 1);
+        }
     }
     return slept ? 'woke' : 'moved';
 }
@@ -160,6 +186,7 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
 export async function waitForAsync(words, index, seen, sleeps, deadline = Infinity,
     closed = -1, bell = index){
     seen |= 0;
+    checkTimes(deadline, 0);
     let slept = false;
     while (Atomics.load(words, index) === seen)
     {

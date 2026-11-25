@@ -35,6 +35,7 @@
  */
 
 import { createDoorbell, deadlineOf, openDoorbell, waitFor, waitForAsync, wake } from './bell.js';
+import { checkBytes } from './bytes.js';
 
 /**
  * Words of the control block: bytes ever written and the writer's waits
@@ -68,6 +69,7 @@ const ALIGN = 4;
 
 /** @param {number} n */
 const aligned = n=>(n + ALIGN - 1) & ~(ALIGN - 1);
+
 
 /**
  * @typedef {Object} RingMemory
@@ -116,8 +118,12 @@ export function openRing(memory){
 
     /** @param {number} index */
     const load = index=>Atomics.load(control, index) >>> 0;
+    /** The reader holds a record `peek` returned and has not released. */
+    let peeked = false;
+    /** The reader is inside `drain`'s `take`. */
+    let draining = false;
 
-    return {
+    const self = {
         capacity,
         maxRecord,
         bell,
@@ -135,6 +141,7 @@ export function openRing(memory){
             {
                 throw new RingClosed();
             }
+            checkBytes(record, 'ring');
             const length = record.length;
             if (length > maxRecord)
             {
@@ -179,7 +186,7 @@ export function openRing(memory){
             for (;;)
             {
                 const room = Atomics.load(control, ROOM);
-                if (this.write(record))
+                if (self.write(record))
                 {
                     return true;
                 }
@@ -208,7 +215,7 @@ export function openRing(memory){
             for (;;)
             {
                 const room = Atomics.load(control, ROOM);
-                if (this.write(record))
+                if (self.write(record))
                 {
                     return true;
                 }
@@ -235,6 +242,7 @@ export function openRing(memory){
             const written = load(WRITTEN);
             if (read === written)
             {
+                peeked = false;
                 return null;
             }
             let at = read & mask;
@@ -246,13 +254,21 @@ export function openRing(memory){
                 at = 0;
                 length = words.getUint32(0, true);
             }
+            peeked = true;
             return bytes.subarray(at + ALIGN, at + ALIGN + length);
         },
 
         /**
          * The reader's: gives the record `peek` returned back to the writer.
+         * Throws where `peek` returned none since the last release: it would
+         * free a record not read.
          */
         release(){
+            if (!peeked)
+            {
+                throw new Error('ring: release with no record peeked');
+            }
+            peeked = false;
             const read = load(READ);
             const at = read & mask;
             const length = words.getUint32(at, true);
@@ -267,19 +283,32 @@ export function openRing(memory){
          * does not keep its reader from the others it reads. Returns how many.
          * A reader that took `most` does not wait on the doorbell next while
          * `held()` is not zero: what is left was rung for before its look, and
-         * nothing will ring for it again.
+         * nothing will ring for it again. `take` may not read this ring itself:
+         * it holds the record being taken.
          *
          * @param {(record: Uint8Array) => void} take
          * @param {number} [most]
          */
         drain(take, most = Infinity){
-            let count = 0;
-            for (let record = count < most ? this.peek() : null; record !== null;
-                record = count < most ? this.peek() : null)
+            if (draining)
             {
-                take(record);
-                this.release();
-                count++;
+                throw new Error('ring: drained from inside its own take');
+            }
+            draining = true;
+            let count = 0;
+            try
+            {
+                for (let record = count < most ? self.peek() : null; record !== null;
+                    record = count < most ? self.peek() : null)
+                {
+                    take(record);
+                    self.release();
+                    count++;
+                }
+            }
+            finally
+            {
+                draining = false;
             }
             return count;
         },
@@ -303,6 +332,8 @@ export function openRing(memory){
         /** Bytes held, records and their framing: for diagnostics. */
         held: ()=>(load(WRITTEN) - load(READ)) >>> 0,
     };
+    return self;
 }
 
 /** @typedef {ReturnType<typeof openRing>} Ring */
+/** @typedef {import('./bell.js').WaitEnd} WaitEnd */

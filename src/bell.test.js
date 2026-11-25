@@ -7,7 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { createDoorbell, openDoorbell, publish, waitFor, waitForAsync, wake } from './bell.js';
+import { createDoorbell, deadlineOf, openDoorbell, publish, waitFor, waitForAsync, wake }
+    from './bell.js';
 
 const WORD = 0;
 const SLEEPS = 1;
@@ -90,4 +91,32 @@ test('no wake is lost between a wait\'s last look and its sleep', { timeout: 600
     {
         await Promise.all(workers.map(worker=>worker.terminate()));
     }
+});
+
+test('a timeout or a spin that is not a number is refused, not a wait that never sleeps', async()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    assert.throws(()=>deadlineOf(NaN), RangeError);
+    assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, NaN), RangeError);
+    assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, NaN), RangeError);
+    await assert.rejects(waitForAsync(words, WORD, 0, SLEEPS, NaN), RangeError);
+    assert.throws(()=>openDoorbell(createDoorbell()).wait(0, NaN), RangeError);
+    assert.equal(Atomics.load(words, SLEEPS), 0);
+});
+
+test('a wait whose sleep throws (a thread that may not block) takes itself off the count', ()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const wait = Atomics.wait;
+    Atomics.wait = ()=>{
+        throw new TypeError('Atomics.wait cannot be called in this context');
+    };
+    try
+    {
+        assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, 0), TypeError);
+    }
+    finally
+    {
+        Atomics.wait = wait;
+    }
+    assert.equal(Atomics.load(words, SLEEPS), 0);
+    assert.equal(publish(words, WORD, 1, SLEEPS), false, 'nobody counted asleep: no notify');
 });

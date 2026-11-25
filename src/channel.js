@@ -37,6 +37,7 @@
 
 import { SPIN_MS, deadlineOf, publish as publishWord, waitFor as waitWord,
     waitForAsync as waitWordAsync } from './bell.js';
+import { checkBytes } from './bytes.js';
 
 /** The header, in 32-bit words. */
 const HEADER_WORDS = 16;
@@ -110,6 +111,15 @@ export class ChannelClosed extends Error {
     }
 }
 
+/** The answer to a request whose handler threw, or answered more than a slot holds. */
+export class ChannelFailed extends Error {
+    /** @param {string} message  what the serving side said of the failure */
+    constructor(message){
+        super(`channel: the serving side failed: ${message}`);
+        this.name = 'ChannelFailed';
+    }
+}
+
 /**
  * What both ends share: the channel's words and slots, and the waits.
  *
@@ -155,6 +165,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} base @param {number} n @param {ArrayLike<number>} message
      */
     const writeSlot = (base, n, message)=>{
+        checkBytes(message, 'channel');
         if (message.length > slotBytes)
         {
             throw new RangeError(`channel: ${message.length} bytes, a slot holds ${slotBytes}`);
@@ -162,6 +173,32 @@ function endOver(memory, { spinMs = SPIN_MS }){
         const at = base + (n & (slots - 1)) * stride;
         bytes.set(message, at + 4);
         words[at >> 2] = message.length;
+    };
+
+    /**
+     * Writes the `n`th answer as a failure: its length word is the
+     * complement of the length of what is said of it, as much as a slot holds.
+     *
+     * @param {number} n @param {unknown} failure
+     */
+    const writeFailure = (n, failure)=>{
+        const said = new TextEncoder().encode(String(/** @type {any} */ (failure)?.message ?? failure))
+            .subarray(0, slotBytes);
+        const at = answers + (n & (slots - 1)) * stride;
+        bytes.set(said, at + 4);
+        words[at >> 2] = ~said.length;
+    };
+
+    /**
+     * What is said of the failure the `n`th answer is, or null where it is an answer.
+     *
+     * @param {number} n
+     */
+    const failureAt = n=>{
+        const at = answers + (n & (slots - 1)) * stride;
+        const word = words[at >> 2];
+        // Copied out: a decoder does not read shared memory.
+        return word < 0 ? new TextDecoder().decode(bytes.slice(at + 4, at + 4 + ~word)) : null;
     };
 
     /**
@@ -206,7 +243,8 @@ function endOver(memory, { spinMs = SPIN_MS }){
     };
 
     return {
-        words, requests, answers, slots, slotAt, writeSlot, publish, waitFor, waitForAsync,
+        words, requests, answers, slots, slotAt, writeSlot, writeFailure, failureAt, publish,
+        waitFor, waitForAsync,
         /**
          * Ends the channel for both sides: every wait on it ends with
          * ChannelClosed. The bells are moved, not only notified: a wait that
@@ -252,32 +290,62 @@ export function openClient(memory, options = {}){
     /** @type {Promise<void> | null} */
     let pumping = null;
 
+    /** An answer is being read: a request made from inside its reading would take its slot. */
+    let reading = false;
+
+    /**
+     * Reads the next answer in place with `readAnswer` and frees its slot:
+     * what `readAnswer` returned; throws what it threw, or `ChannelFailed`.
+     *
+     * @template T @param {ReadAnswer<T>} readAnswer @returns {T}
+     */
+    const readNext = readAnswer=>{
+        reading = true;
+        try
+        {
+            const failure = end.failureAt(read);
+            if (failure !== null)
+            {
+                throw new ChannelFailed(failure);
+            }
+            return readAnswer(end.slotAt(end.answers, read));
+        }
+        finally
+        {
+            reading = false;
+            read = (read + 1) | 0;
+            Atomics.store(words, READ, read);
+        }
+    };
+
     /** Hands the next answer, read in place, to whoever asked for it. */
     const takeAnswer = ()=>{
         const taker = /** @type {(typeof waiting)[number]} */ (waiting.shift());
         let value;
         try
         {
-            value = taker.read(end.slotAt(end.answers, read));
+            value = readNext(taker.read);
         }
         catch (e){
-            read = (read + 1) | 0;
-            Atomics.store(words, READ, read);
             taker.reject(e);
             return;
         }
-        read = (read + 1) | 0;
-        Atomics.store(words, READ, read);
         taker.resolve(value);
     };
 
+    const notReading = ()=>{
+        if (reading)
+        {
+            throw new Error('channel: asked from inside the reading of an answer');
+        }
+    };
+
     /**
-     * An ask that ran out of time: its answer, when it comes, goes to nobody.
+     * An ask that ran out of time.
      *
      * @param {number | undefined} timeoutMs @returns {never}
      */
     const noAnswer = timeoutMs=>{
-        waiting.push(DROPPED);
         throw new Error(`channel: no answer in ${timeoutMs} ms`);
     };
 
@@ -336,6 +404,7 @@ export function openClient(memory, options = {}){
          * @returns {T}
          */
         ask(message, { read: readAnswer = /** @type {any} */ (copy), timeoutMs } = {}){
+            notReading();
             const deadline = deadlineOf(timeoutMs);
             while ((asked - read) >>> 0 >= slots)
             {
@@ -347,31 +416,35 @@ export function openClient(memory, options = {}){
             }
             // Sent before it waits: a request refused leaves nothing behind.
             send(message);
-            // Calls out before it are answered first: hand them theirs.
-            while (waiting.length > 0)
+            try
             {
+                // Calls out before it are answered first: hand them theirs.
+                while (waiting.length > 0)
+                {
+                    if (Atomics.load(words, ANSWERED) === read
+                        && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
+                    {
+                        noAnswer(timeoutMs);
+                    }
+                    takeAnswer();
+                }
                 if (Atomics.load(words, ANSWERED) === read
                     && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
                 {
-                    return noAnswer(timeoutMs);
+                    noAnswer(timeoutMs);
                 }
-                takeAnswer();
             }
-            if (Atomics.load(words, ANSWERED) === read
-                && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
-            {
-                return noAnswer(timeoutMs);
+            catch (e){
+                // Out of time, or a wait this thread may not make (a page's
+                // own): the request is out, and its answer, when it comes,
+                // goes to nobody.
+                if (!(e instanceof ChannelClosed))
+                {
+                    waiting.push(DROPPED);
+                }
+                throw e;
             }
-            const answer = end.slotAt(end.answers, read);
-            try
-            {
-                return readAnswer(answer);
-            }
-            finally
-            {
-                read = (read + 1) | 0;
-                Atomics.store(words, READ, read);
-            }
+            return readNext(readAnswer);
         },
 
         /**
@@ -385,6 +458,7 @@ export function openClient(memory, options = {}){
          * @returns {Promise<T>}
          */
         async call(message, { read: readAnswer = /** @type {any} */ (copy) } = {}){
+            notReading();
             while ((asked - read) >>> 0 >= slots)
             {
                 // A close fails the calls out and frees no slot: waiting on
@@ -393,8 +467,15 @@ export function openClient(memory, options = {}){
                 {
                     throw new ChannelClosed();
                 }
-                startPump();
-                await pumping;
+                // A slot frees with each answer: one is waited for, not all.
+                if (Atomics.load(words, ANSWERED) === read)
+                {
+                    await end.waitForAsync(ANSWERED, read, CLIENT_SLEEPS, Infinity);
+                }
+                while (waiting.length > 0 && Atomics.load(words, ANSWERED) !== read)
+                {
+                    takeAnswer();
+                }
             }
             send(message);
             /** @type {Promise<T>} */
@@ -433,20 +514,46 @@ export function openServer(memory, options = {}){
     const end = endOver(memory, options);
     const { words } = end;
     let taken = Atomics.load(words, TAKEN);
+    /** A handler runs: a serve from inside it would answer its request twice. */
+    let serving = false;
 
-    /** Answers every request written, in order: how many. @param {Handler} handler */
+    /**
+     * Answers every request written, in order: how many. A handler that
+     * throws, or answers more than a slot holds, answers its request with
+     * the failure (`ChannelFailed` on the asking side), and the next is
+     * answered.
+     *
+     * @param {Handler} handler
+     */
     const answerAll = handler=>{
-        let answered = 0;
-        while (Atomics.load(words, ASKED) !== taken)
+        if (serving)
         {
-            const answer = handler(end.slotAt(end.requests, taken)) ?? EMPTY;
-            end.writeSlot(end.answers, taken, answer);
-            taken = (taken + 1) | 0;
-            // The request's slot is free before its answer is seen: the asking
-            // side writes its next request there only after reading the answer.
-            Atomics.store(words, TAKEN, taken);
-            end.publish(ANSWERED, taken, CLIENT_SLEEPS);
-            answered++;
+            throw new Error('channel: served from inside its own handler');
+        }
+        serving = true;
+        let answered = 0;
+        try
+        {
+            while (Atomics.load(words, ASKED) !== taken)
+            {
+                try
+                {
+                    end.writeSlot(end.answers, taken, handler(end.slotAt(end.requests, taken)) ?? EMPTY);
+                }
+                catch (e){
+                    end.writeFailure(taken, e);
+                }
+                taken = (taken + 1) | 0;
+                // The request's slot is free before its answer is seen: the asking
+                // side writes its next request there only after reading the answer.
+                Atomics.store(words, TAKEN, taken);
+                end.publish(ANSWERED, taken, CLIENT_SLEEPS);
+                answered++;
+            }
+        }
+        finally
+        {
+            serving = false;
         }
         return answered;
     };

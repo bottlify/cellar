@@ -52,6 +52,11 @@ for (const minify of [false, true])
 // The declarations of the package's own files, tests and fixtures left out.
 execFileSync(process.execPath, [join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'),
     '-p', join(ROOT, 'jsconfig.types.json')], { stdio: 'inherit' });
+// Read as a consumer reads them, their own declarations checked: a name one of
+// them uses without importing it would be \`any\` to a consumer that skips them.
+execFileSync(process.execPath, [join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'),
+    '--noEmit', '--strict', '--skipLibCheck', 'false', '--target', 'es2022', '--module', 'nodenext',
+    '--lib', 'es2024,dom', join(DIST, 'types', 'index.d.ts')], { stdio: 'inherit' });
 
 /** @param {string} dir @returns {Promise<string[]>} */
 const filesUnder = async dir=>(await Promise.all((await readdir(dir, { withFileTypes: true }))

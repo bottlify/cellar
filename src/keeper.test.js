@@ -498,3 +498,19 @@ test('close lets go of the pack still opening', async()=>{
     await new Promise(resolve=>setTimeout(resolve, 0));
     assert.deepEqual([...open], []);
 });
+
+test('an engine whose shared buffers cannot grow is told so when the keeper opens', async()=>{
+    const prototype = SharedArrayBuffer.prototype;
+    const descriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(prototype,
+        'maxByteLength'));
+    // @ts-ignore -- removed for the test, put back below
+    delete prototype.maxByteLength;
+    try
+    {
+        await assert.rejects(openKeeper({ budget: 256 * KIB }), /cannot grow/);
+    }
+    finally
+    {
+        Object.defineProperty(prototype, 'maxByteLength', descriptor);
+    }
+});

@@ -15,6 +15,11 @@ through the event loop for every exchange.
 - **Bell** - one thread waits on a shared word, another wakes it, and only when it sleeps.
 - **Doorbell** - one wait for everything a thread is sent, whatever it came through.
 
+Cellar is browser code: a page and its workers sharing memory, in a cross-origin isolated page.
+Node runs it too (its tests run there), with `worker_threads` for workers. It works with what the
+platform has: a thread blocks only where the platform lets it (a worker, never a page's own
+thread), and a wait on the event loop uses `Atomics.waitAsync` where there is one.
+
 Built for [Bottlify](https://github.com/bottlify/bottlify), whose processes and workers share
 memory and wait on each other; nothing in it is Bottlify's, and it suits any page that runs work in
 several threads. No runtime dependencies, the browser's own primitives (`SharedArrayBuffer`,
@@ -28,15 +33,14 @@ The figures are `examples/call-a-worker.mjs`, `examples/memory.mjs` and `example
 (node 22, a 4-core x86 VM, 3 runs an arm, medians); the tables below give every number. How each
 mechanism works, drawn: [examples/README.md](examples/README.md).
 
-Status: the bell, the ring, the channel and the cache, each with its gate; not yet on npm. Every version is built into a
-[release](https://github.com/bottlify/cellar/releases): `cellar.js`, `cellar.min.js`, the
-declarations and their checksums.
+Status: the bell, the ring, the channel and the cache, each with its gate.
 
 ## Install
 
-```sh
-npm install @bottlify/cellar
-```
+Not on npm yet. Every version is built into a
+[release](https://github.com/bottlify/cellar/releases): `cellar.js`, `cellar.min.js`, the
+declarations (`types/`) and their checksums; take them from there. The examples below import it
+by the name it will have on npm.
 
 ## Use
 
@@ -72,6 +76,12 @@ cache.commit('blocks/43');
 A body is read only inside `with`: the keeper never takes a body a reader is in. A body that can
 be made again goes away when there is no room and no disk; one marked `onlyCopy` never does.
 
+A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
+`commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
+the name has no body then, and the room goes back. A thread joining later is handed
+`keeper.shared` and `keeper.segmentBuffers()` as they are then. The `raise` a reader is given
+takes `{ known }`, the segments that reader has: a body is brought back only where it can read it.
+
 ## Channel
 
 Calls between two threads without a message: a request is written where the other thread reads it,
@@ -95,8 +105,17 @@ const answer = client.ask(request);                  // a copy, or { read } read
 const later = await client.call(request);
 ```
 
-One asking side and one serving side; answers come back in order, as many requests out at once as
-there are slots. A blocking ask makes no garbage: the request and answer are read where they lie.
+One asking side and one serving side for the channel's life; a thread that needs a new link (a
+worker started again) makes a new channel. Answers come back in order, as many requests out at
+once as there are slots; a call waiting for room goes out as soon as one answer frees a slot. A
+blocking ask makes no garbage: the request and answer are read where they lie.
+
+A handler that throws, or answers more than a slot holds, answers its request with the failure:
+the call or ask fails with `ChannelFailed`, saying what the handler threw (as much as a slot
+holds), and the next request is served. A `serve` from inside its own handler, and an `ask` or a
+`call` from inside the reading of an answer, throw: each would take a slot that is in use. An
+`ask` on a thread that may not block throws there when it would sleep, and its answer, when it
+comes, goes to nobody.
 
 `examples/memory.mjs` calls a function in a worker by postMessage and by the channel, each arm in a
 process of its own (node 22, a 4-core x86 VM, 3 runs an arm, medians):
@@ -144,10 +163,16 @@ takes at most `most` records, so one ring written without a pause does not starv
 thread reads (a reader that took `most` drains again before it waits: what is left will not ring
 again). Either side closes a ring when it goes or knows the other went: a writer waiting for
 room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
-reading what was written before.
+reading what was written before. A `take` may not drain its own ring (it holds the record being
+taken), and `release` frees only a record `peek` returned: either throws rather than free a
+record not read. A record is bytes: a `Uint8Array` or an array of numbers; a wider typed array, a
+`DataView` or a buffer is refused.
 
-`waitFor`, `waitForAsync`, `wake` and `publish` are the bell over any word of a shared
-`Int32Array`, for a protocol of its own.
+`waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
+`Int32Array`, for a protocol of its own; `deadlineOf(timeoutMs)` is a deadline on the clock they
+read, and `SPIN_MS` how long a blocking wait looks before it sleeps. A timeout or a spin that is
+not a number is refused. The count of waits asleep is kept by the waits themselves: a worker
+terminated while asleep stays counted, and every move after notifies once for it (about 50 ns more a move, x86).
 
 `examples/ring.mjs` sends 20 000 pointer moves to a worker busy with 2 000 steps of work, then
 2 000 events one at a time to it idle, each answered (node 22, a 4-core x86 VM, 3 runs, medians):
@@ -159,9 +184,13 @@ reading what was written before.
 
 ## Requirements
 
-`SharedArrayBuffer` (a cross-origin isolated page) and growable shared buffers for a cache every
-thread reads; without them the cache is one thread's, on buffers of its own, and works the same
-there. `Atomics.waitAsync` for a channel's asynchronous waits. The disk is optional.
+- `SharedArrayBuffer`, in a cross-origin isolated page, for anything shared between threads.
+  Without it the cache is one thread's, on buffers of its own, and works the same there.
+- Growable buffers (`maxByteLength`) for the cache's index: an engine without them is told so
+  when the keeper opens.
+- `Atomics.waitAsync` for waits on the event loop (`waitForAsync`, `call`, `serveAsync`,
+  `writeWaitingAsync`); where there is none they look again every millisecond.
+- The disk (OPFS synchronous handles, in a worker) is optional.
 
 ## Develop
 
