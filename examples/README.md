@@ -46,6 +46,8 @@ flowchart LR
 
 `examples/ring.mjs`: pointer moves to a worker busy with steps of work, drained between two steps
 without giving its thread back; then events to the worker idle, asleep on the doorbell.
+`examples/cache-lines.mjs`: whether the writer's and the reader's counts want cache lines of their
+own on the machine it runs on (they share one in Cellar).
 
 ## Doorbell: one wait for many sources
 
