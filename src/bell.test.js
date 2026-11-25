@@ -182,3 +182,9 @@ test('an asynchronous wait whose sleep throws takes itself off the count', async
     }
     assert.equal(Atomics.load(words, SLEEPS), 0);
 });
+
+test('a wait on a bell past its words takes itself off the count', ()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, 0, -1, 99), RangeError);
+    assert.equal(Atomics.load(words, SLEEPS), 0);
+});

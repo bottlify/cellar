@@ -287,8 +287,10 @@ export function openRing(memory){
          * does not keep its reader from the others it reads. Returns how many.
          * A reader that took `most` does not wait on the doorbell next while
          * `held()` is not zero: what is left was rung for before its look, and
-         * nothing will ring for it again. `take` may not read this ring itself:
-         * it holds the record being taken.
+         * nothing will ring for it again. `take` may not read this ring itself
+         * (`drain`, `peek`, `release`): it holds the record being taken. A
+         * drain from it throws; a release from it frees the record, and the
+         * drain throws as it would release it again.
          *
          * @param {(record: Uint8Array) => void} take
          * @param {number} [most]

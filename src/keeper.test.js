@@ -815,3 +815,54 @@ test('a keeper closed twice, a pack opening between, lets go of each file once',
     assert.equal(keeper.close(), false);
     assert.deepEqual(closes.sort(), ['index-a', 'index-b', 'pack-0']);
 });
+
+test('a keeper whose first segment cannot be told of lets go of every file it opened', async()=>{
+    /** @type {Set<string>} */
+    const open = new Set();
+    const base = memoryDisk();
+    const disk = {
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            open.add(name);
+            return { ...file,
+                close(){
+                    open.delete(name);
+                } };
+        },
+    };
+    await assert.rejects(openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk,
+        announce: ()=>{
+            throw new Error('no thread to tell');
+        } }), /no thread to tell/);
+    await new Promise(resolve=>setTimeout(resolve, 10));
+    assert.deepEqual([...open], []);
+});
+
+test('an index of more packs than a run opens, or of an unsafe generation, is not read', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('a', bodyOf(100, 1));
+    first.keeper.save();
+    first.reader.put('b', bodyOf(100, 2));
+    first.keeper.save();
+    const [newer, bytes] = [...disk.files].filter(([file])=>file.startsWith('index-'))
+        .sort(([, x], [, y])=>y.length - x.length)[0];
+    const saved = JSON.parse(new TextDecoder().decode(bytes));
+    /** @type {string[]} */
+    const opened = [];
+    const counting = {
+        async open(/** @type {string} */ name){
+            opened.push(name);
+            return disk.open(name);
+        },
+    };
+    for (const change of [{ packs: 1e9 }, { generation: 2 ** 60 }])
+    {
+        disk.files.set(newer, new TextEncoder().encode(JSON.stringify({ ...saved, ...change })));
+        opened.length = 0;
+        const next = await cacheOf({ disk: counting });
+        assert.equal(next.reader.look('a'), 'cold', 'the other index read');
+        assert.equal(next.reader.look('b'), null);
+        assert.ok(opened.length < 10, `${opened.length} files opened`);
+    }
+});

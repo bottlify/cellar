@@ -109,6 +109,22 @@ export function createChannel({ slots = 16, slotBytes = 4096 } = {}){
 /** A slot's bytes: its length word and its bytes, to a whole word. @param {number} slotBytes */
 const slotStride = slotBytes=>4 + Math.ceil(slotBytes / 4) * 4;
 
+/**
+ * What a failure says of itself, as text: anything may be thrown, a thing
+ * whose message is a getter that throws, or with no way to be a string.
+ *
+ * @param {unknown} failure
+ */
+const sayFailure = failure=>{
+    try
+    {
+        return String(/** @type {any} */ (failure)?.message ?? failure);
+    }
+    catch {
+        return 'a failure that says nothing of itself';
+    }
+};
+
 /** Why a wait ended without what it waited for. */
 export class ChannelClosed extends Error {
     constructor(){
@@ -188,8 +204,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} n @param {unknown} failure
      */
     const writeFailure = (n, failure)=>{
-        const said = new TextEncoder().encode(String(/** @type {any} */ (failure)?.message ?? failure))
-            .subarray(0, slotBytes);
+        const said = new TextEncoder().encode(sayFailure(failure)).subarray(0, slotBytes);
         const at = answers + (n & (slots - 1)) * stride;
         bytes.set(said, at + 4);
         words[at >> 2] = ~said.length;

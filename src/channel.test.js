@@ -361,3 +361,29 @@ test('a channel past 1 GiB is refused, its slots found by 32-bit arithmetic', ()
     assert.throws(()=>createChannel({ slots: 1 << 16, slotBytes: 1 << 16 }), RangeError);
     assert.throws(()=>createChannel({ slots: 2, slotBytes: 2 ** 31 }), RangeError);
 });
+
+test('a handler that throws what cannot be a string still fails its own request alone', async()=>{
+    const memory = createChannel({ slots: 2, slotBytes: 64 });
+    const client = openClient(memory);
+    const server = openServer(memory);
+    const odd = client.call([1]);
+    const getter = client.call([2]);
+    const good = client.call([3]);
+    assert.equal(server.serve(request=>{
+        if (request[0] === 1)
+        {
+            throw Object.create(null);
+        }
+        if (request[0] === 2)
+        {
+            throw { get message(){
+                throw new Error('no');
+            } };
+        }
+        return [request[0]];
+    }, { timeoutMs: 0 }), 2);
+    await assert.rejects(odd, ChannelFailed);
+    await assert.rejects(getter, ChannelFailed);
+    assert.equal(server.serve(request=>[request[0]], { timeoutMs: 0 }), 1);
+    assert.deepEqual([...await good], [3]);
+});

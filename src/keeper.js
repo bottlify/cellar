@@ -44,6 +44,8 @@ const MIB = 1024 * 1024;
 const MAX_RECORDS = 1 << 20;
 const MAX_NAME_UNITS = 1 << 25;
 const FIRST_TABLE = 1024;
+/** Packs a run opens at most: 64 TiB of the default packs. */
+const MAX_PACKS = 1 << 20;
 /** The layout of the index saved on the disk: another is not read. */
 const INDEX_VERSION = 1;
 
@@ -451,7 +453,8 @@ export async function openKeeper(options){
     };
 
     const openNextPack = ()=>{
-        if (disk !== null && !closed && nextPack === null && readyPack === null)
+        if (disk !== null && !closed && nextPack === null && readyPack === null
+            && packs.length < MAX_PACKS)
         {
             const name = `pack-${packs.length}`;
             const opening = disk;
@@ -490,6 +493,12 @@ export async function openKeeper(options){
         const length = get(id, R_LENGTH);
         if (pack < 0 || packTop + length > packBytes)
         {
+            // Past the packs a run reads back, the disk is full: an index of
+            // more would not be read.
+            if (packs.length >= MAX_PACKS)
+            {
+                return false;
+            }
             if (readyPack === null)
             {
                 openNextPack();
@@ -622,9 +631,9 @@ export async function openKeeper(options){
                 return null;
             }
             const saved = JSON.parse(new TextDecoder().decode(bytes));
-            return saved?.version === INDEX_VERSION && Number.isInteger(saved.generation)
-                && Number.isInteger(saved.packs) && saved.packs >= 0 && Array.isArray(saved.records)
-                ? saved : null;
+            return saved?.version === INDEX_VERSION && Number.isSafeInteger(saved.generation)
+                && Number.isInteger(saved.packs) && saved.packs >= 0 && saved.packs <= MAX_PACKS
+                && Array.isArray(saved.records) ? saved : null;
         }
         catch {
             // Torn mid-write, or not read: the other file is the index.
@@ -723,18 +732,20 @@ export async function openKeeper(options){
     try
     {
         await load();
+        keepSpare();
+        openNextPack();
     }
     catch (e){
-        // A file the disk would not open: the ones it did are let go, so the
-        // next try finds none of them held.
+        // A file the disk would not open, or a segment not made or told of:
+        // the files opened are let go, and a pack still opening is let go of
+        // where it opens, so the next try finds none of them held.
+        closed = true;
         for (const file of [...packs, ...indexFiles])
         {
             closeFile(file);
         }
         throw e;
     }
-    keepSpare();
-    openNextPack();
 
     const keeper = {
         shared,

@@ -364,3 +364,16 @@ test('a ring of a capacity that is not a number of bytes is refused', ()=>{
         assert.throws(()=>createRingMemory(capacity), RangeError);
     }
 });
+
+test('a take that releases its own record: freed once, and the drain throws rather than free the'
+    + ' next', ()=>{
+    const ring = openRing(createRingMemory(256));
+    ring.write(Uint8Array.of(1));
+    ring.write(Uint8Array.of(2));
+    assert.throws(()=>ring.drain(()=>ring.release()), /no record peeked/);
+    /** @type {number[]} */
+    const taken = [];
+    assert.equal(ring.drain(record=>void taken.push(record[0])), 1);
+    assert.deepEqual(taken, [2], 'the first freed once, the second still there');
+    assert.equal(ring.held(), 0);
+});

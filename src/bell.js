@@ -170,11 +170,11 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
         }
         Atomics.add(words, sleeps, 1);
         slept = true;
-        // The bell read after the count rose and before the last looks: a
-        // move or a close after it moves the bell, and the sleep returns.
-        const rung = bell === index ? seen : Atomics.load(words, bell);
         try
         {
+            // The bell read after the count rose and before the last looks: a
+            // move or a close after it moves the bell, and the sleep returns.
+            const rung = bell === index ? seen : Atomics.load(words, bell);
             if (Atomics.load(words, index) === seen
                 && (closed < 0 || Atomics.load(words, closed) === 0))
             {
