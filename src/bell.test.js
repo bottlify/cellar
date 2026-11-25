@@ -58,15 +58,16 @@ test('no wake is lost between a wait\'s last look and its sleep', { timeout: 600
             const there = openDoorbell(workerData.there);
             const here = openDoorbell(workerData.here);
             let woke = 0;
+            let notified = 0;
             for (let turn = 0; turn < workerData.turns; turn++)
             {
-                if (workerData.first) here.ring();
+                if (workerData.first && here.ring()) notified++;
                 const end = there.wait(turn, 2000, 0);
                 if (end === 'timed-out') throw new Error('both sides asleep at turn ' + turn);
                 if (end === 'woke') woke++;
-                if (!workerData.first) here.ring();
+                if (!workerData.first && here.ring()) notified++;
             }
-            parentPort.postMessage(woke);
+            parentPort.postMessage({ woke, notified });
         });`, { eval: true, workerData: { bell: new URL('./bell.js', import.meta.url).href,
         first, there, here, turns } });
     const workers = [side(true, pong, ping), side(false, ping, pong)];
@@ -74,11 +75,16 @@ test('no wake is lost between a wait\'s last look and its sleep', { timeout: 600
     workers.forEach(worker=>worker.unref());
     try
     {
-        const woke = await Promise.all(workers.map(worker=>new Promise((resolve, reject)=>{
-            worker.once('message', resolve);
-            worker.once('error', reject);
-        })));
-        assert.ok(woke.some(count=>count > 0), 'a side did sleep and was woken');
+        const [first, second] = /** @type {{ woke: number, notified: number }[]} */ (
+            await Promise.all(workers.map(worker=>new Promise((resolve, reject)=>{
+                worker.once('message', resolve);
+                worker.once('error', reject);
+            }))));
+        assert.ok(first.woke + second.woke > 0, 'a side did sleep and was woken');
+        // A side notifies only a wait that counted itself asleep: never more
+        // notifies than the other side's waits that ended so.
+        assert.ok(first.notified <= second.woke && second.notified <= first.woke,
+            JSON.stringify({ first, second }));
     }
     finally
     {

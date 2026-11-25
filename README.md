@@ -83,7 +83,7 @@ request names where it lies (a body in the cache, a range of a shared buffer).
 ```js
 import { createChannel, openClient, openServer } from '@bottlify/cellar';
 
-const channel = createChannel({ slots: 16, slotBytes: 4096 });   // hand it to both threads
+const channel = createChannel({ slots: 16, slotBytes: 4096 });   // slots a power of two; hand it to both threads
 
 // In the worker: answer each request, read in place.
 const server = openServer(channel);

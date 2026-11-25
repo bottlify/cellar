@@ -43,9 +43,10 @@ export const SPIN_MS = 0.05;
 const SPIN_LOOKS = 255;
 
 /**
- * How a wait ended: the word moved before it slept (`moved`) or after
- * (`woke`), the deadline passed (`timed-out`), or the closed word was set
- * first (`closed`).
+ * How a wait ended: the word moved before it counted itself asleep (`moved`)
+ * or after (`woke`: a mover may have seen the count and notified it, whether
+ * or not the sleep itself began), the deadline passed (`timed-out`), or the
+ * closed word was set first (`closed`).
  *
  * @typedef {'moved' | 'woke' | 'timed-out' | 'closed'} WaitEnd
  */
@@ -130,6 +131,7 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
             return 'timed-out';
         }
         Atomics.add(words, sleeps, 1);
+        slept = true;
         // The bell read after the count rose and before the last looks: a
         // move or a close after it moves the bell, and the sleep returns.
         const rung = bell === index ? seen : Atomics.load(words, bell);
@@ -137,7 +139,6 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
             && (closed < 0 || Atomics.load(words, closed) === 0))
         {
             Atomics.wait(words, bell, rung, left === Infinity ? undefined : left);
-            slept = true;
         }
         Atomics.sub(words, sleeps, 1);
     }
@@ -170,6 +171,7 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
             return 'timed-out';
         }
         Atomics.add(words, sleeps, 1);
+        slept = true;
         const rung = bell === index ? seen : Atomics.load(words, bell);
         if (Atomics.load(words, index) === seen
             && (closed < 0 || Atomics.load(words, closed) === 0))
@@ -178,7 +180,6 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
                 left === Infinity ? undefined : left);
             if (waited?.async)
             {
-                slept = true;
                 // Node lets a thread whose loop has only this wait end:
                 // something of the loop's own keeps it while it waits. A
                 // browser keeps its threads, and the wait costs no timer there.
@@ -198,7 +199,6 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
             else if (!waited)
             {
                 // No waitAsync here: look again on a later turn of the loop.
-                slept = true;
                 await new Promise(resolve=>setTimeout(resolve, 1));
             }
         }

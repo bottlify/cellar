@@ -71,7 +71,7 @@ const bellOf = counter=>(counter === ASKED ? SERVER_BELL : CLIENT_BELL);
 
 /**
  * @typedef {Object} ChannelOptions
- * @property {number} [slots]  requests out at once, at most (16)
+ * @property {number} [slots]  requests out at once, at most, a power of two (16)
  * @property {number} [slotBytes]  bytes of a request or an answer, at most (4096)
  */
 
@@ -83,9 +83,13 @@ const bellOf = counter=>(counter === ASKED ? SERVER_BELL : CLIENT_BELL);
  * @returns {SharedArrayBuffer}
  */
 export function createChannel({ slots = 16, slotBytes = 4096 } = {}){
-    if (!Number.isInteger(slots) || slots < 1 || !Number.isInteger(slotBytes) || slotBytes < 0)
+    // A power of two: a request's slot is its count's low bits, which go on
+    // in order across the count's wrap at 2^32; three slots would put the
+    // requests counted 2^32 - 1 and 0 in one slot.
+    if (!Number.isInteger(slots) || slots < 1 || (slots & (slots - 1)) !== 0
+        || !Number.isInteger(slotBytes) || slotBytes < 0)
     {
-        throw new RangeError(`channel: ${slots} slots of ${slotBytes} bytes`);
+        throw new RangeError(`channel: ${slots} slots of ${slotBytes} bytes (slots a power of two)`);
     }
     const stride = slotStride(slotBytes);
     const memory = new SharedArrayBuffer(HEADER_WORDS * 4 + 2 * slots * stride);
@@ -126,7 +130,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} base @param {number} n
      */
     const slotAt = (base, n)=>{
-        const slot = (n >>> 0) % slots;
+        const slot = n & (slots - 1);
         const at = base + slot * stride;
         const length = words[at >> 2];
         // A view a slot, made again only when its length changes: a call
@@ -155,7 +159,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
         {
             throw new RangeError(`channel: ${message.length} bytes, a slot holds ${slotBytes}`);
         }
-        const at = base + ((n >>> 0) % slots) * stride;
+        const at = base + (n & (slots - 1)) * stride;
         bytes.set(message, at + 4);
         words[at >> 2] = message.length;
     };

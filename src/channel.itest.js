@@ -41,7 +41,7 @@ test('a thread that blocks serves another that asks, blocking and not', { timeou
 });
 
 test('a thread with an event loop to keep serves on it', { timeout: 120_000 }, async()=>{
-    const memory = createChannel({ slots: 3, slotBytes: GATE_SLOT_BYTES });
+    const memory = createChannel({ slots: 4, slotBytes: GATE_SLOT_BYTES });
     const server = openServer(memory);
     const client = new Worker(WORKER, { workerData: { role: 'client', memory, seed: 23, count: COUNT } });
     const done = resultOf(client);

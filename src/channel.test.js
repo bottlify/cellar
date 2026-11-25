@@ -51,7 +51,7 @@ test('no more calls go out than there are slots: the next waits for an answer', 
 });
 
 test('a slot wraps past its count many times and past 2^32 requests', async()=>{
-    const memory = createChannel({ slots: 3, slotBytes: 4 });
+    const memory = createChannel({ slots: 4, slotBytes: 4 });
     // Both counters near the wrap, as a channel that ran long has them.
     const words = new Int32Array(memory);
     for (const counter of COUNTS)
@@ -148,5 +148,29 @@ test('a close moves the bells both sides sleep on: a wait that looked before the
             assert.equal(Atomics.wait(words, bell, seen[at], 1000), 'not-equal',
                 `${closing} closed: bell ${bell}`);
         });
+    }
+});
+
+test('requests out together across the counts\' wrap each keep their own slot', async()=>{
+    // Three slots put the requests counted 2^32 - 1 and 0 in one: refused.
+    assert.throws(()=>createChannel({ slots: 3 }), /power of two/);
+    for (const slots of [1, 2, 4, 8, 16])
+    {
+        const memory = createChannel({ slots, slotBytes: 4 });
+        // The counts just short of 2^32, so the requests out at once straddle it.
+        const words = new Int32Array(memory);
+        for (const counter of COUNTS)
+        {
+            words[counter] = -1 - Math.floor(slots / 2);
+        }
+        const client = openClient(memory);
+        const server = openServer(memory);
+        for (let round = 0; round < 3; round++)
+        {
+            const answers = Array.from({ length: slots }, (_, n)=>client.call([round, n]));
+            server.serve(request=>[request[0], request[1], 9], { timeoutMs: 0 });
+            assert.deepEqual((await Promise.all(answers)).map(answer=>[...answer]),
+                Array.from({ length: slots }, (_, n)=>[round, n, 9]), `${slots} slots, round ${round}`);
+        }
     }
 });
