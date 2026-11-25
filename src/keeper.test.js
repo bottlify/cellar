@@ -376,17 +376,39 @@ test('a cold body is raised only into a segment the asking thread has', async()=
 
 test('a body the disk holds less of than the index says is gone, not answered with other bytes',
     async()=>{
+        // The pack gone before the run: its entries are skipped as the index is read.
         const disk = memoryDisk();
         const first = await cacheOf({ disk });
         first.reader.put('doc', bodyOf(8000, 5), { onlyCopy: true });
         first.keeper.close();
         disk.files.delete('pack-0');
         const second = await cacheOf({ disk });
-        second.reader.put('other', bodyOf(8000, 99));
-        second.keeper.drop('other');
-        assert.equal(second.reader.with('doc', body=>body.slice(), { wait: true }), undefined);
         assert.equal(second.reader.look('doc'), null);
-        assert.equal(second.keeper.figures().lostOnDisk, 1);
+        assert.equal(second.keeper.figures().skippedEntries, 1);
+
+        // The pack read short while the run goes on: the body is gone, not another's bytes.
+        let short = false;
+        const cut = {
+            files: disk.files,
+            async open(/** @type {string} */ name){
+                const file = await disk.open(name);
+                return { ...file,
+                    read(/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where){
+                        return short ? file.read(view.subarray(0, view.length >> 1), where)
+                            : file.read(view, where);
+                    } };
+            },
+        };
+        const third = await cacheOf({ disk: cut });
+        third.reader.put('doc', bodyOf(8000, 6), { onlyCopy: true });
+        third.step(150);
+        assert.equal(third.reader.look('doc'), 'cold');
+        third.reader.put('other', bodyOf(8000, 99));
+        third.keeper.drop('other');
+        short = true;
+        assert.equal(third.reader.with('doc', body=>body.slice(), { wait: true }), undefined);
+        assert.equal(third.reader.look('doc'), null);
+        assert.equal(third.keeper.figures().lostOnDisk, 1);
     });
 
 test('a body saved by a run of larger segments is not raised, and moves nothing', async()=>{
@@ -569,8 +591,108 @@ test('an index entry that does not say a body is skipped, the rest read', async(
 
 test('an idle span past half the keeper\'s 32-bit clock is refused', async()=>{
     for (const options of [{ coldAfterMs: 2 ** 31 }, { goneAfterMs: 30 * 24 * 3600_000 },
-        { releaseAfterMs: NaN }, { coldAfterMs: -1 }])
+        { releaseAfterMs: NaN }, { coldAfterMs: -1 }, { packBytes: 2 ** 31 }])
     {
         await assert.rejects(openKeeper({ budget: 256 * KIB, ...options }), RangeError);
     }
 });
+
+test('a body idle longer than the clock\'s half, with no sweep between, is as old as it is', async()=>{
+    const { reader, step } = await cacheOf({ disk: memoryDisk(), goneAfterMs: 24 * 3600_000 });
+    reader.put('a', bodyOf(100, 1));
+    step(150);
+    assert.equal(reader.look('a'), 'cold');
+    step(2 ** 31 + 10);
+    assert.equal(reader.look('a'), null, 'gone: idle 24.8 days and more');
+});
+
+test('a disk that throws at once when a pack is opened is counted, and no body is left mid-move',
+    async()=>{
+        const base = memoryDisk();
+        const disk = {
+            open(/** @type {string} */ name){
+                if (name.startsWith('pack'))
+                {
+                    throw new Error('no room');
+                }
+                return base.open(name);
+            },
+        };
+        const { reader, keeper, step } = await cacheOf({ disk });
+        reader.put('a', bodyOf(100, 1), { onlyCopy: true });
+        step(150);
+        assert.equal(reader.look('a'), 'hot', 'an only copy the disk did not take stays');
+        assert.ok(keeper.figures().diskFailures > 0);
+        assert.equal(keeper.save(), false);
+    });
+
+test('a pack still opening at close whose close throws is counted, not left a rejection', async()=>{
+    /** @type {unknown[]} */
+    const rejected = [];
+    const listen = (/** @type {unknown} */ reason)=>rejected.push(reason);
+    process.on('unhandledRejection', listen);
+    try
+    {
+        const base = memoryDisk();
+        /** @type {(() => void)[]} */
+        const later = [];
+        const disk = {
+            async open(/** @type {string} */ name){
+                const file = await base.open(name);
+                if (name === 'pack-0')
+                {
+                    await new Promise(resolve=>later.push(()=>resolve(undefined)));
+                }
+                return { ...file,
+                    close(){
+                        throw new Error('busy');
+                    } };
+            },
+        };
+        const keeper = await openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk });
+        keeper.close();
+        later.forEach(go=>go());
+        await new Promise(resolve=>setTimeout(resolve, 10));
+        assert.deepEqual(rejected, []);
+        assert.ok(keeper.figures().diskFailures > 0);
+    }
+    finally
+    {
+        process.off('unhandledRejection', listen);
+    }
+});
+
+test('an index entry past its pack\'s file, of other fields, or an index read short is not trusted',
+    async()=>{
+        const disk = memoryDisk();
+        const first = await cacheOf({ disk });
+        first.reader.put('a', bodyOf(100, 1));
+        first.keeper.save();
+        first.reader.put('b', bodyOf(100, 2));
+        first.keeper.close();
+        const files = [...disk.files].filter(([file])=>file.startsWith('index-'))
+            .sort(([, x], [, y])=>y.length - x.length);
+        const [name, bytes] = files[0];
+        const saved = JSON.parse(new TextDecoder().decode(bytes));
+        saved.records.push(['c', 0, 2 ** 40, 10, 0], ['d', 0, 0, 2 ** 31, 0], ['e', 0, 0, 10, 0, 1],
+            ['f', 0, 0, 10]);
+        disk.files.set(name, new TextEncoder().encode(JSON.stringify(saved)));
+        const second = await cacheOf({ disk });
+        assert.equal(second.keeper.figures().loaded, 2);
+        assert.equal(second.keeper.figures().skippedEntries, 4);
+
+        // The newer index read short: the one before it is read.
+        const short = {
+            files: disk.files,
+            async open(/** @type {string} */ file){
+                const opened = await disk.open(file);
+                return { ...opened,
+                    read(/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where){
+                        return file === name ? opened.read(view.subarray(1), where) : opened.read(view, where);
+                    } };
+            },
+        };
+        const third = await cacheOf({ disk: short });
+        assert.equal(third.reader.look('a'), 'cold');
+        assert.equal(third.reader.look('b'), null, 'saved in the index read short only');
+    });

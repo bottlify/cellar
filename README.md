@@ -80,7 +80,12 @@ A `reserve` the keeper refuses leaves the name's body as it was; one it grants t
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
 the name has no body then, and the room goes back. A thread joining later is handed
 `keeper.shared` and `keeper.segmentBuffers()` as they are then. A write the disk takes in part
-counts as not written; a save that fails leaves the last whole index, which the next run reads.
+counts as not written. `save()` writes the hot bodies the disk lacks, then an index of exactly the
+bodies the disk holds, after the packs are flushed: the index is always true, and `false` says some
+body stayed in memory only (the disk refused it, or the next pack was not open yet). A save that
+fails at the index leaves the last whole one, which the next run reads; an entry of it that does
+not fit its pack's file is skipped and counted (`skippedEntries`). After `close()` the files are
+let go and the keeper goes on in memory, as without a disk.
 The idle spans (`coldAfterMs`, `goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's
 clock is a 32-bit word. Records and names are not reused within a run: a run holds 2^20 records
 and 2^25 UTF-16 units of names, past which a new name is refused. The `raise` a reader is given

@@ -98,6 +98,11 @@ export async function openKeeper(options){
             throw new RangeError(`cache: ${name} ${ms} is not a span of 0 to 24.8 days`);
         }
     }
+    // A body's place in a segment and in a pack is a 32-bit word of its record.
+    if (!(packBytes > 0 && packBytes < 2 ** 31))
+    {
+        throw new RangeError(`cache: packs of ${packBytes} bytes: a pack holds under 2 GiB`);
+    }
     const shared = {
         records: growableShared((HEADER_WORDS + 1024 * RECORD_WORDS) * 4,
             (HEADER_WORDS + MAX_RECORDS * RECORD_WORDS) * 4),
@@ -127,7 +132,7 @@ export async function openKeeper(options){
         reserved: 0, refusedBusy: 0, refusedRoom: 0, refusedLarge: 0, refusedUnseen: 0,
         replaced: 0, raised: 0, raiseFailed: 0, cooled: 0, written: 0, writtenBytes: 0, gone: 0,
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
-        diskFailures: 0, lostOnDisk: 0, abandoned: 0,
+        diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0,
     };
 
     /**
@@ -135,8 +140,16 @@ export async function openKeeper(options){
      * after 24.8 days, so times are compared by `age`, never by size.
      */
     const tick = ()=>Math.max(0, Math.floor(now() - started)) | 0;
-    /** @param {number} at @param {number} since  both of `tick` */
-    const age = (at, since)=>(at - since) | 0;
+    /**
+     * How long since `since`, both of `tick`. A stamp is never after the
+     * clock, so a difference past half the word is one that long ago or more.
+     *
+     * @param {number} at @param {number} since
+     */
+    const age = (at, since)=>{
+        const ms = (at - since) | 0;
+        return ms < 0 ? 2 ** 31 : ms;
+    };
 
     // --- records ------------------------------------------------------------
 
@@ -421,7 +434,10 @@ export async function openKeeper(options){
     const openNextPack = ()=>{
         if (disk !== null && !closed && nextPack === null && readyPack === null)
         {
-            nextPack = Promise.resolve(disk.open(`pack-${packs.length}`))
+            const name = `pack-${packs.length}`;
+            // A disk that throws at once fails the same way as one whose
+            // promise does: counted, and the body that wanted it stays.
+            nextPack = Promise.resolve().then(()=>disk.open(name))
                 .then(file=>{
                     readyPack = file;
                     nextPack = null;
@@ -572,7 +588,10 @@ export async function openKeeper(options){
     /** @param {DiskFile} file */
     const readIndex = file=>{
         const bytes = new Uint8Array(file.getSize());
-        file.read(bytes, { at: 0 });
+        if (file.read(bytes, { at: 0 }) !== bytes.length)
+        {
+            return null;
+        }
         try
         {
             const saved = JSON.parse(new TextDecoder().decode(bytes));
@@ -616,14 +635,18 @@ export async function openKeeper(options){
         {
             // An entry that does not say a body is skipped, not trusted: the
             // rest of the index is still the disk's.
-            if (!Array.isArray(entry) || typeof entry[0] !== 'string'
-                || !entry.slice(1, 5).every(Number.isInteger))
+            if (!Array.isArray(entry) || entry.length !== 5 || typeof entry[0] !== 'string'
+                || !entry.slice(1).every(Number.isInteger))
             {
+                counts.skippedEntries++;
                 continue;
             }
             const [name, from, offset, length, flags] = entry;
-            if (from < 0 || from >= packs.length || offset < 0 || !(length > 0))
+            // Within a pack this run opened, and within that pack's file.
+            if (from < 0 || from >= packs.length || offset < 0 || !(length > 0)
+                || offset + length > packs[from].getSize())
             {
+                counts.skippedEntries++;
                 continue;
             }
             const id = recordOf(name);
@@ -990,7 +1013,15 @@ export async function openKeeper(options){
                     counts.diskFailures++;
                 }
             }
-            nextPack?.then(file=>file.close(), ()=>{});
+            nextPack?.then(file=>{
+                try
+                {
+                    file.close();
+                }
+                catch {
+                    counts.diskFailures++;
+                }
+            }, ()=>{});
             packs.length = 0;
             indexFiles.length = 0;
             readyPack = null;
