@@ -44,33 +44,81 @@ by the name it will have on npm.
 
 ## Use
 
-The keeper runs in one thread. It hands out the index and the segments every thread reads:
+Every example below is two files: `page.js`, the page's own thread, which may never block, and
+`worker.js`, a module worker, which may. The shared memory is made on one side and handed to the
+other once, by `postMessage`; from then on the two talk through it.
+
+The keeper runs in one thread, here the page's. It hands each worker the index and the segments,
+and answers the few calls a worker makes of it (room to write, a body brought back from the disk)
+over a channel:
 
 ```js
-import { openKeeper } from '@bottlify/cellar';
+// page.js
+import { createChannel, openKeeper, openServer } from '@bottlify/cellar';
 
+/** @type {Worker | undefined} */
+let worker;
 const keeper = await openKeeper({
-    budget: 256 << 20,           // bytes of shared memory for hot bodies, at most
-    disk,                        // OPFS sync handles, or null for memory only
-    announce: message=>workers.forEach(worker=>worker.postMessage(message)),
+    budget: 256 << 20,                                   // bytes of shared memory for hot bodies, at most
+    disk: null,                                          // or OPFS sync handles, opened in a worker
+    announce: message=>worker?.postMessage(message),     // segments made and let go, a larger table
 });
-// Each worker gets keeper.shared and keeper.segmentBuffers(); the keeper sweeps idle bodies.
-setInterval(()=>keeper.sweep(), 1000);
+setInterval(()=>keeper.sweep(), 1000);                   // idle bodies go cold, then away
+
+// The worker's calls to the keeper, answered on the page's event loop.
+const channel = createChannel();
+const server = openServer(channel);
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+(async()=>{
+    for (;;)
+    {
+        await server.serveAsync(request=>{
+            const { op, name, length, options } = JSON.parse(decoder.decode(request));
+            const answer = op === 'reserve' ? keeper.reserve(name, length, options)
+                : op === 'raise' ? keeper.raise(name, options) : keeper.drop(name);
+            return encoder.encode(JSON.stringify(answer));
+        });
+    }
+})();
+
+// The index and the segments as they are now; the ones made after come by `announce`.
+worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+worker.postMessage({ shared: keeper.shared, segments: keeper.segmentBuffers(), channel });
 ```
 
-Each thread reads through a reader. It reaches the keeper only for room to write and for a body
-to be brought back from the disk, through whatever blocking call its threads already have:
-
 ```js
-import { createReader } from '@bottlify/cellar';
+// worker.js
+import { createReader, openClient } from '@bottlify/cellar';
 
-const cache = createReader({ shared, segments, keeper: calls });
-self.onmessage = event=>cache.adopt(event.data);   // segments made and let go
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+let cache = null;
 
-const sum = cache.with('blocks/42', body=>checksum(body));   // undefined on a miss
-const into = cache.reserve('blocks/43', length);              // write in place
-into?.set(bytes);
-cache.commit('blocks/43');
+self.onmessage = ({ data })=>{
+    if (data.shared === undefined)
+    {
+        cache.adopt(data);                               // a segment made or let go, a larger table
+        return;
+    }
+    const client = openClient(data.channel);
+    const send = call=>encoder.encode(JSON.stringify(call));
+    // A worker may block: room to write is asked and waited for.
+    const ask = call=>JSON.parse(decoder.decode(client.ask(send(call))));
+    cache = createReader({ shared: data.shared, segments: data.segments, keeper: {
+        reserve: (name, length, options)=>ask({ op: 'reserve', name, length, options }),
+        raise: (name, options)=>ask({ op: 'raise', name, options }),
+        raiseLater: name=>{
+            client.call(send({ op: 'raise', name })).catch(()=>{});   // not waited for
+        },
+        drop: name=>{
+            client.call(send({ op: 'drop', name })).catch(()=>{});
+        },
+    } });
+
+    cache.put('blocks/42', bytes);                       // reserve, copy, commit
+    const sum = cache.with('blocks/42', body=>checksum(body));   // read in place; undefined on a miss
+};
 ```
 
 A body is read only inside `with`: the keeper never takes a body a reader is in. A body that can
@@ -105,19 +153,46 @@ request once and need not wait for anything but the answer. What is large is not
 request names where it lies (a body in the cache, a range of a shared buffer).
 
 ```js
-import { createChannel, openClient, openServer } from '@bottlify/cellar';
+// page.js - the page's own thread may not block: it calls and awaits.
+import { createChannel, openClient } from '@bottlify/cellar';
 
-const channel = createChannel({ slots: 16, slotBytes: 4096 });   // slots a power of two; hand it to both threads
+const channel = createChannel({ slots: 16, slotBytes: 4096 });   // slots a power of two
+const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+worker.postMessage({ channel });                                 // the shared memory, once
 
-// In the worker: answer each request, read in place.
-const server = openServer(channel);
-for (;;) server.serve(request=>answerTo(request));   // blocks; serveAsync keeps the event loop
-
-// In the asking thread: blocking (a worker) or not (any thread, a page's own too).
 const client = openClient(channel);
-const answer = client.ask(request);                  // a copy, or { read } reads it in place
-const later = await client.call(request);
+const sum = await client.call(Uint8Array.of(1, 2, 3), { read: answer=>answer[0] });   // 6
+client.close();                                                  // the worker's serve ends
 ```
+
+```js
+// worker.js - a worker may block: it serves, asleep on the channel between requests.
+import { ChannelClosed, openServer } from '@bottlify/cellar';
+
+self.onmessage = ({ data })=>{
+    const server = openServer(data.channel);
+    try
+    {
+        for (;;)
+        {
+            // The request read where it lies; the answer's bytes returned.
+            server.serve(request=>[request.reduce((sum, value)=>sum + value, 0)]);
+        }
+    }
+    catch (e)
+    {
+        if (!(e instanceof ChannelClosed))
+        {
+            throw e;
+        }
+    }
+};
+```
+
+A worker that asks blocks for its answer, with no promise and no garbage: `client.ask(request)`
+answers it at once (a copy, or `{ read }` reads it in place). A worker that must keep its event
+loop serves with `await server.serveAsync(handler)` instead of `serve`.
+
 
 One asking side and one serving side for the channel's life; a thread that needs a new link (a
 worker started again) makes a new channel. Answers come back in order, as many requests out at
@@ -156,22 +231,43 @@ on it, counted beside it; whoever moves the word notifies only when a wait sleep
 bell several rings share, so a thread reading several waits once for all of them.
 
 ```js
-import { createRingMemory, openRing, createDoorbell, openDoorbell } from '@bottlify/cellar';
+// page.js - pointer moves to a worker busy with long work, which reads them between its steps.
+import { createDoorbell, createRingMemory, openRing } from '@bottlify/cellar';
 
 const bell = createDoorbell();                       // one per reading thread
-const memory = createRingMemory(1 << 20, bell);      // hand it to both threads
+const memory = createRingMemory(1 << 16, bell);
+const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+worker.postMessage({ memory });
 
-openRing(memory).write(bytes);                       // the writer: false when it does not fit
-
-const ring = openRing(memory);                       // the reader
-const doorbell = openDoorbell(bell);
-for (;;)
-{
-    const seen = doorbell.seen();                    // before the look: nothing written after it is missed
-    ring.drain(record=>take(record));                // each record a view, valid inside the call
-    doorbell.wait(seen);                             // blocks; waitAsync keeps the event loop
-}
+const ring = openRing(memory);
+const record = new Uint8Array(8);
+const fields = new DataView(record.buffer);
+addEventListener('pointermove', event=>{
+    fields.setInt32(0, event.clientX, true);
+    fields.setInt32(4, event.clientY, true);
+    ring.write(record);                              // false when the ring is full
+});
 ```
+
+```js
+// worker.js
+import { openDoorbell, openRing } from '@bottlify/cellar';
+
+self.onmessage = ({ data })=>{
+    const ring = openRing(data.memory);
+    const doorbell = openDoorbell(data.memory.bell);
+    while (!ring.closed())
+    {
+        const seen = doorbell.seen();                // before the look: nothing written after it is missed
+        ring.drain(record=>{                         // each record a view, valid inside the call
+            const fields = new DataView(record.buffer, record.byteOffset, record.length);
+            move(fields.getInt32(0, true), fields.getInt32(4, true));
+        });
+        doorbell.wait(seen);                         // blocks; waitAsync keeps the event loop
+    }
+};
+```
+
 
 A writer that may not block (a page) waits for room with `writeWaitingAsync`; `drain(take, most)`
 takes at most `most` records, so one ring written without a pause does not starve the others a
