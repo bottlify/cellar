@@ -16,20 +16,25 @@
  *                 by `commit`: no copy
  *
  * Each batch is the same work to build (a word written every 4 bytes) and to
- * read (every word summed). Printed for each size and arm: the processor
- * time each thread spent a batch (not wall time: a loaded machine's waits
- * are not counted), the median of the runs, then the lowest and highest.
+ * read (every word summed). Printed for each size and arm, the median of the
+ * runs, then the lowest and highest: the wall time a batch takes, batches
+ * sent one after another; and the processor time both threads spent a batch,
+ * their waits included -- a ring's side looks a moment before it sleeps, a
+ * posting side sleeps in its event loop, so each way's waiting is paid as it
+ * is. A gibibyte a run: a thread's processor clock moves in coarse steps, and
+ * a short run measures them.
  *
- *   node examples/batches.mjs [runs]
+ *   node examples/batches.mjs [runs] [sizes, e.g. 65536,262144]
  */
 
 import { MessageChannel, Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { createRingMemory, openRing } from '../src/index.js';
 
 const SIZES = [64, 8 << 10, 64 << 10, 256 << 10];
-/** Bytes sent a run, whatever the batch size, at least this many batches. */
-const BYTES = 256 << 20;
+/** Bytes sent a run, whatever the batch size, between so many batches. */
+const BYTES = 1 << 30;
 const MIN_BATCHES = 2000;
+const MAX_BATCHES = 1_000_000;
 const ARMS = ['post', 'ring write', 'ring reserve'];
 /** Buffers a posting sender keeps in flight before it waits for one back. */
 const IN_FLIGHT = 8;
@@ -98,16 +103,18 @@ if (!isMainThread)
         let n = 0;
         let check = 0;
         let start = 0;
+        let began = 0;
         port.on('message', (/** @type {ArrayBuffer} */ buffer)=>{
             if (n === 0)
             {
                 start = cpu();
+                began = performance.now();
             }
             check = (check + sum(new Uint32Array(buffer))) | 0;
             port.postMessage(buffer, [buffer]);
             if (++n === count)
             {
-                parentPort?.postMessage({ spent: cpu() - start, check });
+                parentPort?.postMessage({ spent: cpu() - start, wall: performance.now() - began, check });
                 port.close();
             }
         });
@@ -141,10 +148,12 @@ if (!isMainThread)
         let n = 0;
         let check = 0;
         let start = 0;
+        let began = 0;
         const take = (/** @type {Uint8Array} */ record)=>{
             if (n === 0)
             {
                 start = cpu();
+                began = performance.now();
             }
             check = (check + sum(new Uint32Array(record.buffer, record.byteOffset, words))) | 0;
             n++;
@@ -157,7 +166,7 @@ if (!isMainThread)
                 ring.bell.wait(seen);
             }
         }
-        parentPort?.postMessage({ spent: cpu() - start, check });
+        parentPort?.postMessage({ spent: cpu() - start, wall: performance.now() - began, check });
     }
 }
 else
@@ -170,7 +179,7 @@ else
     });
     /** One run of an arm: processor microseconds a batch, the sender's and the reader's. */
     const run = async(/** @type {string} */ arm, /** @type {number} */ size)=>{
-        const count = Math.max(MIN_BATCHES, Math.floor(BYTES / size));
+        const count = Math.min(MAX_BATCHES, Math.max(MIN_BATCHES, Math.floor(BYTES / size)));
         const shared = { arm, size, count };
         /** @type {Worker} */
         let sender;
@@ -192,7 +201,9 @@ else
         }
         const [sent, read] = await Promise.all([answer(sender), answer(reader)]);
         await Promise.all([sender.terminate(), reader.terminate()]);
-        return { send: /** @type {number} */ (sent) / count, read: /** @type {any} */ (read).spent / count };
+        const got = /** @type {any} */ (read);
+        return { send: /** @type {number} */ (sent) / count, read: got.spent / count,
+            wall: got.wall * 1000 / count };
     };
     /** @param {number[]} list */
     const spread = list=>{
@@ -200,26 +211,29 @@ else
         const f = (/** @type {number} */ v)=>v.toFixed(2);
         return `${f(sorted[sorted.length >> 1])} (${f(sorted[0])}-${f(sorted.at(-1) ?? 0)})`;
     };
-    console.log(`node ${process.version}, ${runs} runs an arm alternated; processor us a batch, `
-        + 'median (lowest-highest)');
-    for (const size of SIZES)
+    console.log(`node ${process.version}, ${runs} runs an arm alternated, median (lowest-highest): `
+        + 'wall us a batch (one batch after another, both threads busy), then processor us a batch, '
+        + 'sender + reader, a wait included (a ring\'s side spins a moment before it sleeps; a '
+        + 'posting side sleeps in its event loop)');
+    const sizes = process.argv[3] ? process.argv[3].split(',').map(Number) : SIZES;
+    for (const size of sizes)
     {
-        /** @type {Record<string, { send: number[], read: number[] }>} */
-        const results = Object.fromEntries(ARMS.map(arm=>[arm, { send: [], read: [] }]));
+        /** @type {Record<string, { wall: number[], cpu: number[] }>} */
+        const results = Object.fromEntries(ARMS.map(arm=>[arm, { wall: [], cpu: [] }]));
         await run('ring reserve', size);
         for (let r = 0; r < runs; r++)
         {
             for (const arm of r % 2 === 0 ? ARMS : [...ARMS].reverse())
             {
-                const { send, read } = await run(arm, size);
-                results[arm].send.push(send);
-                results[arm].read.push(read);
+                const { send, read, wall } = await run(arm, size);
+                results[arm].wall.push(wall);
+                results[arm].cpu.push(send + read);
             }
         }
         for (const arm of ARMS)
         {
-            console.log(`${String(size).padStart(7)} B  ${arm.padEnd(13)} sender ${spread(results[arm].send).padEnd(24)}`
-                + ` reader ${spread(results[arm].read)}`);
+            console.log(`${String(size).padStart(7)} B  ${arm.padEnd(13)} wall ${spread(results[arm].wall).padEnd(26)}`
+                + ` processor ${spread(results[arm].cpu)}`);
         }
     }
 }

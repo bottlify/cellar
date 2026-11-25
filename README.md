@@ -315,16 +315,21 @@ terminated while asleep stays counted, and every move after notifies once for it
 
 `examples/batches.mjs` hands batches of bytes from one worker to another, the same work to build
 and to read each way: posted with the buffer transferred and posted back, copied into a ring
-(`write`), and built in the ring (`reserve`, `commit`). Processor time a batch, sender + reader,
-building and reading included (node 26 and node 22, a 4-core x86 VM under load ~10, 5 runs an arm
+(`write`), and built in the ring (`reserve`, `commit`). Batches go one after another, a gibibyte a
+run (a million batches at most). Wall time a batch, and in brackets the processor time of both
+threads a batch, their waits included: a ring's side looks a moment before it sleeps, a posting
+side sleeps in its event loop (node 26 / node 22, a 4-core x86 VM under load ~8, 5 runs an arm
 alternated, medians):
 
 | batch | postMessage | ring `write` | ring `reserve` |
 | --- | --- | --- | --- |
-| 64 B | 5.8 / 6.4 us | 0.45 / 0.44 us | 0.46 / 0.41 us |
-| 8 KiB | 20.8 / 12.9 us | 8.0 / 8.5 us | 6.8 / 5.4 us |
-| 64 KiB | 97.6 / 63.3 us | 42.1 / 60.3 us | 32.3 / 36.5 us |
-| 256 KiB | 314 / 217 us | 176 / 409 us | 143 / 135 us |
+| 64 B | 5.3 / 5.9 us (5.4 / 5.7) | 0.42 / 0.42 us (0.46 / 0.44) | 0.44 / 0.35 us (0.47 / 0.39) |
+| 8 KiB | 14.6 / 12.6 us (15.8 / 12.2) | 7.6 / 8.7 us (8.5 / 8.4) | 7.0 / 6.2 us (7.4 / 5.7) |
+| 64 KiB | 108 / 58 us (103 / 55) | 49 / 62 us (49 / 59) | 39 / 39 us (37 / 37) |
+| 256 KiB | 384 / 195 us (375 / 190) | 162 / 223 us (179 / 213) | 135 / 137 us (134 / 134) |
+
+Copied in, a large batch costs about what a post does on node 22; built in the ring it costs least
+on both.
 
 ## Requirements
 
