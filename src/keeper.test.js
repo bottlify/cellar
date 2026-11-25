@@ -937,3 +937,98 @@ test('a generation past what a save counts to is not read', async()=>{
         assert.equal(next.keeper.save(), true, 'the next save writes');
     }
 });
+
+test('a reader that missed a segment\'s message is placed only below it: an only copy rewritten is'
+    + ' not lost', async()=>{
+    const { reader: full, keeper } = await cacheOf({ budget: 192 * KIB });
+    full.put('a', bodyOf(60 * KIB, 1), { onlyCopy: true });
+    full.put('b', bodyOf(60 * KIB, 2));
+    full.put('c', bodyOf(60 * KIB, 3));
+    keeper.drop('b');
+    // A reader told of segments 0 and 2, not of 1, which is the free one.
+    const [s0, , s2] = keeper.segmentBuffers();
+    const partial = createReader({ shared: keeper.shared, segments: [s0], keeper: {
+        reserve: (name, length, options)=>keeper.reserve(name, length, options),
+        raise: (name, options)=>keeper.raise(name, options),
+        raiseLater: ()=>{}, drop: ()=>{},
+    } });
+    partial.adopt({ segment: 2, buffer: s2 });
+    assert.equal(partial.put('a', bodyOf(60 * KIB, 4), { onlyCopy: true }), true);
+    assert.deepEqual(partial.with('a', body=>[...body]), [...bodyOf(60 * KIB, 4)]);
+    assert.equal(partial.figures().refused, 0);
+});
+
+test('a name\'s own body is not cooled to make room for its rewrite, though its reader left',
+    async()=>{
+        const { reader, keeper } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
+        reader.put('a', bodyOf(60 * KIB, 1));
+        // Read when the rewrite looks at it, out before room is sought: a
+        // reader in another thread leaving between the two.
+        const words = new Int32Array(keeper.shared.records);
+        const state = 16 + 2;
+        Atomics.add(words, state, 1);
+        const compareExchange = Atomics.compareExchange;
+        let leave = true;
+        Atomics.compareExchange = /** @type {any} */ ((/** @type {any} */ array, /** @type {number} */ at,
+            /** @type {number} */ expected, /** @type {number} */ value)=>{
+            const was = compareExchange(array, at, expected, value);
+            if (leave && array.buffer === words.buffer && at === state)
+            {
+                // The rewrite found it read; the reader leaves now.
+                leave = false;
+                Atomics.sub(words, state, 1);
+            }
+            return was;
+        });
+        let place;
+        try
+        {
+            place = keeper.reserve('a', 60 * KIB, { known: 1 });
+        }
+        finally
+        {
+            Atomics.compareExchange = compareExchange;
+        }
+        assert.equal(leave, false, 'the reader left between the two');
+        assert.equal(place, null, 'no room but its own');
+        assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(60 * KIB, 1)], 'as it was');
+    });
+
+test('bytes that grow while they are put are put as long as they were', async()=>{
+    const { reader } = await cacheOf();
+    const shared = new /** @type {any} */ (SharedArrayBuffer)(16, { maxByteLength: 64 * KIB });
+    /** A length-tracking view that grows once its length has been taken. */
+    class Growing extends Uint8Array {
+        get length(){
+            const length = super.length;
+            if (shared.byteLength === 16)
+            {
+                shared.grow(8 * KIB);
+            }
+            return length;
+        }
+    }
+    assert.equal(reader.put('a', new Growing(shared)), true);
+    assert.equal(reader.with('a', body=>body.length), 16);
+});
+
+test('a put whose bytes cannot be copied lets its reservation go', async()=>{
+    const { reader, keeper } = await cacheOf();
+    reader.put('a', bodyOf(100, 1));
+    const odd = bodyOf(100, 2);
+    const set = Uint8Array.prototype.set;
+    Uint8Array.prototype.set = function(){
+        throw new RangeError('offset is out of bounds');
+    };
+    try
+    {
+        assert.throws(()=>reader.put('b', odd), RangeError);
+    }
+    finally
+    {
+        Uint8Array.prototype.set = set;
+    }
+    keeper.sweep();
+    assert.equal(keeper.figures().placedBytes, UNIT, 'only a');
+    assert.equal(reader.figures().abandoned, 1);
+});

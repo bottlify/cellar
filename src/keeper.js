@@ -413,8 +413,9 @@ export async function openKeeper(options){
      * find it.
      *
      * @param {number} length @param {number} limit  segments a writer has
+     * @param {number} [spare]  the record the room is for, never cooled for it
      */
-    const room = (length, limit)=>{
+    const room = (length, limit, spare = -1)=>{
         let found = placeIn(length, limit);
         if (found !== null)
         {
@@ -431,6 +432,10 @@ export async function openKeeper(options){
         }
         for (const id of oldestHot(limit))
         {
+            if (id === spare)
+            {
+                continue;
+            }
             cool(id);
             found = placeIn(length, limit);
             if (found !== null)
@@ -836,7 +841,9 @@ export async function openKeeper(options){
             // reservation refused leaves the name's body as it was.
             const held = state === HOT && Atomics.compareExchange(words, index.at(id) + R_STATE,
                 stateWord(HOT), stateWord(MOVING)) === stateWord(HOT);
-            let found = room(length, known);
+            // The name's own body is not cooled for it: a reader that leaves
+            // it meanwhile does not make it a candidate.
+            let found = room(length, known, id);
             if (found === null && held && get(id, R_SEGMENT) < known
                 && blockOf(length) <= blockOf(get(id, R_LENGTH)))
             {

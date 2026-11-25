@@ -188,13 +188,16 @@ function endOver(memory, { spinMs = SPIN_MS }){
      */
     const writeSlot = (base, n, message)=>{
         checkBytes(message, 'channel');
-        if (message.length > slotBytes)
+        const length = message.length;
+        if (length > slotBytes)
         {
-            throw new RangeError(`channel: ${message.length} bytes, a slot holds ${slotBytes}`);
+            throw new RangeError(`channel: ${length} bytes, a slot holds ${slotBytes}`);
         }
         const at = base + (n & (slots - 1)) * stride;
-        bytes.set(message, at + 4);
-        words[at >> 2] = message.length;
+        // The length taken: a view that grows may have grown since.
+        bytes.set(ArrayBuffer.isView(message) ? /** @type {Uint8Array} */ (message).subarray(0, length)
+            : message, at + 4);
+        words[at >> 2] = length;
     };
 
     /**

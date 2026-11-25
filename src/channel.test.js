@@ -387,3 +387,32 @@ test('a handler that throws what cannot be a string still fails its own request 
     assert.equal(server.serve(request=>[request[0]], { timeoutMs: 0 }), 1);
     assert.deepEqual([...await good], [3]);
 });
+
+test('a request that grows while it is written is written as long as it was', async()=>{
+    const memory = createChannel({ slots: 2, slotBytes: 64 });
+    const client = openClient(memory);
+    const server = openServer(memory);
+    const shared = new /** @type {any} */ (SharedArrayBuffer)(8, { maxByteLength: 1024 });
+    let reads = 0;
+    /** A length-tracking view that grows once its length has been taken to size the copy. */
+    class Growing extends Uint8Array {
+        get length(){
+            const length = super.length;
+            // The second reading sizes the copy (the first checks the bytes).
+            if (++reads === 2)
+            {
+                shared.grow(200);
+            }
+            return length;
+        }
+    }
+    const answer = client.call(new Growing(shared));
+    /** @type {number[]} */
+    const lengths = [];
+    server.serve(request=>{
+        lengths.push(request.length);
+        return [request.length];
+    }, { timeoutMs: 0 });
+    assert.deepEqual([...await answer], [8]);
+    assert.deepEqual(lengths, [8]);
+});

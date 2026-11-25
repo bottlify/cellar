@@ -377,3 +377,27 @@ test('a take that releases its own record: freed once, and the drain throws rath
     assert.deepEqual(taken, [2], 'the first freed once, the second still there');
     assert.equal(ring.held(), 0);
 });
+
+test('a record that grows while it is written is written as long as it was', ()=>{
+    const ring = openRing(createRingMemory(256));
+    const shared = new /** @type {any} */ (SharedArrayBuffer)(8, { maxByteLength: 1024 });
+    let reads = 0;
+    /** A length-tracking view that grows once its length has been taken to size the copy. */
+    class Growing extends Uint8Array {
+        get length(){
+            const length = super.length;
+            // The second reading sizes the copy (the first checks the bytes).
+            if (++reads === 2)
+            {
+                shared.grow(200);
+            }
+            return length;
+        }
+    }
+    assert.equal(ring.write(new Growing(shared)), true);
+    assert.equal(ring.write(Uint8Array.of(7)), true);
+    /** @type {number[][]} */
+    const records = [];
+    assert.equal(ring.drain(record=>void records.push([...record])), 2);
+    assert.deepEqual(records, [[0, 0, 0, 0, 0, 0, 0, 0], [7]]);
+});

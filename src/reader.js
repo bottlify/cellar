@@ -55,8 +55,14 @@ const KNOWN_MOST = 1 << 16;
  */
 export function createReader({ shared, segments = [], keeper }){
     const index = viewIndex(shared);
-    /** @type {(Uint8Array | null)[]} */
+    /** By segment: a view, null for one let go, undefined for one not heard of. @type {(Uint8Array | null | undefined)[]} */
     const views = segments.map(buffer=>(buffer === null ? null : new Uint8Array(buffer)));
+    /**
+     * The segments this reader has heard of, each one below: what the keeper
+     * may place a body in for it. A message missed (an announce that threw)
+     * leaves a gap, and nothing past the gap is counted.
+     */
+    let heard = views.length;
     /** Reserved and not committed yet, by name. @type {Map<string, number>} */
     const writing = new Map();
     const counts = {
@@ -146,11 +152,16 @@ export function createReader({ shared, segments = [], keeper }){
             }
             if (message.segment !== undefined)
             {
+                // A segment not heard of stays undefined, one let go null.
                 while (views.length <= message.segment)
                 {
-                    views.push(null);
+                    views.push(undefined);
                 }
                 views[message.segment] = message.buffer ? new Uint8Array(message.buffer) : null;
+                while (heard < views.length && views[heard] !== undefined)
+                {
+                    heard++;
+                }
             }
         },
 
@@ -188,7 +199,7 @@ export function createReader({ shared, segments = [], keeper }){
                 return undefined;
             }
             let got = readHot(id, read);
-            if (got === NOT_HERE_COLD && wait && keeper.raise(name, { known: views.length }))
+            if (got === NOT_HERE_COLD && wait && keeper.raise(name, { known: heard }))
             {
                 counts.raisedWaiting++;
                 got = readHot(id, read);
@@ -225,7 +236,7 @@ export function createReader({ shared, segments = [], keeper }){
         reserve(name, length, { onlyCopy = false } = {}){
             // A second reserve of a name not committed yet replaces the first.
             self.abandon(name);
-            const place = keeper.reserve(name, length, { onlyCopy, known: views.length });
+            const place = keeper.reserve(name, length, { onlyCopy, known: heard });
             const view = place === null ? null : views[place.segment];
             if (place !== null)
             {
@@ -295,12 +306,22 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name @param {Uint8Array} bytes @param {{ onlyCopy?: boolean }} [options]
          */
         put(name, bytes, options){
-            const into = self.reserve(name, bytes.length, options);
+            const length = bytes.length;
+            const into = self.reserve(name, length, options);
             if (into === null)
             {
                 return false;
             }
-            into.set(bytes);
+            try
+            {
+                // The length taken, not the bytes' length now: a view over
+                // shared memory that grows may have grown since.
+                into.set(ArrayBuffer.isView(bytes) ? bytes.subarray(0, length) : bytes);
+            }
+            catch (e){
+                self.abandon(name);
+                throw e;
+            }
             self.commit(name);
             return true;
         },

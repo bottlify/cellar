@@ -169,7 +169,10 @@ export function openRing(memory){
             }
             const start = (at + skip) & mask;
             words.setUint32(start, length, true);
-            bytes.set(record, start + ALIGN);
+            // The length taken: a view over shared memory that grows may have
+            // grown since, and its tail would run over a record not read.
+            bytes.set(ArrayBuffer.isView(record) ? /** @type {Uint8Array} */ (record).subarray(0, length)
+                : record, start + ALIGN);
             // The record is published by the index, and the index by the store
             // being atomic: a reader that sees the new count sees the bytes.
             Atomics.store(control, WRITTEN, (written + skip + need) | 0);
