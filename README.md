@@ -120,6 +120,14 @@ for (;;)
 `waitFor`, `waitForAsync`, `wake` and `publish` are the bell over any word of a shared
 `Int32Array`, for a protocol of its own.
 
+`examples/ring.mjs` sends 20 000 pointer moves to a worker busy with 2 000 steps of work, then
+2 000 events one at a time to it idle, each answered (node 22, a 4-core x86 VM, 3 runs, medians):
+
+| | postMessage | ring |
+| --- | --- | --- |
+| a step of the busy worker (it yields after each to hear a message) | 206 us | 183 us |
+| an event there and back, the worker idle | 50 us | 1.6 us |
+
 ## Requirements
 
 `SharedArrayBuffer` (a cross-origin isolated page) and growable shared buffers for a cache every

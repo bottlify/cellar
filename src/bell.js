@@ -44,11 +44,14 @@ const SPIN_LOOKS = 255;
  * @typedef {Object} WaitOptions
  * @property {number} sleeps  the word counting the waits asleep on this one
  * @property {number} [deadline]  on the clock of `performance.now()`; Infinity by default
- * @property {number} [spinMs]  how long it looks before it sleeps (`SPIN_MS`)
+ * @property {number} [spinMs]  how long it looks before it sleeps (`SPIN_MS`); 0 sleeps at once
  * @property {number} [closed]  a word that, once not zero, ends the wait (none by default)
  */
 
 const clock = globalThis.performance ?? Date;
+
+/** Whether this is node, whose threads end with nothing but a wait in their loop. */
+const NODE = typeof (/** @type {any} */ (globalThis).process)?.versions?.node === 'string';
 
 /**
  * The deadline of a wait of `timeoutMs`, on the clock waits read.
@@ -69,6 +72,10 @@ export const deadlineOf = timeoutMs=>(timeoutMs === undefined || timeoutMs === I
 export function waitFor(words, index, seen, { sleeps, deadline = Infinity, spinMs = SPIN_MS,
     closed = -1 }){
     seen |= 0;
+    if (spinMs <= 0)
+    {
+        return sleepFor(words, index, seen, sleeps, deadline, closed);
+    }
     // The clock is read once in a while, and not at all before the first few
     // hundred looks: each answer of it is a number made on the heap, and the
     // word often moves sooner.
@@ -159,15 +166,19 @@ export async function waitForAsync(words, index, seen, { sleeps, deadline = Infi
             {
                 slept = true;
                 // Node lets a thread whose loop has only this wait end:
-                // something of the loop's own keeps it while it waits.
-                const holding = setInterval(()=>{}, 1 << 30);
+                // something of the loop's own keeps it while it waits. A
+                // browser keeps its threads, and the wait costs no timer there.
+                const holding = NODE ? setInterval(()=>{}, 1 << 30) : null;
                 try
                 {
                     await waited.value;
                 }
                 finally
                 {
-                    clearInterval(holding);
+                    if (holding !== null)
+                    {
+                        clearInterval(holding);
+                    }
                 }
             }
             else if (!waited)
