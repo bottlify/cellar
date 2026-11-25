@@ -36,37 +36,27 @@
  * hottest paths, and makes no garbage.
  */
 
-/** How long a wait looks before it sleeps, in ms: the other side often moves the word sooner. */
+/**
+ * About how long a wait looks before it sleeps, in ms (`LOOKS_PER_MS`): the
+ * other side often moves the word sooner.
+ */
 export const SPIN_MS = 0.05;
 
 /** Looks between two checks of the closed word while a wait spins, less one (a mask). */
 const SPIN_LOOKS = 255;
 
-/** Looks timed once to learn how many a millisecond holds. */
-const CALIBRATION_LOOKS = 1 << 16;
-
 /**
- * Looks a millisecond holds on this thread, timed on the first wait that
- * spins. A spin counts looks, not time: each reading of the clock is a number
- * made on the heap, and a wait that spins to its end on every call (a handler
- * slower than the spin) would make garbage on every call.
+ * Looks a millisecond of spin is taken to hold: a spin counts looks, not
+ * time. Each reading of the clock is a number made on the heap, and a wait
+ * that spins to its end on every call (a handler slower than the spin) would
+ * make garbage on every call; a clock a browser coarsens could not time a
+ * spin this short either. How long a look takes differs from one processor
+ * to another: a spin of `spinMs` lasts about that, never more than its looks.
  */
-let looksPerMs = 0;
+const LOOKS_PER_MS = 100_000;
 
 /** @param {number} spinMs @returns {number} looks a spin of `spinMs` takes */
-const looksFor = spinMs=>{
-    if (looksPerMs === 0)
-    {
-        const probe = new Int32Array(1);
-        const from = clock.now();
-        for (let n = 0; n < CALIBRATION_LOOKS; n++)
-        {
-            Atomics.load(probe, 0);
-        }
-        looksPerMs = CALIBRATION_LOOKS / Math.max(clock.now() - from, 0.001);
-    }
-    return Math.max(SPIN_LOOKS + 1, Math.round(spinMs * looksPerMs));
-};
+const looksFor = spinMs=>Math.max(SPIN_LOOKS + 1, Math.round(spinMs * LOOKS_PER_MS));
 
 /**
  * How a wait ended: the word moved before it counted itself asleep (`moved`)
@@ -105,7 +95,9 @@ export const deadlineOf = timeoutMs=>{
 
 /** @param {number} deadline @param {number} spinMs */
 const checkTimes = (deadline, spinMs)=>{
-    if (Number.isNaN(deadline) || Number.isNaN(spinMs))
+    // A deadline may be Infinity (none); a spin is a finite time, or none.
+    if (typeof deadline !== 'number' || Number.isNaN(deadline)
+        || typeof spinMs !== 'number' || !Number.isFinite(spinMs))
     {
         throw new RangeError(`bell: a deadline of ${deadline}, a spin of ${spinMs} ms`);
     }

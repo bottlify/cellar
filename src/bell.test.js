@@ -120,3 +120,42 @@ test('a wait whose sleep throws (a thread that may not block) takes itself off t
     assert.equal(Atomics.load(words, SLEEPS), 0);
     assert.equal(publish(words, WORD, 1, SLEEPS), false, 'nobody counted asleep: no notify');
 });
+
+test('a wait with no deadline never reads the clock, spinning or asleep: it makes no garbage', async()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const now = performance.now;
+    let readings = 0;
+    performance.now = function(){
+        readings++;
+        return now.call(performance);
+    };
+    try
+    {
+        // Spins to its end, then sleeps until another thread moves the word.
+        const mover = new Worker(`
+            const { workerData } = require('node:worker_threads');
+            const words = new Int32Array(workerData);
+            const nap = new Int32Array(new SharedArrayBuffer(4));
+            Atomics.wait(nap, 0, 0, 50);
+            Atomics.store(words, 0, 1);
+            Atomics.notify(words, 0);`, { eval: true, workerData: words.buffer });
+        assert.equal(waitFor(words, WORD, 0, SLEEPS, Infinity, 0.05), 'woke');
+        await mover.terminate();
+    }
+    finally
+    {
+        performance.now = now;
+    }
+    assert.equal(readings, 0);
+});
+
+test('a spin that is not a finite time, or a deadline that is not a number, is refused', ()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    for (const spin of [Infinity, /** @type {any} */ ('1')])
+    {
+        assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, spin), RangeError);
+    }
+    assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, /** @type {any} */ ('5')), RangeError);
+    assert.equal(waitFor(words, WORD, 0, SLEEPS, performance.now() + 1, -1), 'timed-out',
+        'a spin of none sleeps at once');
+});

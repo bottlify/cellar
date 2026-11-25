@@ -696,3 +696,51 @@ test('an index entry past its pack\'s file, of other fields, or an index read sh
         assert.equal(third.reader.look('a'), 'cold');
         assert.equal(third.reader.look('b'), null, 'saved in the index read short only');
     });
+
+test('after close the keeper is memory\'s only: an only copy stays hot, a cold body is the next'
+    + ' run\'s', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('cold', bodyOf(100, 1));
+    first.step(150);
+    assert.equal(first.reader.look('cold'), 'cold');
+    first.reader.put('only', bodyOf(100, 2), { onlyCopy: true });
+    first.keeper.close();
+    first.step(150);
+    first.step(150);
+    assert.deepEqual(first.reader.with('only', body=>[...body]), [...bodyOf(100, 2)], 'still read');
+    assert.equal(first.reader.look('cold'), null, 'no body of this run');
+    assert.equal(first.keeper.save(), false);
+    const second = await cacheOf({ disk });
+    assert.deepEqual(second.reader.with('cold', body=>[...body], { wait: true }), [...bodyOf(100, 1)]);
+    assert.deepEqual(second.reader.with('only', body=>[...body], { wait: true }), [...bodyOf(100, 2)]);
+});
+
+test('an index file the disk fails to read leaves the other one to the run', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('a', bodyOf(100, 1));
+    first.keeper.save();
+    first.reader.put('b', bodyOf(100, 2));
+    first.keeper.save();
+    const [newer] = [...disk.files].filter(([file])=>file.startsWith('index-'))
+        .sort(([, x], [, y])=>y.length - x.length)[0];
+    const failing = {
+        async open(/** @type {string} */ name){
+            const file = await disk.open(name);
+            return name === newer ? { ...file,
+                getSize(){
+                    throw new Error('unreadable');
+                } } : file;
+        },
+    };
+    const second = await cacheOf({ disk: failing });
+    assert.equal(second.reader.look('a'), 'cold');
+});
+
+test('a segment past 1 GiB, or not a power of two, is refused when the keeper opens', async()=>{
+    for (const segmentBytes of [2 ** 31, 3 * UNIT, UNIT + 0.5, UNIT / 2])
+    {
+        await assert.rejects(openKeeper({ budget: 1, segmentBytes }), RangeError);
+    }
+});

@@ -31,14 +31,25 @@ export const blockOf = length=>{
 };
 
 /**
- * @param {number} bytes  the segment's size, a power of two at least `UNIT`
+ * Throws where `bytes` is no segment's size: a power of two from `UNIT` to
+ * 1 GiB, so that a block's size and offset stay within the 32-bit words a
+ * block is counted in.
+ *
+ * @param {number} bytes
  */
-export function createBuddy(bytes){
-    if (bytes < UNIT || (bytes & (bytes - 1)) !== 0)
+export const checkSegmentBytes = bytes=>{
+    if (!Number.isInteger(bytes) || bytes < UNIT || bytes > 1 << 30 || (bytes & (bytes - 1)) !== 0)
     {
         throw new RangeError(
-            `cache: a segment of ${bytes} bytes is not a power of two from ${UNIT}`);
+            `cache: a segment of ${bytes} bytes is not a power of two from ${UNIT} to 1 GiB`);
     }
+};
+
+/**
+ * @param {number} bytes  the segment's size (`checkSegmentBytes`)
+ */
+export function createBuddy(bytes){
+    checkSegmentBytes(bytes);
     const top = log2(bytes / UNIT);
     /** Free blocks by order (block = UNIT << order), as offsets. @type {Set<number>[]} */
     const free = Array.from({ length: top + 1 }, ()=>new Set());

@@ -29,7 +29,7 @@
  * only once the disk holds it.
  */
 
-import { blockOf, createBuddy } from './buddy.js';
+import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import {
     COLD, F_DROP, F_ONLY_COPY, F_ON_DISK, GONE, HEADER_WORDS, HOT, H_COUNT, H_NAMES, H_TICK,
     MOVING, RECORD_WORDS, RETIRED, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME, R_NAME_LENGTH,
@@ -85,10 +85,12 @@ const INDEX_VERSION = 1;
  */
 export async function openKeeper(options){
     const {
-        budget, segmentBytes = 16 * MIB, disk = null, packBytes = 64 * MIB,
+        budget, segmentBytes = 16 * MIB, packBytes = 64 * MIB,
         coldAfterMs = 30_000, goneAfterMs = 7 * 24 * 3600_000, releaseAfterMs = 10_000,
         announce = ()=>{}, now = ()=>performance.now(),
     } = options;
+    /** The disk, null once closed: from then on the keeper is memory's only. */
+    let disk = options.disk ?? null;
     // Ages are told on a 32-bit clock that wraps (`age`): a span past half of
     // it would read as a fresh one.
     for (const [name, ms] of Object.entries({ coldAfterMs, goneAfterMs, releaseAfterMs }))
@@ -98,6 +100,7 @@ export async function openKeeper(options){
             throw new RangeError(`cache: ${name} ${ms} is not a span of 0 to 24.8 days`);
         }
     }
+    checkSegmentBytes(segmentBytes);
     // A body's place in a segment and in a pack is a 32-bit word of its record.
     if (!(packBytes > 0 && packBytes < 2 ** 31))
     {
@@ -435,9 +438,10 @@ export async function openKeeper(options){
         if (disk !== null && !closed && nextPack === null && readyPack === null)
         {
             const name = `pack-${packs.length}`;
+            const opening = disk;
             // A disk that throws at once fails the same way as one whose
             // promise does: counted, and the body that wanted it stays.
-            nextPack = Promise.resolve().then(()=>disk.open(name))
+            nextPack = Promise.resolve().then(()=>opening.open(name))
                 .then(file=>{
                     readyPack = file;
                     nextPack = null;
@@ -587,20 +591,21 @@ export async function openKeeper(options){
 
     /** @param {DiskFile} file */
     const readIndex = file=>{
-        const bytes = new Uint8Array(file.getSize());
-        if (file.read(bytes, { at: 0 }) !== bytes.length)
-        {
-            return null;
-        }
         try
         {
+            // A file the disk fails to read is no index: the other one is.
+            const bytes = new Uint8Array(file.getSize());
+            if (file.read(bytes, { at: 0 }) !== bytes.length)
+            {
+                return null;
+            }
             const saved = JSON.parse(new TextDecoder().decode(bytes));
             return saved?.version === INDEX_VERSION && Number.isInteger(saved.generation)
                 && Number.isInteger(saved.packs) && saved.packs >= 0 && Array.isArray(saved.records)
                 ? saved : null;
         }
         catch {
-            // Torn mid-write: the other file is the index.
+            // Torn mid-write, or not read: the other file is the index.
             return null;
         }
     };
@@ -1003,6 +1008,25 @@ export async function openKeeper(options){
         close(){
             const whole = keeper.save();
             closed = true;
+            disk = null;
+            // Memory's only from here: a hot body the disk held stays until it
+            // can be made again or is let go, an only copy for good; a cold one
+            // is the next run's, on the disk, and no body of this run any more.
+            for (let id = 0; id < words[H_COUNT]; id++)
+            {
+                const state = stateOf(stateWordOf(id));
+                if (state === COLD)
+                {
+                    set(id, R_FLAGS, 0);
+                    set(id, R_PACK, -1);
+                    store(id, GONE);
+                }
+                else
+                {
+                    set(id, R_FLAGS, get(id, R_FLAGS) & ~F_ON_DISK);
+                    set(id, R_PACK, -1);
+                }
+            }
             for (const file of [...packs, ...indexFiles, ...readyPack ? [readyPack] : []])
             {
                 try
