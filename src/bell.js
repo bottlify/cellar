@@ -46,7 +46,9 @@ const SPIN_LOOKS = 255;
  * How a wait ended: the word moved before it counted itself asleep (`moved`)
  * or after (`woke`: a mover may have seen the count and notified it, whether
  * or not the sleep itself began), the deadline passed (`timed-out`), or the
- * closed word was set first (`closed`).
+ * closed word was set first (`closed`). `woke` is what a mover's notifies are
+ * held to, not a count of the times the thread slept: a wait that counted
+ * itself asleep and found its word moved at its last look never slept.
  *
  * @typedef {'moved' | 'woke' | 'timed-out' | 'closed'} WaitEnd
  */

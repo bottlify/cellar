@@ -6,6 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { Worker } from 'node:worker_threads';
 import { BELLS, COUNTS, ChannelClosed, createChannel, openClient, openServer } from './channel.js';
 
 /** A handler answering each request with its bytes reversed. @param {Uint8Array} request */
@@ -174,3 +175,45 @@ test('requests out together across the counts\' wrap each keep their own slot', 
         }
     }
 });
+
+test('a closed channel takes no request: an ask or a call after the close publishes nothing',
+    async()=>{
+        for (const closing of ['client', 'server'])
+        {
+            const memory = createChannel({ slots: 4, slotBytes: 8 });
+            const client = openClient(memory);
+            const server = openServer(memory);
+            (closing === 'client' ? client : server).close();
+            assert.throws(()=>client.ask([1], { timeoutMs: 100 }), ChannelClosed);
+            await assert.rejects(client.call([2]), ChannelClosed);
+            assert.equal(server.waiting(), 0, `${closing} closed: nothing for the server to read`);
+        }
+    });
+
+test('a call waiting for a slot of a full channel is failed by the close, the thread free',
+    { timeout: 30000 }, async t=>{
+        // In a worker of its own: a call that waited on would turn its
+        // thread's loop for ever, this file's timers with it.
+        const worker = new Worker(`
+            const { parentPort, workerData } = require('node:worker_threads');
+            import(workerData.channel).then(async({ createChannel, openClient })=>{
+                const client = openClient(createChannel({ slots: 2, slotBytes: 8 }));
+                const out = [client.call([1]), client.call([2])];
+                const third = client.call([3]);
+                await new Promise(resolve=>setTimeout(resolve, 20));
+                client.close();
+                const ends = await Promise.allSettled([...out, third]);
+                parentPort.postMessage(ends.map(end=>end.status + ':' + (end.reason?.name ?? '')));
+            });`, { eval: true,
+            workerData: { channel: new URL('./channel.js', import.meta.url).href } });
+        worker.unref();
+        t.after(()=>worker.terminate());
+        const ends = await Promise.race([
+            new Promise((resolve, reject)=>{
+                worker.once('message', resolve);
+                worker.once('error', reject);
+            }),
+            new Promise(resolve=>setTimeout(()=>resolve('its thread never came back'), 10000)),
+        ]);
+        assert.deepEqual(ends, Array(3).fill('rejected:ChannelClosed'));
+    });

@@ -283,6 +283,12 @@ export function openClient(memory, options = {}){
 
     /** @param {ArrayLike<number>} message */
     const send = message=>{
+        // A closed channel takes no request: one published after the close
+        // would still be read by the serving side, answered to nobody.
+        if (end.closed())
+        {
+            throw new ChannelClosed();
+        }
         end.writeSlot(end.requests, asked, message);
         asked = (asked + 1) | 0;
         end.publish(ASKED, asked, SERVER_SLEEPS);
@@ -381,6 +387,12 @@ export function openClient(memory, options = {}){
         async call(message, { read: readAnswer = /** @type {any} */ (copy) } = {}){
             while ((asked - read) >>> 0 >= slots)
             {
+                // A close fails the calls out and frees no slot: waiting on
+                // would turn this loop for ever, the thread's timers with it.
+                if (end.closed())
+                {
+                    throw new ChannelClosed();
+                }
                 startPump();
                 await pumping;
             }
