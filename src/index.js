@@ -27,7 +27,6 @@ export { createRingMemory, openRing } from './ring.js';
 /** @typedef {import('./channel.js').ChannelOptions} ChannelOptions */
 /** @typedef {import('./channel.js').Handler} ChannelHandler */
 /** @typedef {import('./bell.js').WaitEnd} WaitEnd */
-/** @typedef {import('./bell.js').WaitOptions} WaitOptions */
 /** @typedef {import('./bell.js').DoorbellMemory} DoorbellMemory */
 /** @typedef {import('./bell.js').Doorbell} Doorbell */
 /** @typedef {import('./ring.js').RingMemory} RingMemory */

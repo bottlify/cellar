@@ -17,8 +17,7 @@ test('a side that moves a word notifies only while a wait sleeps on it', { timeo
     async()=>{
     const words = new Int32Array(new SharedArrayBuffer(12));
     assert.equal(publish(words, WORD, 1, SLEEPS), false, 'nobody sleeps: no notify');
-    const waiting = waitForAsync(words, WORD, 1, { sleeps: SLEEPS,
-        deadline: performance.now() + 5000 });
+    const waiting = waitForAsync(words, WORD, 1, SLEEPS, performance.now() + 5000);
     assert.equal(Atomics.load(words, SLEEPS), 1, 'the wait counted itself before it slept');
     assert.equal(publish(words, WORD, 2, SLEEPS), true);
     assert.equal(await waiting, 'woke');
@@ -28,14 +27,12 @@ test('a side that moves a word notifies only while a wait sleeps on it', { timeo
 
 test('a wait ends at once on a word already moved, at its deadline, and on the closed word', async()=>{
     const words = new Int32Array(new SharedArrayBuffer(12));
-    assert.equal(waitFor(words, WORD, 5, { sleeps: SLEEPS }), 'moved');
-    assert.equal(waitFor(words, WORD, 0, { sleeps: SLEEPS,
-        deadline: performance.now() + 5 }), 'timed-out');
-    assert.equal(await waitForAsync(words, WORD, 0, { sleeps: SLEEPS,
-        deadline: performance.now() + 5 }), 'timed-out');
+    assert.equal(waitFor(words, WORD, 5, SLEEPS), 'moved');
+    assert.equal(waitFor(words, WORD, 0, SLEEPS, performance.now() + 5), 'timed-out');
+    assert.equal(await waitForAsync(words, WORD, 0, SLEEPS, performance.now() + 5), 'timed-out');
     Atomics.store(words, CLOSED, 1);
-    assert.equal(waitFor(words, WORD, 0, { sleeps: SLEEPS, closed: CLOSED }), 'closed');
-    assert.equal(await waitForAsync(words, WORD, 0, { sleeps: SLEEPS, closed: CLOSED }), 'closed');
+    assert.equal(waitFor(words, WORD, 0, SLEEPS, Infinity, undefined, CLOSED), 'closed');
+    assert.equal(await waitForAsync(words, WORD, 0, SLEEPS, Infinity, CLOSED), 'closed');
     assert.equal(Atomics.load(words, SLEEPS), 0);
 });
 

@@ -165,7 +165,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} seen @param {number} sleeps @param {number} deadline
      */
     const waitFor = (counter, seen, sleeps, deadline)=>{
-        const end = waitWord(words, counter, seen, { sleeps, deadline, spinMs, closed: CLOSED });
+        const end = waitWord(words, counter, seen, sleeps, deadline, spinMs, CLOSED);
         if (end === 'closed')
         {
             throw new ChannelClosed();
@@ -181,7 +181,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @returns {Promise<boolean>}
      */
     const waitForAsync = async(counter, seen, sleeps, deadline)=>{
-        const end = await waitWordAsync(words, counter, seen, { sleeps, deadline, closed: CLOSED });
+        const end = await waitWordAsync(words, counter, seen, sleeps, deadline, CLOSED);
         if (end === 'closed')
         {
             throw new ChannelClosed();

@@ -159,7 +159,7 @@ export function openRing(memory){
                 {
                     return true;
                 }
-                if (waitFor(control, ROOM, room, { sleeps: ROOM_SLEEPS, deadline }) === 'timed-out')
+                if (waitFor(control, ROOM, room, ROOM_SLEEPS, deadline) === 'timed-out')
                 {
                     return false;
                 }

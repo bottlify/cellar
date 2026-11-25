@@ -23,7 +23,9 @@
  * and one that finds a sleeper notifies under the lock the wait takes.
  *
  * Words are indices into an `Int32Array` over a SharedArrayBuffer; a word
- * that says the conversation is over (`closed`) ends every wait on it.
+ * that says the conversation is over (`closed`) ends every wait on it. A wait
+ * takes its terms as arguments, not an object: it is made once a call on the
+ * hottest paths, and makes no garbage.
  */
 
 /** How long a wait looks before it sleeps, in ms: the other side often moves the word sooner. */
@@ -40,13 +42,6 @@ const SPIN_LOOKS = 255;
  * @typedef {'moved' | 'woke' | 'timed-out' | 'closed'} WaitEnd
  */
 
-/**
- * @typedef {Object} WaitOptions
- * @property {number} sleeps  the word counting the waits asleep on this one
- * @property {number} [deadline]  on the clock of `performance.now()`; Infinity by default
- * @property {number} [spinMs]  how long it looks before it sleeps (`SPIN_MS`); 0 sleeps at once
- * @property {number} [closed]  a word that, once not zero, ends the wait (none by default)
- */
 
 const clock = globalThis.performance ?? Date;
 
@@ -66,11 +61,14 @@ export const deadlineOf = timeoutMs=>(timeoutMs === undefined || timeoutMs === I
  * block (a worker, never a page's own thread).
  *
  * @param {Int32Array} words @param {number} index @param {number} seen
- * @param {WaitOptions} options
+ * @param {number} sleeps  the word counting the waits asleep on `index`
+ * @param {number} [deadline]  on the clock of `performance.now()`; Infinity by default
+ * @param {number} [spinMs]  how long it looks before it sleeps (`SPIN_MS`); 0 sleeps at once
+ * @param {number} [closed]  a word that, once not zero, ends the wait (none by default)
  * @returns {WaitEnd}
  */
-export function waitFor(words, index, seen, { sleeps, deadline = Infinity, spinMs = SPIN_MS,
-    closed = -1 }){
+export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs = SPIN_MS,
+    closed = -1){
     seen |= 0;
     if (spinMs <= 0)
     {
@@ -139,11 +137,11 @@ function sleepFor(words, index, seen, sleeps, deadline, closed){
  * sleeps: its thread has other work.
  *
  * @param {Int32Array} words @param {number} index @param {number} seen
- * @param {WaitOptions} options
+ * @param {number} sleeps @param {number} [deadline] @param {number} [closed]  as `waitFor`'s
  * @returns {Promise<WaitEnd>}
  */
-export async function waitForAsync(words, index, seen, { sleeps, deadline = Infinity,
-    closed = -1 }){
+export async function waitForAsync(words, index, seen, sleeps, deadline = Infinity,
+    closed = -1){
     seen |= 0;
     let slept = false;
     while (Atomics.load(words, index) === seen)
@@ -271,16 +269,16 @@ export function openDoorbell(memory){
          * @param {number} seen @param {number} [timeoutMs] @param {number} [spinMs]
          * @returns {WaitEnd}
          */
-        wait: (seen, timeoutMs, spinMs = SPIN_MS)=>waitFor(words, at, seen,
-            { sleeps, deadline: deadlineOf(timeoutMs), spinMs }),
+        wait: (seen, timeoutMs, spinMs = SPIN_MS)=>waitFor(words, at, seen, sleeps,
+            deadlineOf(timeoutMs), spinMs),
         /**
          * The same on the event loop.
          *
          * @param {number} seen @param {number} [timeoutMs]
          * @returns {Promise<WaitEnd>}
          */
-        waitAsync: (seen, timeoutMs)=>waitForAsync(words, at, seen,
-            { sleeps, deadline: deadlineOf(timeoutMs) }),
+        waitAsync: (seen, timeoutMs)=>waitForAsync(words, at, seen, sleeps,
+            deadlineOf(timeoutMs)),
         /** Moves the count on and wakes the waits asleep on it. */
         ring: ()=>ring(words, at, sleeps),
     };
