@@ -28,18 +28,37 @@
  * (`bell.js`), so a thread with several inbound rings waits once for all of
  * them. It is rung after the record is published, and wakes the reader only
  * when the reader sleeps on it.
+ *
+ * The words each side writes lie a cache line apart (128 bytes, an Apple M
+ * processor's): the writer's count and the reader's do not drag one line
+ * back and forth between two cores at every record.
+ *
+ * Either side may close the ring, when it goes or knows the other went: a
+ * writer waiting for room and a write after it end with `RingClosed`, and the
+ * reader is rung to find it closed, after it has read what was written before.
  */
 
-import { createDoorbell, deadlineOf, openDoorbell, waitFor, wake } from './bell.js';
+import { createDoorbell, deadlineOf, openDoorbell, waitFor, waitForAsync, wake } from './bell.js';
 
-/** Words of the control block. */
+/** Words of a cache line: 128 bytes. */
+const LINE = 32;
+/** The writer's line: bytes ever written, and its waits asleep on `ROOM`. */
 const WRITTEN = 0;
-const READ = 1;
-/** Moved by the reader when it frees room: what a full ring's writer waits on. */
-const ROOM = 2;
-/** The writer's waits asleep on `ROOM`. */
-const ROOM_SLEEPS = 3;
-const CONTROL_WORDS = 4;
+const ROOM_SLEEPS = 1;
+/** The reader's line: bytes ever read, and a count it moves when it frees room. */
+const READ = LINE;
+const ROOM = LINE + 1;
+/** Not zero once either side closed the ring. */
+const CLOSED = 2 * LINE;
+const CONTROL_WORDS = 3 * LINE;
+
+/** Why a write, or a wait for room, ended without writing. */
+export class RingClosed extends Error {
+    constructor(){
+        super('ring: closed');
+        this.name = 'RingClosed';
+    }
+}
 
 /** A record's length word that means "the rest of the buffer is unused; go to the start". */
 const WRAP = 0xffffffff;
@@ -105,12 +124,17 @@ export function openRing(memory){
 
         /**
          * The writer's: puts one record in, and rings the doorbell. False,
-         * and nothing written, when there is not room for it now.
+         * and nothing written, when there is not room for it now; `RingClosed`
+         * once the ring is closed.
          *
          * @param {ArrayLike<number>} record
          * @returns {boolean}
          */
         write(record){
+            if (Atomics.load(control, CLOSED) !== 0)
+            {
+                throw new RingClosed();
+            }
             const length = record.length;
             if (length > maxRecord)
             {
@@ -159,7 +183,41 @@ export function openRing(memory){
                 {
                     return true;
                 }
-                if (waitFor(control, ROOM, room, ROOM_SLEEPS, deadline) === 'timed-out')
+                const end = waitFor(control, ROOM, room, ROOM_SLEEPS, deadline, undefined, CLOSED);
+                if (end === 'closed')
+                {
+                    throw new RingClosed();
+                }
+                if (end === 'timed-out')
+                {
+                    return false;
+                }
+            }
+        },
+
+        /**
+         * `writeWaiting` without blocking the thread: for a writer with an
+         * event loop to keep, a page's own above all.
+         *
+         * @param {ArrayLike<number>} record
+         * @param {number} [timeoutMs]
+         * @returns {Promise<boolean>} whether it was written
+         */
+        async writeWaitingAsync(record, timeoutMs){
+            const deadline = deadlineOf(timeoutMs);
+            for (;;)
+            {
+                const room = Atomics.load(control, ROOM);
+                if (this.write(record))
+                {
+                    return true;
+                }
+                const end = await waitForAsync(control, ROOM, room, ROOM_SLEEPS, deadline, CLOSED);
+                if (end === 'closed')
+                {
+                    throw new RingClosed();
+                }
+                if (end === 'timed-out')
                 {
                     return false;
                 }
@@ -204,14 +262,17 @@ export function openRing(memory){
         },
 
         /**
-         * The reader's: every record there is now, each handed to `take`
-         * before the next is read. Returns how many.
+         * The reader's: the records there are, each handed to `take` before
+         * the next is read, `most` at the most: a ring written without a pause
+         * does not keep its reader from the others it reads. Returns how many.
          *
          * @param {(record: Uint8Array) => void} take
+         * @param {number} [most]
          */
-        drain(take){
+        drain(take, most = Infinity){
             let count = 0;
-            for (let record = this.peek(); record !== null; record = this.peek())
+            for (let record = count < most ? this.peek() : null; record !== null;
+                record = count < most ? this.peek() : null)
             {
                 take(record);
                 this.release();
@@ -219,6 +280,19 @@ export function openRing(memory){
             }
             return count;
         },
+
+        /**
+         * Ends the ring for both sides: a writer waiting for room, and every
+         * write after, end with `RingClosed`; the reader is rung, reads what
+         * was written before, and finds `closed()` true.
+         */
+        close(){
+            Atomics.store(control, CLOSED, 1);
+            Atomics.notify(control, ROOM);
+            bell.ring();
+        },
+        /** Whether either side closed the ring. */
+        closed: ()=>Atomics.load(control, CLOSED) !== 0,
 
         /** Bytes held, records and their framing: for diagnostics. */
         held: ()=>(load(WRITTEN) - load(READ)) >>> 0,

@@ -38,24 +38,29 @@
 import { SPIN_MS, deadlineOf, publish as publishWord, waitFor as waitWord,
     waitForAsync as waitWordAsync } from './bell.js';
 
-/** The header, in 32-bit words. */
-const HEADER_WORDS = 16;
-/** Requests written. */
+/**
+ * The header, in 32-bit words: what each side writes on a cache line of its
+ * own (128 bytes, an Apple M processor's), so the two sides do not drag one
+ * line between their cores at every call; the terms on a third.
+ */
+const LINE = 32;
+const HEADER_WORDS = 3 * LINE;
+/** The asking side's: requests written, answers read, its waits asleep on `ANSWERED`
+ * (a blocking ask and the pump of calls may both be). */
 const ASKED = 0;
-/** Requests read: their slots free again. */
-const TAKEN = 1;
-/** Answers written. */
-const ANSWERED = 2;
-/** Answers read. */
-const READ = 3;
-/** Waits of the serving side asleep on `ASKED`. */
-const SERVER_SLEEPS = 4;
-/** Waits of the asking side asleep on `ANSWERED`: a blocking ask and the pump of calls may both be. */
-const CLIENT_SLEEPS = 5;
-/** 1 once either side closed the channel. */
-const CLOSED = 6;
-const SLOTS = 7;
-const SLOT_BYTES = 8;
+const READ = 1;
+const CLIENT_SLEEPS = 2;
+/** The serving side's: requests read (their slots free again), answers written, its
+ * waits asleep on `ASKED`. */
+const TAKEN = LINE;
+const ANSWERED = LINE + 1;
+const SERVER_SLEEPS = LINE + 2;
+/** 1 once either side closed the channel; the slots and their bytes. */
+const CLOSED = 2 * LINE;
+const SLOTS = 2 * LINE + 1;
+const SLOT_BYTES = 2 * LINE + 2;
+/** The four counts, for a test that starts them near their wrap. */
+export const COUNTS = Object.freeze([ASKED, TAKEN, ANSWERED, READ]);
 
 
 /**

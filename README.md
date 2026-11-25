@@ -139,6 +139,13 @@ for (;;)
 }
 ```
 
+A writer that may not block (a page) waits for room with `writeWaitingAsync`; `drain(take, most)`
+takes at most `most` records, so one ring written without a pause does not starve the others a
+thread reads. Either side closes a ring when it goes or knows the other went: a writer waiting for
+room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
+reading what was written before. Each side's counts lie on a cache line of its own (128 bytes), the
+channel's too.
+
 `waitFor`, `waitForAsync`, `wake` and `publish` are the bell over any word of a shared
 `Int32Array`, for a protocol of its own.
 

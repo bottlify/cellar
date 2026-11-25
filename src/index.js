@@ -16,7 +16,7 @@ export { createReader } from './reader.js';
 export { ChannelClosed, createChannel, openClient, openServer } from './channel.js';
 export { SPIN_MS, createDoorbell, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
     waitForAsync } from './bell.js';
-export { createRingMemory, openRing } from './ring.js';
+export { RingClosed, createRingMemory, openRing } from './ring.js';
 
 /** @typedef {import('./keeper.js').Keeper} Keeper */
 /** @typedef {import('./keeper.js').KeeperOptions} KeeperOptions */

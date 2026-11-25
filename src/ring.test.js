@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { createRingMemory, openRing } from './ring.js';
+import { RingClosed, createRingMemory, openRing } from './ring.js';
 import { createDoorbell, openDoorbell } from './bell.js';
 
 /** @param {number} seed */
@@ -205,5 +205,84 @@ test('a writer that may block waits for the reader to make room, and gives up af
         const { written, late } = /** @type {any} */ (await result);
         assert.equal(written, 50);
         assert.equal(late, false, 'with nobody reading, a full ring times out');
+        await writer.terminate();
+    });
+
+test('a ring closed: what was written is read, then the reader finds it closed; a write after'
+    + ' throws', ()=>{
+    const ring = openRing(createRingMemory(256));
+    ring.write(Uint8Array.of(1));
+    const seen = ring.bell.seen();
+    ring.close();
+    assert.equal(ring.bell.wait(seen, 1000), 'moved', 'the reader is rung for it');
+    assert.deepEqual(ring.peek(), Uint8Array.of(1));
+    ring.release();
+    assert.equal(ring.peek(), null);
+    assert.equal(ring.closed(), true);
+    assert.throws(()=>ring.write(Uint8Array.of(2)), RingClosed);
+});
+
+test('a drain takes no more than it is asked: a ring written without a pause leaves room for'
+    + ' the others', ()=>{
+    const ring = openRing(createRingMemory(1024));
+    for (let n = 0; n < 10; n++)
+    {
+        ring.write(Uint8Array.of(n));
+    }
+    /** @type {number[]} */
+    const taken = [];
+    assert.equal(ring.drain(record=>taken.push(record[0]), 4), 4);
+    assert.deepEqual(taken, [0, 1, 2, 3]);
+    assert.equal(ring.drain(record=>taken.push(record[0])), 6);
+    assert.deepEqual(taken, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+});
+
+test('a writer that may not block waits for room on its event loop, and a close ends the wait',
+    { timeout: 30000 }, async()=>{
+        const memory = createRingMemory(64);
+        const writer = openRing(memory);
+        const reader = openRing(memory);
+        const record = new Uint8Array(writer.maxRecord);
+        while (writer.write(record))
+        {
+            // full
+        }
+        const waiting = writer.writeWaitingAsync(record);
+        reader.drain(()=>{});
+        assert.equal(await waiting, true, 'written once the reader made room');
+        while (writer.write(record))
+        {
+            // full again
+        }
+        const ended = writer.writeWaitingAsync(record);
+        reader.close();
+        await assert.rejects(ended, RingClosed);
+    });
+
+test('a writer asleep on a full ring in another thread ends when the reader closes the ring',
+    { timeout: 30000 }, async t=>{
+        const memory = createRingMemory(64);
+        const writer = inWorker(`
+        const w = ring.openRing(memory);
+        const bytes = new Uint8Array(w.maxRecord);
+        while (w.write(bytes)) {}
+        try { return w.writeWaiting(bytes) ? 'written' : 'timed out'; }
+        catch (e) { return e.name; }`, { memory });
+        // A writer a lost wake left asleep for good must not hold the test's process.
+        writer.unref();
+        t.after(()=>writer.terminate());
+        const result = new Promise((resolve, reject)=>{
+            writer.once('message', resolve);
+            writer.once('error', reject);
+        });
+        const reader = openRing(memory);
+        while (reader.held() < reader.capacity)
+        {
+            await new Promise(resolve=>setTimeout(resolve, 1));
+        }
+        // Long enough that the writer, past its look, sleeps: the close must wake it.
+        await new Promise(resolve=>setTimeout(resolve, 100));
+        reader.close();
+        assert.equal(await result, 'RingClosed');
         await writer.terminate();
     });

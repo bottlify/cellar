@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelClosed, createChannel, openClient, openServer } from './channel.js';
+import { COUNTS, ChannelClosed, createChannel, openClient, openServer } from './channel.js';
 
 /** A handler answering each request with its bytes reversed. @param {Uint8Array} request */
 const reversed = request=>request.slice().reverse();
@@ -54,7 +54,7 @@ test('a slot wraps past its count many times and past 2^32 requests', async()=>{
     const memory = createChannel({ slots: 3, slotBytes: 4 });
     // Both counters near the wrap, as a channel that ran long has them.
     const words = new Int32Array(memory);
-    for (const counter of [0, 1, 2, 3])
+    for (const counter of COUNTS)
     {
         words[counter] = -5;
     }
