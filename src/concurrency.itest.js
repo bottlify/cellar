@@ -28,6 +28,8 @@ const THREADS = 4;
 const POOL = 120;
 /** Names each thread owns: with the pool, past the first table's half, so it grows. */
 const OWNED = 150;
+/** Hot reads, writes and hot reads of owned names each thread makes at least: a fourth of 1000 and one. */
+const LEAST = 251;
 
 /**
  * Runs the threads over a keeper of `options` and checks what every gate
@@ -61,7 +63,7 @@ async function gate(options){
         }));
         const worker = new Worker(new URL('./concurrency.worker.fixture.js', import.meta.url), {
             workerData: { channel: memory, shared: keeper.shared, segments: keeper.segmentBuffers(),
-                seed: 0x9e3779b9 + t * 7919, operations: 6000, pool: POOL, thread: t,
+                seed: 0x9e3779b9 + t * 7919, operations: 6000, least: LEAST, pool: POOL, thread: t,
                 threads: THREADS, owned: OWNED },
         });
         workers.push(worker);

@@ -25,7 +25,7 @@ import { caller } from './channel.fixture.js';
 import { createReader } from './reader.js';
 import { hashName } from './shared.js';
 
-const { channel, shared, segments, seed, operations, pool, thread, threads, owned } = workerData;
+const { channel, shared, segments, seed, operations, least, pool, thread, threads, owned } = workerData;
 const keeper = caller(channel);
 const reader = createReader({
     shared, segments,
@@ -132,7 +132,13 @@ const write = (name, version, length)=>{
     reader.commit(name);
     return true;
 };
-for (let op = 0; op < operations; op++)
+/**
+ * Whether the thread did what the gate counts on, as many times as it asks:
+ * how many reads find a body hot is the machine's timing, not the code's, so
+ * a thread goes on past `operations` until they did.
+ */
+const enough = ()=>counts.hits >= least && counts.written >= least && counts.ownHits >= least;
+for (let op = 0; op < operations || !enough(); op++)
 {
     if (op % 64 === 0)
     {
