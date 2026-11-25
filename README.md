@@ -84,7 +84,9 @@ counts as not written. `save()` writes the hot bodies the disk lacks, then an in
 bodies the disk holds, after the packs are flushed: the index is always true, and `false` says some
 body stayed in memory only (the disk refused it, or the next pack was not open yet). A save that
 fails at the index leaves the last whole one, which the next run reads; an entry of it that does
-not fit its pack's file is skipped and counted (`skippedEntries`). After `close()` the files are
+not fit its pack's file is skipped and counted (`skippedEntries`). `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
+none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the keeper
+goes on: a thread not told of a segment is never placed in it. After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
 good), a cold one is the next run's, on the disk, and no body of this run any more.
 `budget` is a finite number of bytes; `segmentBytes` a power of two from 4 KiB to 1 GiB;

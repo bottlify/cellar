@@ -51,7 +51,10 @@ const INDEX_VERSION = 1;
 
 /**
  * A file on the disk as the keeper uses it: the shape of a
- * `FileSystemSyncAccessHandle`.
+ * `FileSystemSyncAccessHandle`. Its methods are called on the keeper's thread
+ * in the middle of its work and call none of the keeper's methods; one that
+ * throws, or reads or writes less than asked, is a failure of the disk,
+ * counted (`diskFailures`), and the body stays where it was.
  *
  * @typedef {Object} DiskFile
  * @property {(view: Uint8Array, options: { at: number }) => number} read
@@ -78,7 +81,9 @@ const INDEX_VERSION = 1;
  * @property {number} [goneAfterMs]  idle so long, a cold body that can be made again goes
  * @property {number} [releaseAfterMs]  empty so long, a segment is let go
  * @property {(message: { segment?: number, buffer?: SharedArrayBuffer | null,
- *     table?: SharedArrayBuffer }) => void} [announce]  sent to every thread reading
+ *     table?: SharedArrayBuffer }) => void} [announce]  sent to every thread reading:
+ *     called on the keeper's thread in the middle of its work, it calls none of
+ *     the keeper's methods; one that throws is counted (`announceFailures`)
  * @property {() => number} [now]
  */
 
@@ -142,7 +147,26 @@ export async function openKeeper(options){
         reserved: 0, refusedBusy: 0, refusedRoom: 0, refusedLarge: 0, refusedUnseen: 0,
         replaced: 0, raised: 0, raiseFailed: 0, cooled: 0, written: 0, writtenBytes: 0, gone: 0,
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
-        diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0,
+        diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
+        segmentFailures: 0,
+    };
+
+    /**
+     * Tells every thread reading of a segment or a table. One that throws is
+     * counted, and the keeper goes on: a thread not told of a segment is
+     * never placed in it (a reader's `known`), one not told of a larger table
+     * finds the names the old one holds.
+     *
+     * @param {{ segment?: number, buffer?: SharedArrayBuffer | null, table?: SharedArrayBuffer }} message
+     */
+    const tell = message=>{
+        try
+        {
+            announce(message);
+        }
+        catch {
+            counts.announceFailures++;
+        }
     };
 
     /**
@@ -196,7 +220,8 @@ export async function openKeeper(options){
             return known;
         }
         const from = words[H_NAMES];
-        if (from + name.length > MAX_NAME_UNITS)
+        // Room for its record first: a name written for none would be spent.
+        if (words[H_COUNT] >= MAX_RECORDS || from + name.length > MAX_NAME_UNITS)
         {
             return -1;
         }
@@ -308,7 +333,7 @@ export async function openKeeper(options){
             index.adoptTable(larger);
             shared.table = larger;
             table = into;
-            announce({ table: larger });
+            tell({ table: larger });
         }
         const mask = table.length - 1;
         let slot = first & mask;
@@ -329,7 +354,18 @@ export async function openKeeper(options){
         {
             return -1;
         }
-        const buffer = sharedBuffer(segmentBytes);
+        /** @type {SharedArrayBuffer} */
+        let buffer;
+        try
+        {
+            buffer = sharedBuffer(segmentBytes);
+        }
+        catch {
+            // Memory the engine will not give now: as a budget spent, room is
+            // found by cooling, counted.
+            counts.segmentFailures++;
+            return -1;
+        }
         // A number is never given to a second buffer: a thread that has not
         // heard a segment was let go still reads through its old view, and
         // under the same number it would read another body.
@@ -338,7 +374,7 @@ export async function openKeeper(options){
         segments[at] = { buffer, bytes: new Uint8Array(buffer), buddy: createBuddy(segmentBytes),
             emptySince: tick() };
         counts.segmentsMade++;
-        announce({ segment: at, buffer });
+        tell({ segment: at, buffer });
         return at;
     };
 
@@ -566,6 +602,16 @@ export async function openKeeper(options){
         {
             return false;
         }
+        // Asked away while it was read: it goes now, not to the disk.
+        if ((get(id, R_FLAGS) & F_DROP) !== 0)
+        {
+            giveBack(id);
+            forgetDisk(id);
+            set(id, R_FLAGS, 0);
+            store(id, GONE);
+            counts.gone++;
+            return true;
+        }
         const onlyCopy = (get(id, R_FLAGS) & F_ONLY_COPY) !== 0;
         const onDisk = (get(id, R_FLAGS) & F_ON_DISK) !== 0 || writeOut(id);
         if (!onDisk && onlyCopy)
@@ -631,7 +677,9 @@ export async function openKeeper(options){
                 return null;
             }
             const saved = JSON.parse(new TextDecoder().decode(bytes));
+            // A generation the next save can count on from, in a file of two.
             return saved?.version === INDEX_VERSION && Number.isSafeInteger(saved.generation)
+                && saved.generation >= 0 && saved.generation < Number.MAX_SAFE_INTEGER
                 && Number.isInteger(saved.packs) && saved.packs >= 0 && saved.packs <= MAX_PACKS
                 && Array.isArray(saved.records) ? saved : null;
         }
@@ -736,9 +784,9 @@ export async function openKeeper(options){
         openNextPack();
     }
     catch (e){
-        // A file the disk would not open, or a segment not made or told of:
-        // the files opened are let go, and a pack still opening is let go of
-        // where it opens, so the next try finds none of them held.
+        // A file the disk would not open: the files opened are let go, and a
+        // pack still opening is let go of where it opens, so the next try
+        // finds none of them held.
         closed = true;
         for (const file of [...packs, ...indexFiles])
         {
@@ -979,7 +1027,7 @@ export async function openKeeper(options){
                     segments[s] = null;
                     counts.segmentsLetGo++;
                     counts.letGoBytes += segmentBytes;
-                    announce({ segment: s, buffer: null });
+                    tell({ segment: s, buffer: null });
                 }
             }
             for (const file of packs)

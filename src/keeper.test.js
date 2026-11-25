@@ -816,26 +816,12 @@ test('a keeper closed twice, a pack opening between, lets go of each file once',
     assert.deepEqual(closes.sort(), ['index-a', 'index-b', 'pack-0']);
 });
 
-test('a keeper whose first segment cannot be told of lets go of every file it opened', async()=>{
-    /** @type {Set<string>} */
-    const open = new Set();
-    const base = memoryDisk();
-    const disk = {
-        async open(/** @type {string} */ name){
-            const file = await base.open(name);
-            open.add(name);
-            return { ...file,
-                close(){
-                    open.delete(name);
-                } };
-        },
-    };
-    await assert.rejects(openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk,
-        announce: ()=>{
-            throw new Error('no thread to tell');
-        } }), /no thread to tell/);
-    await new Promise(resolve=>setTimeout(resolve, 10));
-    assert.deepEqual([...open], []);
+test('an announce that throws is counted and the keeper goes on', async()=>{
+    const { keeper } = await cacheOf({ announce: ()=>{
+        throw new Error('no thread to tell');
+    } });
+    assert.ok(keeper.figures().announceFailures > 0);
+    assert.notEqual(keeper.reserve('a', 100), null);
 });
 
 test('an index of more packs than a run opens, or of an unsafe generation, is not read', async()=>{
@@ -864,5 +850,90 @@ test('an index of more packs than a run opens, or of an unsafe generation, is no
         assert.equal(next.reader.look('a'), 'cold', 'the other index read');
         assert.equal(next.reader.look('b'), null);
         assert.ok(opened.length < 10, `${opened.length} files opened`);
+    }
+});
+
+test('a body asked away while read and then cooled for room goes, not to the disk', async()=>{
+    const { reader, keeper, step } = await cacheOf({ disk: memoryDisk(), budget: 64 * KIB });
+    reader.put('a', bodyOf(32 * KIB, 1), { onlyCopy: true });
+    reader.with('a', ()=>{
+        keeper.drop('a');
+    });
+    // Room for another: the oldest is cooled before any sweep.
+    assert.equal(reader.put('b', bodyOf(48 * KIB, 2)), true);
+    assert.equal(reader.look('a'), null);
+    step(1);
+    assert.equal(keeper.figures().cold, 0);
+    keeper.save();
+    const next = await cacheOf({ disk: memoryDisk() });
+    assert.equal(next.reader.look('a'), null);
+});
+
+test('a segment the engine will not make is counted, and room found by cooling as if the budget'
+    + ' were spent: no body is left mid-move, no reservation half made', async()=>{
+    const { reader, keeper } = await cacheOf({ disk: memoryDisk(), budget: 1024 * KIB });
+    reader.put('cold', bodyOf(60 * KIB, 1), { onlyCopy: true });
+    reader.put('a', bodyOf(60 * KIB, 2));
+    const Shared = globalThis.SharedArrayBuffer;
+    globalThis.SharedArrayBuffer = /** @type {any} */ (class extends /** @type {any} */ (Shared) {
+        /** @param {number} bytes @param {any} [options] */
+        constructor(bytes, options){
+            if (bytes === 64 * KIB)
+            {
+                throw new RangeError('out of memory');
+            }
+            super(bytes, options);
+        }
+    });
+    try
+    {
+        // Two segments, the second the spare: each write takes one, its next
+        // spare is refused, and the next write cools what it must.
+        assert.equal(reader.put('b', bodyOf(60 * KIB, 3)), true);
+        assert.equal(reader.put('c', bodyOf(60 * KIB, 4)), true);
+        assert.equal(reader.look('cold'), 'cold');
+        assert.deepEqual(reader.with('cold', body=>[...body], { wait: true }), [...bodyOf(60 * KIB, 1)]);
+        assert.equal(reader.put('c', bodyOf(60 * KIB, 5)), true, 'rewritten');
+    }
+    finally
+    {
+        globalThis.SharedArrayBuffer = Shared;
+    }
+    assert.ok(keeper.figures().segmentFailures > 0);
+    assert.deepEqual(reader.with('c', body=>[...body]), [...bodyOf(60 * KIB, 5)]);
+});
+
+test('names are not spent once the records are full', { timeout: 120_000 }, async()=>{
+    const { reader, keeper } = await cacheOf({ budget: 4096 * KIB, segmentBytes: 1024 * KIB });
+    const words = new Int32Array(keeper.shared.records);
+    const body = bodyOf(8, 1);
+    // Each name written and dropped: its record stays for the run.
+    for (let n = 0; reader.put(`${n}`, body); n++)
+    {
+        keeper.drop(`${n}`);
+    }
+    assert.equal(keeper.figures().records, 1 << 20);
+    const names = Atomics.load(words, 2);
+    assert.equal(reader.put('a name past the records', bodyOf(16, 1)), false);
+    assert.equal(Atomics.load(words, 2), names);
+});
+
+test('a generation past what a save counts to is not read', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('a', bodyOf(100, 1));
+    first.keeper.save();
+    first.reader.put('b', bodyOf(100, 2));
+    first.keeper.save();
+    const [newer, bytes] = [...disk.files].filter(([file])=>file.startsWith('index-'))
+        .sort(([, x], [, y])=>y.length - x.length)[0];
+    const saved = JSON.parse(new TextDecoder().decode(bytes));
+    for (const generation of [-3, Number.MAX_SAFE_INTEGER])
+    {
+        disk.files.set(newer, new TextEncoder().encode(JSON.stringify({ ...saved, generation })));
+        const next = await cacheOf({ disk });
+        assert.equal(next.reader.look('b'), null, `generation ${generation} not read`);
+        assert.equal(next.reader.look('a'), 'cold');
+        assert.equal(next.keeper.save(), true, 'the next save writes');
     }
 });
