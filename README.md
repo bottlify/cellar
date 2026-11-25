@@ -79,7 +79,11 @@ be made again goes away when there is no room and no disk; one marked `onlyCopy`
 A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
 the name has no body then, and the room goes back. A thread joining later is handed
-`keeper.shared` and `keeper.segmentBuffers()` as they are then. The `raise` a reader is given
+`keeper.shared` and `keeper.segmentBuffers()` as they are then. A write the disk takes in part
+counts as not written; a save that fails leaves the last whole index, which the next run reads.
+The idle spans (`coldAfterMs`, `goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's
+clock is a 32-bit word. Records and names are not reused within a run: a run holds 2^20 records
+and 2^25 UTF-16 units of names, past which a new name is refused. The `raise` a reader is given
 takes `{ known }`, the segments that reader has: a body is brought back only where it can read it.
 
 ## Channel

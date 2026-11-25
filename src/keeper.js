@@ -89,6 +89,15 @@ export async function openKeeper(options){
         coldAfterMs = 30_000, goneAfterMs = 7 * 24 * 3600_000, releaseAfterMs = 10_000,
         announce = ()=>{}, now = ()=>performance.now(),
     } = options;
+    // Ages are told on a 32-bit clock that wraps (`age`): a span past half of
+    // it would read as a fresh one.
+    for (const [name, ms] of Object.entries({ coldAfterMs, goneAfterMs, releaseAfterMs }))
+    {
+        if (!(ms >= 0 && ms < 2 ** 31))
+        {
+            throw new RangeError(`cache: ${name} ${ms} is not a span of 0 to 24.8 days`);
+        }
+    }
     const shared = {
         records: growableShared((HEADER_WORDS + 1024 * RECORD_WORDS) * 4,
             (HEADER_WORDS + MAX_RECORDS * RECORD_WORDS) * 4),
@@ -454,7 +463,14 @@ export async function openKeeper(options){
         const offset = get(id, R_OFFSET);
         try
         {
-            packs[pack].write(one.bytes.subarray(offset, offset + length), { at: packTop });
+            // A disk that wrote less than asked holds no body: what it wrote is
+            // written over by the next one.
+            if (packs[pack].write(one.bytes.subarray(offset, offset + length), { at: packTop })
+                !== length)
+            {
+                counts.diskFailures++;
+                return false;
+            }
             if (get(id, R_FLAGS) & F_ONLY_COPY)
             {
                 packs[pack].flush();
@@ -560,7 +576,9 @@ export async function openKeeper(options){
         try
         {
             const saved = JSON.parse(new TextDecoder().decode(bytes));
-            return saved?.version === INDEX_VERSION ? saved : null;
+            return saved?.version === INDEX_VERSION && Number.isInteger(saved.generation)
+                && Number.isInteger(saved.packs) && saved.packs >= 0 && Array.isArray(saved.records)
+                ? saved : null;
         }
         catch {
             // Torn mid-write: the other file is the index.
@@ -594,10 +612,22 @@ export async function openKeeper(options){
             pack = packs.length - 1;
             packTop = packs[pack].getSize();
         }
-        for (const [name, from, offset, length, flags] of saved.records)
+        for (const entry of saved.records)
         {
+            // An entry that does not say a body is skipped, not trusted: the
+            // rest of the index is still the disk's.
+            if (!Array.isArray(entry) || typeof entry[0] !== 'string'
+                || !entry.slice(1, 5).every(Number.isInteger))
+            {
+                continue;
+            }
+            const [name, from, offset, length, flags] = entry;
+            if (from < 0 || from >= packs.length || offset < 0 || !(length > 0))
+            {
+                continue;
+            }
             const id = recordOf(name);
-            if (id < 0 || from >= packs.length)
+            if (id < 0)
             {
                 continue;
             }
@@ -916,22 +946,29 @@ export async function openKeeper(options){
                     return false;
                 }
             }
-            generation++;
+            const next = generation + 1;
             const bytes = new TextEncoder().encode(JSON.stringify({
-                version: INDEX_VERSION, generation, packs: packs.length, records,
+                version: INDEX_VERSION, generation: next, packs: packs.length, records,
             }));
-            // The other file keeps the last index whole while this one is written.
-            const file = indexFiles[generation % indexFiles.length];
+            // The other file keeps the last index whole while this one is
+            // written; a save that fails leaves the next one to this file
+            // again, so the whole one is never the one written over.
+            const file = indexFiles[next % indexFiles.length];
             try
             {
                 file.truncate(0);
-                file.write(bytes, { at: 0 });
+                if (file.write(bytes, { at: 0 }) !== bytes.length)
+                {
+                    counts.diskFailures++;
+                    return false;
+                }
                 file.flush();
             }
             catch {
                 counts.diskFailures++;
                 return false;
             }
+            generation = next;
             counts.saved++;
             return whole;
         },

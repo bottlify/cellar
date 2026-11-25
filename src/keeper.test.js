@@ -514,3 +514,63 @@ test('an engine whose shared buffers cannot grow is told so when the keeper open
         Object.defineProperty(prototype, 'maxByteLength', descriptor);
     }
 });
+
+test('a disk that writes less than asked holds no body, and two failed saves keep the last whole'
+    + ' index', async()=>{
+    const base = memoryDisk();
+    let short = false;
+    let failIndex = false;
+    const disk = {
+        files: base.files,
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            return { ...file,
+                write(/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where){
+                    if (failIndex && name.startsWith('index'))
+                    {
+                        throw new Error('quota');
+                    }
+                    return short && name.startsWith('pack')
+                        ? file.write(view.subarray(0, view.length >> 1), where) : file.write(view, where);
+                } };
+        },
+    };
+    const first = await cacheOf({ disk });
+    first.reader.put('kept', bodyOf(5000, 1), { onlyCopy: true });
+    assert.equal(first.keeper.save(), true);
+    short = true;
+    first.reader.put('cut', bodyOf(5000, 2), { onlyCopy: true });
+    assert.equal(first.keeper.save(), false, 'the disk did not take it whole');
+    first.step(150);
+    assert.equal(first.reader.look('cut'), 'hot', 'an only copy stays in memory');
+    short = false;
+    failIndex = true;
+    assert.equal(first.keeper.save(), false);
+    assert.equal(first.keeper.save(), false);
+    const second = await cacheOf({ disk });
+    assert.deepEqual(second.reader.with('kept', body=>[...body], { wait: true }), [...bodyOf(5000, 1)],
+        'the index saved last whole');
+});
+
+test('an index entry that does not say a body is skipped, the rest read', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('a', bodyOf(100, 1));
+    first.keeper.close();
+    const [name, bytes] = [...disk.files].filter(([file])=>file.startsWith('index-'))
+        .sort(([, x], [, y])=>y.length - x.length)[0];
+    const saved = JSON.parse(new TextDecoder().decode(bytes));
+    saved.records.push([7, 0, 0, 10, 0], ['b', 0, -1, 10, 0], ['c', 0, 0, 'x', 0], null);
+    disk.files.set(name, new TextEncoder().encode(JSON.stringify(saved)));
+    const second = await cacheOf({ disk });
+    assert.equal(second.keeper.figures().loaded, 1);
+    assert.equal(second.reader.with('a', body=>body[1], { wait: true }), (31 + 1) & 255);
+});
+
+test('an idle span past half the keeper\'s 32-bit clock is refused', async()=>{
+    for (const options of [{ coldAfterMs: 2 ** 31 }, { goneAfterMs: 30 * 24 * 3600_000 },
+        { releaseAfterMs: NaN }, { coldAfterMs: -1 }])
+    {
+        await assert.rejects(openKeeper({ budget: 256 * KIB, ...options }), RangeError);
+    }
+});
