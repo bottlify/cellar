@@ -1,12 +1,34 @@
 # Cellar (`@bottlify/cellar`)
 
-One cache for every thread of a page. Bodies live in shared memory and are read in place by name,
-from any worker, without a message. One keeper thread places them under one budget, moves idle
-bodies to the disk (the Origin Private File System) and brings them back when asked. Made for
-[Bottlify](https://github.com/bottlify/bottlify), whose processes share one cache across their
-workers; nothing in it is Bottlify's.
+**Many threads. One memory.**
 
-Status: the cache and its concurrency gate, the channel, the ring and the bell under both, with their gates; not yet on npm. Every version is built into a
+Cellar is a lightweight shared-memory library for multithreaded JavaScript. Threads share data,
+call each other, stream records and wait on each other through shared memory, without going
+through the event loop for every exchange.
+
+- **Cache** - bodies in shared memory, read in place by name from any thread, under one memory
+  budget, idle ones kept on the disk (OPFS) and brought back when asked.
+- **Channel** - calls between two threads, blocking or not, the request and the answer read where
+  they lie.
+- **Ring** - a bounded stream of records one way, read in place, a full ring refusing rather than
+  overwriting.
+- **Bell** - one thread waits on a shared word, another wakes it, and only when it sleeps.
+- **Doorbell** - one wait for everything a thread is sent, whatever it came through.
+
+Built for [Bottlify](https://github.com/bottlify/bottlify), whose processes and workers share
+memory and wait on each other; nothing in it is Bottlify's, and it suits any page that runs work in
+several threads. No runtime dependencies, the browser's own primitives (`SharedArrayBuffer`,
+`Atomics`, OPFS), MPL-2.0.
+
+![Round trip between two threads: postMessage against Cellar](docs/latency.svg)
+
+![Memory of a worker summing shared samples: postMessage against a channel](docs/memory.svg)
+
+The figures are `examples/call-a-worker.mjs`, `examples/memory.mjs` and `examples/ring.mjs`
+(node 22, a 4-core x86 VM, 3 runs an arm, medians); the tables below give every number. How each
+mechanism works, drawn: [examples/README.md](examples/README.md).
+
+Status: the bell, the ring, the channel and the cache, each with its gate; not yet on npm. Every version is built into a
 [release](https://github.com/bottlify/cellar/releases): `cellar.js`, `cellar.min.js`, the
 declarations and their checksums.
 

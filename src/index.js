@@ -5,9 +5,10 @@
  */
 
 /**
- * @bottlify/cellar - one cache for every thread of a page: bodies in shared
- * memory read in place by name, one keeper thread placing them, a budget for
- * all of them, idle bodies on the disk (OPFS) and brought back on demand.
+ * @bottlify/cellar - shared-memory primitives for multithreaded JavaScript:
+ * the bell two threads wait on each other by, byte rings, calls between two
+ * threads (channels), and a cache of bodies in shared memory read in place by
+ * name, under one budget, idle ones on the disk (OPFS).
  */
 
 export { openKeeper } from './keeper.js';

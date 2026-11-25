@@ -28,7 +28,7 @@ const DIST = join(ROOT, 'dist');
 const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
 
 const BANNER = `/*
- * Cellar ${manifest.version}: one cache for every thread of a page.
+ * Cellar ${manifest.version}: shared-memory primitives for multithreaded JavaScript.
  * https://github.com/bottlify/cellar
  * Copyright (c) 2026 Bottlify Project
  * Licensed under the Mozilla Public License, version 2.0
