@@ -401,3 +401,18 @@ test('a record that grows while it is written is written as long as it was', ()=
     assert.equal(ring.drain(record=>void records.push([...record])), 2);
     assert.deepEqual(records, [[0, 0, 0, 0, 0, 0, 0, 0], [7]]);
 });
+
+test('bytes over a buffer that cannot grow are copied as they are, nothing made for them', async()=>{
+    const { bytesOf } = await import('./bytes.js');
+    const plain = new Uint8Array(8);
+    const shared = new Uint8Array(new SharedArrayBuffer(8));
+    const numbers = [1, 2, 3];
+    assert.equal(bytesOf(plain, 'test'), plain);
+    assert.equal(bytesOf(shared, 'test'), shared);
+    assert.equal(bytesOf(numbers, 'test'), numbers);
+    // Only a view another thread can grow is cut to a view of its own.
+    const growing = new Uint8Array(new /** @type {any} */ (SharedArrayBuffer)(8, { maxByteLength: 64 }));
+    const taken = bytesOf(growing, 'test');
+    assert.notEqual(taken, growing);
+    assert.equal(taken.length, 8);
+});

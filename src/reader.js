@@ -21,6 +21,7 @@
 import {
     COLD, GONE, HOT, R_LENGTH, R_OFFSET, R_SEGMENT, R_STATE, WRITING, stateWord, viewIndex,
 } from './shared.js';
+import { bytesOf } from './bytes.js';
 
 /**
  * What the reader asks the keeper: `reserve` and `raise` answer at once,
@@ -306,17 +307,16 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name @param {Uint8Array} bytes @param {{ onlyCopy?: boolean }} [options]
          */
         put(name, bytes, options){
-            const length = bytes.length;
-            const into = self.reserve(name, length, options);
+            // The bytes as long as they are now, which is what is copied.
+            const taken = bytesOf(bytes, 'cache');
+            const into = self.reserve(name, taken.length, options);
             if (into === null)
             {
                 return false;
             }
             try
             {
-                // The length taken, not the bytes' length now: a view over
-                // shared memory that grows may have grown since.
-                into.set(ArrayBuffer.isView(bytes) ? bytes.subarray(0, length) : bytes);
+                into.set(taken);
             }
             catch (e){
                 self.abandon(name);

@@ -37,7 +37,7 @@
 
 import { SPIN_MS, deadlineOf, publish as publishWord, waitFor as waitWord,
     waitForAsync as waitWordAsync } from './bell.js';
-import { checkBytes } from './bytes.js';
+import { bytesOf } from './bytes.js';
 
 /** The header, in 32-bit words. */
 const HEADER_WORDS = 16;
@@ -187,16 +187,15 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} base @param {number} n @param {ArrayLike<number>} message
      */
     const writeSlot = (base, n, message)=>{
-        checkBytes(message, 'channel');
-        const length = message.length;
+        // The bytes as long as they are now, which is what is copied.
+        const taken = bytesOf(message, 'channel');
+        const length = taken.length;
         if (length > slotBytes)
         {
             throw new RangeError(`channel: ${length} bytes, a slot holds ${slotBytes}`);
         }
         const at = base + (n & (slots - 1)) * stride;
-        // The length taken: a view that grows may have grown since.
-        bytes.set(ArrayBuffer.isView(message) ? /** @type {Uint8Array} */ (message).subarray(0, length)
-            : message, at + 4);
+        bytes.set(taken, at + 4);
         words[at >> 2] = length;
     };
 
