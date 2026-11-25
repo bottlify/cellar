@@ -49,6 +49,8 @@ const READ = 2;
 const ROOM = 3;
 const CLOSED = 4;
 const CONTROL_WORDS = 5;
+/** The word a writer waiting for room sleeps on, for a test of the close. */
+export const ROOM_WORD = ROOM;
 
 /** Why a write, or a wait for room, ended without writing. */
 export class RingClosed extends Error {
@@ -263,6 +265,9 @@ export function openRing(memory){
          * The reader's: the records there are, each handed to `take` before
          * the next is read, `most` at the most: a ring written without a pause
          * does not keep its reader from the others it reads. Returns how many.
+         * A reader that took `most` does not wait on the doorbell next while
+         * `held()` is not zero: what is left was rung for before its look, and
+         * nothing will ring for it again.
          *
          * @param {(record: Uint8Array) => void} take
          * @param {number} [most]
@@ -286,6 +291,9 @@ export function openRing(memory){
          */
         close(){
             Atomics.store(control, CLOSED, 1);
+            // Moved, not only notified: a writer that looked at the closed
+            // word just before and sleeps just after finds the word moved.
+            Atomics.add(control, ROOM, 1);
             Atomics.notify(control, ROOM);
             bell.ring();
         },

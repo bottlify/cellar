@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { RingClosed, createRingMemory, openRing } from './ring.js';
+import { ROOM_WORD, RingClosed, createRingMemory, openRing } from './ring.js';
 import { createDoorbell, openDoorbell } from './bell.js';
 
 /** @param {number} seed */
@@ -286,3 +286,15 @@ test('a writer asleep on a full ring in another thread ends when the reader clos
         assert.equal(await result, 'RingClosed');
         await writer.terminate();
     });
+
+test('a close moves the word a writer sleeps on: a wait that looked before the close and sleeps'
+    + ' after it ends at once', ()=>{
+    // The writer's last look at the closed word, then the close, then its
+    // sleep: a close that only notified would wake nobody, and the sleep
+    // would run its time out. A close that moves the word makes it return.
+    const memory = createRingMemory(64);
+    const words = new Int32Array(memory.control);
+    const room = Atomics.load(words, ROOM_WORD);
+    openRing(memory).close();
+    assert.equal(Atomics.wait(words, ROOM_WORD, room, 1000), 'not-equal');
+});

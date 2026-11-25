@@ -23,7 +23,15 @@
  * and one that finds a sleeper notifies under the lock the wait takes.
  *
  * Words are indices into an `Int32Array` over a SharedArrayBuffer; a word
- * that says the conversation is over (`closed`) ends every wait on it. A wait
+ * that says the conversation is over (`closed`) ends every wait on it.
+ *
+ * A wait sleeps on the word it waits for, or on a bell word beside it
+ * (`bell`) when the word it waits for means something and may not be moved
+ * by anyone but its owner - a count of requests, say. Whoever moves the word
+ * then moves the bell too, but only when a wait sleeps; and a close moves the
+ * bell, which a close could not do to the word: a wait that looked at the
+ * closed word just before the close and sleeps just after finds its bell
+ * moved and returns, where a notify alone would have found nobody asleep yet. A wait
  * takes its terms as arguments, not an object: it is made once a call on the
  * hottest paths, and makes no garbage.
  */
@@ -65,14 +73,15 @@ export const deadlineOf = timeoutMs=>(timeoutMs === undefined || timeoutMs === I
  * @param {number} [deadline]  on the clock of `performance.now()`; Infinity by default
  * @param {number} [spinMs]  how long it looks before it sleeps (`SPIN_MS`); 0 sleeps at once
  * @param {number} [closed]  a word that, once not zero, ends the wait (none by default)
+ * @param {number} [bell]  the word it sleeps on, `index` by default
  * @returns {WaitEnd}
  */
 export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs = SPIN_MS,
-    closed = -1){
+    closed = -1, bell = index){
     seen |= 0;
     if (spinMs <= 0)
     {
-        return sleepFor(words, index, seen, sleeps, deadline, closed);
+        return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
     }
     // The clock is read once in a while, and not at all before the first few
     // hundred looks: each answer of it is a number made on the heap, and the
@@ -93,7 +102,7 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
             }
             else if (now >= spinUntil)
             {
-                return sleepFor(words, index, seen, sleeps, deadline, closed);
+                return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
             }
         }
     }
@@ -104,10 +113,10 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
  * The sleeping half of `waitFor`, with no look first.
  *
  * @param {Int32Array} words @param {number} index @param {number} seen @param {number} sleeps
- * @param {number} deadline @param {number} closed
+ * @param {number} deadline @param {number} closed @param {number} bell
  * @returns {WaitEnd}
  */
-function sleepFor(words, index, seen, sleeps, deadline, closed){
+function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
     let slept = false;
     while (Atomics.load(words, index) === seen)
     {
@@ -121,9 +130,13 @@ function sleepFor(words, index, seen, sleeps, deadline, closed){
             return 'timed-out';
         }
         Atomics.add(words, sleeps, 1);
-        if (closed < 0 || Atomics.load(words, closed) === 0)
+        // The bell read after the count rose and before the last looks: a
+        // move or a close after it moves the bell, and the sleep returns.
+        const rung = bell === index ? seen : Atomics.load(words, bell);
+        if (Atomics.load(words, index) === seen
+            && (closed < 0 || Atomics.load(words, closed) === 0))
         {
-            Atomics.wait(words, index, seen, left === Infinity ? undefined : left);
+            Atomics.wait(words, bell, rung, left === Infinity ? undefined : left);
             slept = true;
         }
         Atomics.sub(words, sleeps, 1);
@@ -137,11 +150,12 @@ function sleepFor(words, index, seen, sleeps, deadline, closed){
  * sleeps: its thread has other work.
  *
  * @param {Int32Array} words @param {number} index @param {number} seen
- * @param {number} sleeps @param {number} [deadline] @param {number} [closed]  as `waitFor`'s
+ * @param {number} sleeps @param {number} [deadline] @param {number} [closed]
+ * @param {number} [bell]  as `waitFor`'s
  * @returns {Promise<WaitEnd>}
  */
 export async function waitForAsync(words, index, seen, sleeps, deadline = Infinity,
-    closed = -1){
+    closed = -1, bell = index){
     seen |= 0;
     let slept = false;
     while (Atomics.load(words, index) === seen)
@@ -156,9 +170,11 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
             return 'timed-out';
         }
         Atomics.add(words, sleeps, 1);
-        if (closed < 0 || Atomics.load(words, closed) === 0)
+        const rung = bell === index ? seen : Atomics.load(words, bell);
+        if (Atomics.load(words, index) === seen
+            && (closed < 0 || Atomics.load(words, closed) === 0))
         {
-            const waited = /** @type {any} */ (Atomics).waitAsync?.(words, index, seen,
+            const waited = /** @type {any} */ (Atomics).waitAsync?.(words, bell, rung,
                 left === Infinity ? undefined : left);
             if (waited?.async)
             {
@@ -193,17 +209,23 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
 
 /**
  * Wakes the waits asleep on `words[index]`, which the caller has just stored,
- * when the count `words[sleeps]` says one sleeps.
+ * when the count `words[sleeps]` says one sleeps: through their bell, moved
+ * first, where they sleep on one (`bell`).
  *
  * @param {Int32Array} words @param {number} index @param {number} sleeps
+ * @param {number} [bell]  the word the waits sleep on, `index` by default
  * @returns {boolean} whether it notified
  */
-export function wake(words, index, sleeps){
+export function wake(words, index, sleeps, bell = index){
     if (Atomics.load(words, sleeps) === 0)
     {
         return false;
     }
-    Atomics.notify(words, index);
+    if (bell !== index)
+    {
+        Atomics.add(words, bell, 1);
+    }
+    Atomics.notify(words, bell);
     return true;
 }
 
@@ -211,11 +233,12 @@ export function wake(words, index, sleeps){
  * Stores `value` in `words[index]` and wakes what sleeps on it.
  *
  * @param {Int32Array} words @param {number} index @param {number} value @param {number} sleeps
+ * @param {number} [bell]  as `wake`'s
  * @returns {boolean} whether it notified
  */
-export function publish(words, index, value, sleeps){
+export function publish(words, index, value, sleeps, bell = index){
     Atomics.store(words, index, value | 0);
-    return wake(words, index, sleeps);
+    return wake(words, index, sleeps, bell);
 }
 
 /**

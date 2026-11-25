@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { COUNTS, ChannelClosed, createChannel, openClient, openServer } from './channel.js';
+import { BELLS, COUNTS, ChannelClosed, createChannel, openClient, openServer } from './channel.js';
 
 /** A handler answering each request with its bytes reversed. @param {Uint8Array} request */
 const reversed = request=>request.slice().reverse();
@@ -132,4 +132,21 @@ test('a handler that throws fails its own call alone, through the reader', async
     server.serve(reversed, { timeoutMs: 0 });
     await assert.rejects(bad, /unreadable/);
     assert.deepEqual([...await good], [2]);
+});
+
+test('a close moves the bells both sides sleep on: a wait that looked before the close and'
+    + ' sleeps after it ends at once', ()=>{
+    // Each side sleeps on its bell; a close that only notified would leave
+    // one that looked at the closed word just before it asleep for its time.
+    for (const closing of ['client', 'server'])
+    {
+        const memory = createChannel({ slots: 2, slotBytes: 8 });
+        const words = new Int32Array(memory);
+        const seen = BELLS.map(bell=>Atomics.load(words, bell));
+        (closing === 'client' ? openClient(memory) : openServer(memory)).close();
+        BELLS.forEach((bell, at)=>{
+            assert.equal(Atomics.wait(words, bell, seen[at], 1000), 'not-equal',
+                `${closing} closed: bell ${bell}`);
+        });
+    }
 });

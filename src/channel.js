@@ -54,8 +54,19 @@ const SERVER_SLEEPS = 5;
 const CLOSED = 6;
 const SLOTS = 7;
 const SLOT_BYTES = 8;
+/**
+ * The bells the two sides sleep on: the serving side's for requests, the
+ * asking side's for answers. A side sleeps on its bell, not on the count it
+ * waits for: a close moves the bells, and a count it may not move.
+ */
+const SERVER_BELL = 9;
+const CLIENT_BELL = 10;
 /** The four counts, for a test that starts them near their wrap. */
 export const COUNTS = Object.freeze([ASKED, TAKEN, ANSWERED, READ]);
+/** The two bells, for a test of the close. */
+export const BELLS = Object.freeze([SERVER_BELL, CLIENT_BELL]);
+/** @param {number} counter the bell of the side that waits for it */
+const bellOf = counter=>(counter === ASKED ? SERVER_BELL : CLIENT_BELL);
 
 
 /**
@@ -155,7 +166,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} value @param {number} sleeps
      */
     const publish = (counter, value, sleeps)=>{
-        publishWord(words, counter, value, sleeps);
+        publishWord(words, counter, value, sleeps, bellOf(counter));
     };
 
     /**
@@ -165,7 +176,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} seen @param {number} sleeps @param {number} deadline
      */
     const waitFor = (counter, seen, sleeps, deadline)=>{
-        const end = waitWord(words, counter, seen, sleeps, deadline, spinMs, CLOSED);
+        const end = waitWord(words, counter, seen, sleeps, deadline, spinMs, CLOSED, bellOf(counter));
         if (end === 'closed')
         {
             throw new ChannelClosed();
@@ -181,7 +192,8 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @returns {Promise<boolean>}
      */
     const waitForAsync = async(counter, seen, sleeps, deadline)=>{
-        const end = await waitWordAsync(words, counter, seen, sleeps, deadline, CLOSED);
+        const end = await waitWordAsync(words, counter, seen, sleeps, deadline, CLOSED,
+            bellOf(counter));
         if (end === 'closed')
         {
             throw new ChannelClosed();
@@ -191,12 +203,18 @@ function endOver(memory, { spinMs = SPIN_MS }){
 
     return {
         words, requests, answers, slots, slotAt, writeSlot, publish, waitFor, waitForAsync,
-        /** Ends the channel for both sides: every wait on it ends with ChannelClosed. */
+        /**
+         * Ends the channel for both sides: every wait on it ends with
+         * ChannelClosed. The bells are moved, not only notified: a wait that
+         * looked at the closed word just before the close and sleeps just
+         * after finds its bell moved and returns.
+         */
         close(){
             Atomics.store(words, CLOSED, 1);
-            for (const counter of [ASKED, TAKEN, ANSWERED, READ])
+            for (const bell of BELLS)
             {
-                Atomics.notify(words, counter);
+                Atomics.add(words, bell, 1);
+                Atomics.notify(words, bell);
             }
         },
         closed: ()=>Atomics.load(words, CLOSED) !== 0,
