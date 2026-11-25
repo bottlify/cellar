@@ -268,6 +268,25 @@ self.onmessage = ({ data })=>{
 };
 ```
 
+A record need not be built elsewhere and copied in: `reserve(length)` gives room for one at
+`ring.bytes[at]`, the writer builds it there, and `commit(length)` publishes it, as long as it
+turned out (no longer than was reserved); `abandon()` gives the room back. One reservation at a
+time; `reserveWaiting` and `reserveWaitingAsync` wait for room as the writes do. `write` is the
+same three steps with a copy between.
+
+```js
+// recorder.worker.js - a batch of commands for another worker, built where it will be read.
+const at = ring.reserveWaiting(BATCH_BYTES);         // blocks until the reader makes room
+const words = new DataView(ring.bytes.buffer);
+let end = at;
+for (const command of commands)
+{
+    words.setUint32(end, command.op, true);
+    words.setUint32(end + 4, command.argument, true);
+    end += 8;
+}
+ring.commit(end - at);
+```
 
 A writer that may not block (a page) waits for room with `writeWaitingAsync`; `drain(take, most)`
 takes at most `most` records, so one ring written without a pause does not starve the others a
@@ -293,6 +312,19 @@ terminated while asleep stays counted, and every move after notifies once for it
 | --- | --- | --- |
 | a step of the busy worker (it yields after each to hear a message) | 190 us | 164 us |
 | an event there and back, the worker idle | 38 us | 1.5 us |
+
+`examples/batches.mjs` hands batches of bytes from one worker to another, the same work to build
+and to read each way: posted with the buffer transferred and posted back, copied into a ring
+(`write`), and built in the ring (`reserve`, `commit`). Processor time a batch, sender + reader,
+building and reading included (node 26 and node 22, a 4-core x86 VM under load ~10, 5 runs an arm
+alternated, medians):
+
+| batch | postMessage | ring `write` | ring `reserve` |
+| --- | --- | --- | --- |
+| 64 B | 5.8 / 6.4 us | 0.45 / 0.44 us | 0.46 / 0.41 us |
+| 8 KiB | 20.8 / 12.9 us | 8.0 / 8.5 us | 6.8 / 5.4 us |
+| 64 KiB | 97.6 / 63.3 us | 42.1 / 60.3 us | 32.3 / 36.5 us |
+| 256 KiB | 314 / 217 us | 176 / 409 us | 143 / 135 us |
 
 ## Requirements
 
