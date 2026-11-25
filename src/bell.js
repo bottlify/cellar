@@ -39,8 +39,34 @@
 /** How long a wait looks before it sleeps, in ms: the other side often moves the word sooner. */
 export const SPIN_MS = 0.05;
 
-/** Looks between two readings of the clock while a wait spins, less one (a mask). */
+/** Looks between two checks of the closed word while a wait spins, less one (a mask). */
 const SPIN_LOOKS = 255;
+
+/** Looks timed once to learn how many a millisecond holds. */
+const CALIBRATION_LOOKS = 1 << 16;
+
+/**
+ * Looks a millisecond holds on this thread, timed on the first wait that
+ * spins. A spin counts looks, not time: each reading of the clock is a number
+ * made on the heap, and a wait that spins to its end on every call (a handler
+ * slower than the spin) would make garbage on every call.
+ */
+let looksPerMs = 0;
+
+/** @param {number} spinMs @returns {number} looks a spin of `spinMs` takes */
+const looksFor = spinMs=>{
+    if (looksPerMs === 0)
+    {
+        const probe = new Int32Array(1);
+        const from = clock.now();
+        for (let n = 0; n < CALIBRATION_LOOKS; n++)
+        {
+            Atomics.load(probe, 0);
+        }
+        looksPerMs = CALIBRATION_LOOKS / Math.max(clock.now() - from, 0.001);
+    }
+    return Math.max(SPIN_LOOKS + 1, Math.round(spinMs * looksPerMs));
+};
 
 /**
  * How a wait ended: the word moved before it counted itself asleep (`moved`)
@@ -105,10 +131,10 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
     {
         return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
     }
-    // The clock is read once in a while, and not at all before the first few
-    // hundred looks: each answer of it is a number made on the heap, and the
-    // word often moves sooner.
-    let spinUntil = -1;
+    // The clock is read only for a wait with a deadline, once in a few hundred
+    // looks: each answer of it is a number made on the heap.
+    const most = looksFor(spinMs);
+    const timed = deadline !== Infinity;
     for (let looks = 1; Atomics.load(words, index) === seen; looks++)
     {
         if ((looks & SPIN_LOOKS) === 0)
@@ -117,12 +143,7 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
             {
                 return 'closed';
             }
-            const now = clock.now();
-            if (spinUntil < 0)
-            {
-                spinUntil = Math.min(deadline, now + spinMs);
-            }
-            else if (now >= spinUntil)
+            if (looks >= most || (timed && clock.now() >= deadline))
             {
                 return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
             }
@@ -146,7 +167,7 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
         {
             return 'closed';
         }
-        const left = deadline - clock.now();
+        const left = deadline === Infinity ? Infinity : deadline - clock.now();
         if (left <= 0)
         {
             return 'timed-out';

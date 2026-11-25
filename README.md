@@ -117,7 +117,8 @@ const later = await client.call(request);
 One asking side and one serving side for the channel's life; a thread that needs a new link (a
 worker started again) makes a new channel. Answers come back in order, as many requests out at
 once as there are slots; a call waiting for room goes out as soon as one answer frees a slot. A
-blocking ask makes no garbage: the request and answer are read where they lie.
+blocking ask makes no garbage, answered at once or after its handler worked a while: the request
+and answer are read where they lie, and a wait reads the clock only when it has a deadline.
 
 A handler that throws, or answers more than a slot holds, answers its request with the failure:
 the call or ask fails with `ChannelFailed`, saying what the handler threw (as much as a slot

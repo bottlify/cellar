@@ -14,7 +14,16 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { ChannelClosed, openClient, openServer } from './channel.js';
 import { answerTo, requestOf } from './channel-gate.fixture.js';
 
-const { role, memory, seed, count } = workerData;
+const { role, memory, seed, count, holdMs = 0 } = workerData;
+
+/** Holds the thread `holdMs`, as a handler with work to do does. */
+const hold = ()=>{
+    const until = performance.now() + holdMs;
+    while (performance.now() < until)
+    {
+        // Working.
+    }
+};
 
 if (role === 'server')
 {
@@ -24,7 +33,10 @@ if (role === 'server')
     {
         for (;;)
         {
-            served += server.serve(answerTo);
+            served += server.serve(holdMs > 0 ? request=>{
+                hold();
+                return answerTo(request);
+            } : answerTo);
         }
     }
     catch (e){
