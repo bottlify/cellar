@@ -101,6 +101,11 @@ export async function openKeeper(options){
         }
     }
     checkSegmentBytes(segmentBytes);
+    // NaN compares false to every sum: no limit at all.
+    if (typeof budget !== 'number' || !(budget >= 0) || !Number.isFinite(budget))
+    {
+        throw new RangeError(`cache: a budget of ${budget} bytes`);
+    }
     // A body's place in a segment and in a pack is a 32-bit word of its record.
     if (!(packBytes > 0 && packBytes < 2 ** 31))
     {
@@ -434,6 +439,17 @@ export async function openKeeper(options){
 
     // --- disk ---------------------------------------------------------------
 
+    /** @param {DiskFile} file */
+    const closeFile = file=>{
+        try
+        {
+            file.close();
+        }
+        catch {
+            counts.diskFailures++;
+        }
+    };
+
     const openNextPack = ()=>{
         if (disk !== null && !closed && nextPack === null && readyPack === null)
         {
@@ -443,8 +459,14 @@ export async function openKeeper(options){
             // promise does: counted, and the body that wanted it stays.
             nextPack = Promise.resolve().then(()=>opening.open(name))
                 .then(file=>{
-                    readyPack = file;
                     nextPack = null;
+                    // Opened after the keeper closed: let go of here, once.
+                    if (closed)
+                    {
+                        closeFile(file);
+                        return file;
+                    }
+                    readyPack = file;
                     return file;
                 }, e=>{
                     counts.diskFailures++;
@@ -698,7 +720,19 @@ export async function openKeeper(options){
         }
     };
 
-    await load();
+    try
+    {
+        await load();
+    }
+    catch (e){
+        // A file the disk would not open: the ones it did are let go, so the
+        // next try finds none of them held.
+        for (const file of [...packs, ...indexFiles])
+        {
+            closeFile(file);
+        }
+        throw e;
+    }
     keepSpare();
     openNextPack();
 
@@ -716,6 +750,10 @@ export async function openKeeper(options){
          * @param {{ onlyCopy?: boolean, known?: number }} [options]
          */
         reserve(name, length, { onlyCopy = false, known = Infinity } = {}){
+            if (!Number.isInteger(length))
+            {
+                throw new RangeError(`cache: a body of ${length} bytes`);
+            }
             // No block holds an empty body or one past a segment: refused
             // before anything is moved for it.
             if (!(length > 0) || length > segmentBytes)
@@ -1006,6 +1044,10 @@ export async function openKeeper(options){
          * true where the save was whole.
          */
         close(){
+            if (closed)
+            {
+                return false;
+            }
             const whole = keeper.save();
             closed = true;
             disk = null;
@@ -1029,23 +1071,8 @@ export async function openKeeper(options){
             }
             for (const file of [...packs, ...indexFiles, ...readyPack ? [readyPack] : []])
             {
-                try
-                {
-                    file.close();
-                }
-                catch {
-                    counts.diskFailures++;
-                }
+                closeFile(file);
             }
-            nextPack?.then(file=>{
-                try
-                {
-                    file.close();
-                }
-                catch {
-                    counts.diskFailures++;
-                }
-            }, ()=>{});
             packs.length = 0;
             indexFiles.length = 0;
             readyPack = null;

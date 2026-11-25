@@ -356,3 +356,8 @@ test('a request that is not bytes is refused', ()=>{
     assert.throws(()=>client.ask(/** @type {any} */ (new DataView(new ArrayBuffer(4)))), TypeError);
     assert.equal(openServer(memory).waiting(), 0);
 });
+
+test('a channel past 1 GiB is refused, its slots found by 32-bit arithmetic', ()=>{
+    assert.throws(()=>createChannel({ slots: 1 << 16, slotBytes: 1 << 16 }), RangeError);
+    assert.throws(()=>createChannel({ slots: 2, slotBytes: 2 ** 31 }), RangeError);
+});

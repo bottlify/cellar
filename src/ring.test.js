@@ -357,3 +357,10 @@ test('a ring\'s methods work taken off it', async()=>{
     assert.equal(drain(record=>void taken.push(record[0])), 3);
     assert.deepEqual(taken, [1, 2, 3]);
 });
+
+test('a ring of a capacity that is not a number of bytes is refused', ()=>{
+    for (const capacity of [NaN, -1, 0, /** @type {any} */ ('64')])
+    {
+        assert.throws(()=>createRingMemory(capacity), RangeError);
+    }
+});

@@ -87,6 +87,10 @@ const aligned = n=>(n + ALIGN - 1) & ~(ALIGN - 1);
  * @returns {RingMemory}
  */
 export function createRingMemory(capacity, bell = createDoorbell()){
+    if (typeof capacity !== 'number' || !(capacity > 0))
+    {
+        throw new RangeError(`ring: a capacity of ${capacity} bytes`);
+    }
     let size = 64;
     while (size < capacity)
     {

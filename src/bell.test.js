@@ -159,3 +159,26 @@ test('a spin that is not a finite time, or a deadline that is not a number, is r
     assert.equal(waitFor(words, WORD, 0, SLEEPS, performance.now() + 1, -1), 'timed-out',
         'a spin of none sleeps at once');
 });
+
+test('a spin past a second is refused: its count of looks would not end', ()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, Number.MAX_VALUE), RangeError);
+    assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, 1001), RangeError);
+});
+
+test('an asynchronous wait whose sleep throws takes itself off the count', async()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const waitAsync = /** @type {any} */ (Atomics).waitAsync;
+    /** @type {any} */ (Atomics).waitAsync = ()=>{
+        throw new TypeError('not a shared array');
+    };
+    try
+    {
+        await assert.rejects(waitForAsync(words, WORD, 0, SLEEPS, Infinity), TypeError);
+    }
+    finally
+    {
+        /** @type {any} */ (Atomics).waitAsync = waitAsync;
+    }
+    assert.equal(Atomics.load(words, SLEEPS), 0);
+});

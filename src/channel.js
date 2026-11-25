@@ -93,7 +93,13 @@ export function createChannel({ slots = 16, slotBytes = 4096 } = {}){
         throw new RangeError(`channel: ${slots} slots of ${slotBytes} bytes (slots a power of two)`);
     }
     const stride = slotStride(slotBytes);
-    const memory = new SharedArrayBuffer(HEADER_WORDS * 4 + 2 * slots * stride);
+    const bytes = HEADER_WORDS * 4 + 2 * slots * stride;
+    // A slot's place is found by 32-bit arithmetic: the whole within 1 GiB.
+    if (bytes > 1 << 30)
+    {
+        throw new RangeError(`channel: ${slots} slots of ${slotBytes} bytes take more than 1 GiB`);
+    }
+    const memory = new SharedArrayBuffer(bytes);
     const words = new Int32Array(memory);
     words[SLOTS] = slots;
     words[SLOT_BYTES] = slotBytes;

@@ -87,7 +87,9 @@ fails at the index leaves the last whole one, which the next run reads; an entry
 not fit its pack's file is skipped and counted (`skippedEntries`). After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
 good), a cold one is the next run's, on the disk, and no body of this run any more.
-The idle spans (`coldAfterMs`, `goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's
+`budget` is a finite number of bytes; `segmentBytes` a power of two from 4 KiB to 1 GiB;
+`packBytes` under 2 GiB; a body's length a whole number of bytes. The idle spans (`coldAfterMs`,
+`goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's
 clock is a 32-bit word. Records and names are not reused within a run: a run holds 2^20 records
 and 2^25 UTF-16 units of names, past which a new name is refused. The `raise` a reader is given
 takes `{ known }`, the segments that reader has: a body is brought back only where it can read it.
@@ -181,7 +183,7 @@ record not read. A record is bytes: a `Uint8Array` or an array of numbers; a wid
 
 `waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
 `Int32Array`, for a protocol of its own; `deadlineOf(timeoutMs)` is a deadline on the clock they
-read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (counted in looks, not
+read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
 time: a wait with no deadline never reads the clock). A timeout or a spin that is
 not a number is refused. The count of waits asleep is kept by the waits themselves: a worker
 terminated while asleep stays counted, and every move after notifies once for it (about 50 ns more a move, x86).

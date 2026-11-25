@@ -744,3 +744,74 @@ test('a segment past 1 GiB, or not a power of two, is refused when the keeper op
         await assert.rejects(openKeeper({ budget: 1, segmentBytes }), RangeError);
     }
 });
+
+test('a budget that is not a number of bytes, and a body of a fraction of a byte, are refused',
+    async()=>{
+        for (const budget of [NaN, -1, Infinity, /** @type {any} */ ('1')])
+        {
+            await assert.rejects(openKeeper({ budget }), RangeError);
+        }
+        const { keeper, reader } = await cacheOf();
+        assert.throws(()=>keeper.reserve('a', 100.5), RangeError);
+        assert.equal(reader.put('a', bodyOf(100, 1)), true);
+        assert.equal(keeper.figures().placedBytes, UNIT);
+    });
+
+test('a disk that fails to open a file as the keeper opens has every file it opened let go',
+    async()=>{
+        const disk = memoryDisk();
+        const first = await cacheOf({ disk });
+        first.reader.put('a', bodyOf(100, 1));
+        first.keeper.close();
+        /** @type {Set<string>} */
+        const open = new Set();
+        const failing = {
+            async open(/** @type {string} */ name){
+                if (name === 'pack-0')
+                {
+                    throw new Error('no such file');
+                }
+                const file = await disk.open(name);
+                open.add(name);
+                return { ...file,
+                    close(){
+                        open.delete(name);
+                    } };
+            },
+        };
+        await assert.rejects(openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk: failing }),
+            /no such file/);
+        assert.deepEqual([...open], []);
+    });
+
+test('a keeper closed twice, a pack opening between, lets go of each file once', async()=>{
+    const base = memoryDisk();
+    /** @type {string[]} */
+    const closes = [];
+    /** @type {(() => void)[]} */
+    const later = [];
+    const disk = {
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            if (name === 'pack-0')
+            {
+                await new Promise(resolve=>later.push(()=>resolve(undefined)));
+            }
+            return { ...file,
+                close(){
+                    closes.push(name);
+                } };
+        },
+    };
+    const keeper = await openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk });
+    // The pack's opening under way, held.
+    while (later.length === 0)
+    {
+        await new Promise(resolve=>setTimeout(resolve, 0));
+    }
+    keeper.close();
+    later.forEach(go=>go());
+    await new Promise(resolve=>setTimeout(resolve, 10));
+    assert.equal(keeper.close(), false);
+    assert.deepEqual(closes.sort(), ['index-a', 'index-b', 'pack-0']);
+});

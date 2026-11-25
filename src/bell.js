@@ -55,6 +55,9 @@ const SPIN_LOOKS = 255;
  */
 const LOOKS_PER_MS = 100_000;
 
+/** The longest spin a wait takes, in ms: its looks stay a count a loop reaches. */
+const MAX_SPIN_MS = 1000;
+
 /** @param {number} spinMs @returns {number} looks a spin of `spinMs` takes */
 const looksFor = spinMs=>Math.max(SPIN_LOOKS + 1, Math.round(spinMs * LOOKS_PER_MS));
 
@@ -95,9 +98,10 @@ export const deadlineOf = timeoutMs=>{
 
 /** @param {number} deadline @param {number} spinMs */
 const checkTimes = (deadline, spinMs)=>{
-    // A deadline may be Infinity (none); a spin is a finite time, or none.
+    // A deadline may be Infinity (none); a spin is a time up to a second, or
+    // none: past that a wait sleeps rather than spin.
     if (typeof deadline !== 'number' || Number.isNaN(deadline)
-        || typeof spinMs !== 'number' || !Number.isFinite(spinMs))
+        || typeof spinMs !== 'number' || !(spinMs <= MAX_SPIN_MS) || Number.isNaN(spinMs))
     {
         throw new RangeError(`bell: a deadline of ${deadline}, a spin of ${spinMs} ms`);
     }
@@ -214,37 +218,43 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
         }
         Atomics.add(words, sleeps, 1);
         slept = true;
-        const rung = bell === index ? seen : Atomics.load(words, bell);
-        if (Atomics.load(words, index) === seen
-            && (closed < 0 || Atomics.load(words, closed) === 0))
+        try
         {
-            const waited = /** @type {any} */ (Atomics).waitAsync?.(words, bell, rung,
-                left === Infinity ? undefined : left);
-            if (waited?.async)
+            const rung = bell === index ? seen : Atomics.load(words, bell);
+            if (Atomics.load(words, index) === seen
+                && (closed < 0 || Atomics.load(words, closed) === 0))
             {
-                // Node lets a thread whose loop has only this wait end:
-                // something of the loop's own keeps it while it waits. A
-                // browser keeps its threads, and the wait costs no timer there.
-                const holding = NODE ? setInterval(()=>{}, 1 << 30) : null;
-                try
+                const waited = /** @type {any} */ (Atomics).waitAsync?.(words, bell, rung,
+                    left === Infinity ? undefined : left);
+                if (waited?.async)
                 {
-                    await waited.value;
-                }
-                finally
-                {
-                    if (holding !== null)
+                    // Node lets a thread whose loop has only this wait end:
+                    // something of the loop's own keeps it while it waits. A
+                    // browser keeps its threads, and the wait costs no timer there.
+                    const holding = NODE ? setInterval(()=>{}, 1 << 30) : null;
+                    try
                     {
-                        clearInterval(holding);
+                        await waited.value;
+                    }
+                    finally
+                    {
+                        if (holding !== null)
+                        {
+                            clearInterval(holding);
+                        }
                     }
                 }
-            }
-            else if (!waited)
-            {
-                // No waitAsync here: look again on a later turn of the loop.
-                await new Promise(resolve=>setTimeout(resolve, 1));
+                else if (!waited)
+                {
+                    // No waitAsync here: look again on a later turn of the loop.
+                    await new Promise(resolve=>setTimeout(resolve, 1));
+                }
             }
         }
-        Atomics.sub(words, sleeps, 1);
+        finally
+        {
+            Atomics.sub(words, sleeps, 1);
+        }
     }
     return slept ? 'woke' : 'moved';
 }
