@@ -21,6 +21,16 @@ export const UNIT = 4096;
 const log2 = n=>31 - Math.clz32(n);
 
 /**
+ * The bytes of the block a body of `length` bytes takes.
+ *
+ * @param {number} length
+ */
+export const blockOf = length=>{
+    const units = Math.ceil(length / UNIT);
+    return units <= 1 ? UNIT : UNIT << (log2(units - 1) + 1);
+};
+
+/**
  * @param {number} bytes  the segment's size, a power of two at least `UNIT`
  */
 export function createBuddy(bytes){

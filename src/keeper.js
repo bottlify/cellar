@@ -29,7 +29,7 @@
  * only once the disk holds it.
  */
 
-import { createBuddy } from './buddy.js';
+import { blockOf, createBuddy } from './buddy.js';
 import {
     COLD, F_DROP, F_ONLY_COPY, F_ON_DISK, GONE, HEADER_WORDS, HOT, H_COUNT, H_NAMES, H_TICK,
     MOVING, RECORD_WORDS, RETIRED, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME, R_NAME_LENGTH,
@@ -111,15 +111,23 @@ export async function openKeeper(options){
     let nextPack = null;
     /** @type {DiskFile | null} */
     let readyPack = null;
+    /** Closed: no file is opened any more. */
+    let closed = false;
 
     const counts = {
         reserved: 0, refusedBusy: 0, refusedRoom: 0, refusedLarge: 0, refusedUnseen: 0,
         replaced: 0, raised: 0, raiseFailed: 0, cooled: 0, written: 0, writtenBytes: 0, gone: 0,
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
-        diskFailures: 0,
+        diskFailures: 0, lostOnDisk: 0, abandoned: 0,
     };
 
-    const tick = ()=>Math.max(0, Math.floor(now() - started));
+    /**
+     * The clock in ms since the keeper opened, as a 32-bit word: it wraps
+     * after 24.8 days, so times are compared by `age`, never by size.
+     */
+    const tick = ()=>Math.max(0, Math.floor(now() - started)) | 0;
+    /** @param {number} at @param {number} since  both of `tick` */
+    const age = (at, since)=>(at - since) | 0;
 
     // --- records ------------------------------------------------------------
 
@@ -156,6 +164,10 @@ export async function openKeeper(options){
             return known;
         }
         const from = words[H_NAMES];
+        if (from + name.length > MAX_NAME_UNITS)
+        {
+            return -1;
+        }
         growNames(from + name.length);
         for (let i = 0; i < name.length; i++)
         {
@@ -245,20 +257,24 @@ export async function openKeeper(options){
             const larger = sharedBuffer(table.length * 2 * 4);
             const into = new Int32Array(larger);
             const mask = into.length - 1;
-            for (let other = 0; other < words[H_COUNT]; other++)
+            // What the table leads to now, not every record: a retired one
+            // is no name's any more, and put back it would lead its name to
+            // a body written over since.
+            for (const entry of table)
             {
-                if (other === id)
+                if (entry === 0)
                 {
                     continue;
                 }
-                let slot = get(other, R_HASH_A) & mask;
+                let slot = get(entry - 1, R_HASH_A) & mask;
                 while (into[slot] !== 0)
                 {
                     slot = (slot + 1) & mask;
                 }
-                into[slot] = other + 1;
+                into[slot] = entry;
             }
             index.adoptTable(larger);
+            shared.table = larger;
             table = into;
             announce({ table: larger });
         }
@@ -368,27 +384,33 @@ export async function openKeeper(options){
                 ids.push(id);
             }
         }
-        return ids.sort((a, b)=>get(a, R_TICK) - get(b, R_TICK));
+        const at = tick();
+        return ids.sort((a, b)=>age(at, get(b, R_TICK)) - age(at, get(a, R_TICK)));
     };
 
-    /** @param {number} id */
-    const giveBack = id=>{
-        const one = segments[get(id, R_SEGMENT)];
+    /** @param {number} segment @param {number} offset @param {number} length */
+    const giveRoom = (segment, offset, length)=>{
+        const one = segments[segment];
         if (one !== null)
         {
-            one.buddy.give(get(id, R_OFFSET), get(id, R_LENGTH));
+            one.buddy.give(offset, length);
             if (one.buddy.empty())
             {
                 one.emptySince = tick();
             }
         }
+    };
+
+    /** @param {number} id */
+    const giveBack = id=>{
+        giveRoom(get(id, R_SEGMENT), get(id, R_OFFSET), get(id, R_LENGTH));
         set(id, R_SEGMENT, -1);
     };
 
     // --- disk ---------------------------------------------------------------
 
     const openNextPack = ()=>{
-        if (disk !== null && nextPack === null && readyPack === null)
+        if (disk !== null && !closed && nextPack === null && readyPack === null)
         {
             nextPack = Promise.resolve(disk.open(`pack-${packs.length}`))
                 .then(file=>{
@@ -589,15 +611,40 @@ export async function openKeeper(options){
         }
     };
 
-    /** @param {number} id */
-    const nameOf = id=>String.fromCharCode(...index.names.subarray(get(id, R_NAME),
-        get(id, R_NAME) + get(id, R_NAME_LENGTH)));
+    /**
+     * @param {number} id
+     */
+    const nameOf = id=>{
+        const from = get(id, R_NAME);
+        const units = index.names.subarray(from, from + get(id, R_NAME_LENGTH));
+        // In pieces: a name passed whole as arguments can be longer than a
+        // call may take.
+        let name = '';
+        for (let at = 0; at < units.length; at += 8192)
+        {
+            name += String.fromCharCode(...units.subarray(at, at + 8192));
+        }
+        return name;
+    };
+
+    /** Flushes a file the keeper wrote: false where the disk failed, counted. @param {DiskFile} file */
+    const flushed = file=>{
+        try
+        {
+            file.flush();
+            return true;
+        }
+        catch {
+            counts.diskFailures++;
+            return false;
+        }
+    };
 
     await load();
     keepSpare();
     openNextPack();
 
-    return {
+    const keeper = {
         shared,
         /** Segments by index, for a thread joining later. */
         segmentBuffers: ()=>segments.map(one=>(one === null ? null : one.buffer)),
@@ -611,39 +658,69 @@ export async function openKeeper(options){
          * @param {{ onlyCopy?: boolean, known?: number }} [options]
          */
         reserve(name, length, { onlyCopy = false, known = Infinity } = {}){
-            if (length > segmentBytes)
+            // No block holds an empty body or one past a segment: refused
+            // before anything is moved for it.
+            if (!(length > 0) || length > segmentBytes)
             {
                 counts.refusedLarge++;
                 return null;
             }
             let id = recordOf(name);
-            const state = id < 0 ? GONE : stateOf(stateWordOf(id));
-            // A body no one is in is written over in place; one being read or
-            // written is left to those inside, the name led to a new record.
-            if (state === HOT && Atomics.compareExchange(words, index.at(id) + R_STATE,
-                stateWord(HOT), stateWord(MOVING)) === stateWord(HOT))
-            {
-                giveBack(id);
-            }
-            else if (state === HOT || state === WRITING)
-            {
-                id = replaceRecord(id);
-            }
             if (id < 0)
             {
                 counts.refusedRoom++;
                 return null;
             }
-            forgetDisk(id);
-            set(id, R_FLAGS, onlyCopy ? F_ONLY_COPY : 0);
-            store(id, MOVING);
-            const found = room(length, known);
+            const state = stateOf(stateWordOf(id));
+            // A reservation let go of without a body keeps its room until here.
+            if (state === GONE && get(id, R_SEGMENT) >= 0)
+            {
+                giveBack(id);
+            }
+            // A hot body no one is in is held while room is found, so that a
+            // reservation refused leaves the name's body as it was.
+            const held = state === HOT && Atomics.compareExchange(words, index.at(id) + R_STATE,
+                stateWord(HOT), stateWord(MOVING)) === stateWord(HOT);
+            let found = room(length, known);
+            if (found === null && held && get(id, R_SEGMENT) < known
+                && blockOf(length) <= blockOf(get(id, R_LENGTH)))
+            {
+                // Its own block holds the new body: written over in place.
+                giveBack(id);
+                found = placeIn(length, known);
+            }
             if (found === null)
             {
-                store(id, GONE);
+                if (held)
+                {
+                    store(id, HOT);
+                }
                 counts[segments.length > known ? 'refusedUnseen' : 'refusedRoom']++;
                 return null;
             }
+            if (held)
+            {
+                if (get(id, R_SEGMENT) >= 0)
+                {
+                    giveBack(id);
+                }
+            }
+            else if (state === HOT || state === WRITING)
+            {
+                // A body being read or written is left to those inside, the
+                // name led to a new record.
+                const fresh = replaceRecord(id);
+                if (fresh < 0)
+                {
+                    giveRoom(found.segment, found.offset, length);
+                    counts.refusedRoom++;
+                    return null;
+                }
+                id = fresh;
+            }
+            forgetDisk(id);
+            set(id, R_FLAGS, onlyCopy ? F_ONLY_COPY : 0);
+            store(id, MOVING);
             set(id, R_SEGMENT, found.segment);
             set(id, R_OFFSET, found.offset);
             set(id, R_LENGTH, length);
@@ -656,12 +733,12 @@ export async function openKeeper(options){
         },
 
         /**
-         * Brings `name`'s cold body back into a segment: true where it is hot
-         * now.
+         * Brings `name`'s cold body back into a segment below `known` (the
+         * segments the asker has): true where it is hot there now.
          *
-         * @param {string} name
+         * @param {string} name @param {{ known?: number }} [options]
          */
-        raise(name){
+        raise(name, { known = Infinity } = {}){
             const id = index.find(name);
             if (id < 0)
             {
@@ -670,27 +747,46 @@ export async function openKeeper(options){
             const state = stateOf(stateWordOf(id));
             if (state !== COLD)
             {
-                return state === HOT;
+                return state === HOT && get(id, R_SEGMENT) < known;
+            }
+            const length = get(id, R_LENGTH);
+            // Saved by a run of larger segments: no segment of this one holds it.
+            if (length > segmentBytes)
+            {
+                counts.raiseFailed++;
+                return false;
             }
             store(id, MOVING);
-            const length = get(id, R_LENGTH);
-            const found = room(length, Infinity);
+            const found = room(length, known);
             if (found === null)
             {
+                store(id, COLD);
+                counts[segments.length > known ? 'refusedUnseen' : 'raiseFailed']++;
+                return false;
+            }
+            const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[found.segment]);
+            let read = 0;
+            try
+            {
+                read = packs[get(id, R_PACK)].read(one.bytes.subarray(found.offset,
+                    found.offset + length), { at: get(id, R_PACK_OFFSET) });
+            }
+            catch {
+                giveRoom(found.segment, found.offset, length);
+                counts.diskFailures++;
                 store(id, COLD);
                 counts.raiseFailed++;
                 return false;
             }
-            const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[found.segment]);
-            try
+            if (read !== length)
             {
-                packs[get(id, R_PACK)].read(one.bytes.subarray(found.offset, found.offset + length),
-                    { at: get(id, R_PACK_OFFSET) });
-            }
-            catch {
-                one.buddy.give(found.offset, length);
-                counts.diskFailures++;
-                store(id, COLD);
+                // The pack holds less than the index says (cut, or removed in
+                // the origin): the body is not on the disk any more.
+                giveRoom(found.segment, found.offset, length);
+                forgetDisk(id);
+                set(id, R_FLAGS, 0);
+                store(id, GONE);
+                counts.lostOnDisk++;
                 counts.raiseFailed++;
                 return false;
             }
@@ -721,11 +817,6 @@ export async function openKeeper(options){
             {
                 const word = stateWordOf(id);
                 const state = stateOf(word);
-                if ((get(id, R_FLAGS) & F_DROP) !== 0 && readersOf(word) === 0)
-                {
-                    drop(id);
-                    continue;
-                }
                 if (state === RETIRED && readersOf(word) === 0
                     && Atomics.compareExchange(words, index.at(id) + R_STATE, word,
                         stateWord(MOVING)) === word)
@@ -738,12 +829,27 @@ export async function openKeeper(options){
                     store(id, GONE);
                     continue;
                 }
-                if (state === HOT && readersOf(word) === 0 && at - get(id, R_TICK) >= coldAfterMs)
+                if (state === GONE && get(id, R_SEGMENT) >= 0)
+                {
+                    // A reservation let go of without a body.
+                    giveBack(id);
+                    continue;
+                }
+                if (state !== HOT && state !== COLD)
+                {
+                    continue;
+                }
+                if (state === HOT && readersOf(word) === 0 && (get(id, R_FLAGS) & F_DROP) !== 0)
+                {
+                    drop(id);
+                }
+                else if (state === HOT && readersOf(word) === 0
+                    && age(at, get(id, R_TICK)) >= coldAfterMs)
                 {
                     cool(id);
                 }
                 else if (state === COLD && (get(id, R_FLAGS) & F_ONLY_COPY) === 0
-                    && at - get(id, R_TICK) >= goneAfterMs)
+                    && age(at, get(id, R_TICK)) >= goneAfterMs)
                 {
                     drop(id);
                 }
@@ -761,7 +867,7 @@ export async function openKeeper(options){
                     spare = true;
                     continue;
                 }
-                if (at - one.emptySince >= releaseAfterMs)
+                if (age(at, one.emptySince) >= releaseAfterMs)
                 {
                     segments[s] = null;
                     counts.segmentsLetGo++;
@@ -771,7 +877,7 @@ export async function openKeeper(options){
             }
             for (const file of packs)
             {
-                file.flush();
+                flushed(file);
             }
         },
 
@@ -804,30 +910,54 @@ export async function openKeeper(options){
             }
             for (const file of packs)
             {
-                file.flush();
+                // An index naming bodies the disk may not hold is not written.
+                if (!flushed(file))
+                {
+                    return false;
+                }
             }
             generation++;
             const bytes = new TextEncoder().encode(JSON.stringify({
                 version: INDEX_VERSION, generation, packs: packs.length, records,
             }));
+            // The other file keeps the last index whole while this one is written.
             const file = indexFiles[generation % indexFiles.length];
-            file.truncate(0);
-            file.write(bytes, { at: 0 });
-            file.flush();
+            try
+            {
+                file.truncate(0);
+                file.write(bytes, { at: 0 });
+                file.flush();
+            }
+            catch {
+                counts.diskFailures++;
+                return false;
+            }
             counts.saved++;
             return whole;
         },
 
-        /** Saves, then lets go of every file. */
+        /**
+         * Saves, then lets go of every file, the pack still opening too:
+         * true where the save was whole.
+         */
         close(){
-            this.save();
+            const whole = keeper.save();
+            closed = true;
             for (const file of [...packs, ...indexFiles, ...readyPack ? [readyPack] : []])
             {
-                file.close();
+                try
+                {
+                    file.close();
+                }
+                catch {
+                    counts.diskFailures++;
+                }
             }
+            nextPack?.then(file=>file.close(), ()=>{});
             packs.length = 0;
             indexFiles.length = 0;
             readyPack = null;
+            return whole;
         },
 
         /** Hot bytes, segments, cold bytes and what was done, for the report. */
@@ -862,6 +992,7 @@ export async function openKeeper(options){
             };
         },
     };
+    return keeper;
 }
 
 /** @typedef {Awaited<ReturnType<typeof openKeeper>>} Keeper */

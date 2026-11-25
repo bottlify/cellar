@@ -13,6 +13,11 @@
  * its length, and every byte after them follows from those. A body read that
  * names another name, or whose bytes change between the two passes, is one
  * the keeper gave away while this thread was inside it.
+ *
+ * Each thread also owns names of its own (`o<thread>-<i>`), which only it
+ * writes, each write one version up; every thread reads them. A version read
+ * below one this thread read or wrote before is a stale record the index led
+ * to: a body written over since.
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
@@ -20,13 +25,13 @@ import { caller } from './channel.fixture.js';
 import { createReader } from './reader.js';
 import { hashName } from './shared.js';
 
-const { channel, shared, segments, seed, operations, pool } = workerData;
+const { channel, shared, segments, seed, operations, pool, thread, threads, owned } = workerData;
 const keeper = caller(channel);
 const reader = createReader({
     shared, segments,
     keeper: {
         reserve: (name, length, options)=>keeper.call('reserve', name, length, options),
-        raise: name=>keeper.call('raise', name),
+        raise: (name, options)=>keeper.call('raise', name, options),
         raiseLater: name=>{
             keeper.call('raise', name);
         },
@@ -94,9 +99,39 @@ const check = (name, body)=>{
     return null;
 };
 
-const counts = { reads: 0, hits: 0, writes: 0, written: 0, drops: 0 };
+const counts = { reads: 0, hits: 0, writes: 0, written: 0, drops: 0, ownHits: 0 };
 /** @type {string[]} */
 const failures = [];
+/** The highest version this thread read or wrote of each owned name. @type {Map<string, number>} */
+const highest = new Map();
+/** The version this thread wrote last of each name of its own. @type {Map<string, number>} */
+const versions = new Map();
+
+/**
+ * Writes `name`'s body of `version` into room reserved for it: true where
+ * there was room.
+ *
+ * @param {string} name @param {number} version @param {number} length
+ */
+const write = (name, version, length)=>{
+    const into = reader.reserve(name, length);
+    if (into === null)
+    {
+        return false;
+    }
+    const [a, b] = hashName(name);
+    const view = new DataView(into.buffer, into.byteOffset, into.byteLength);
+    view.setInt32(0, a, true);
+    view.setInt32(4, b, true);
+    view.setUint32(8, version, true);
+    view.setUint32(12, length, true);
+    for (let i = 16; i < length; i++)
+    {
+        into[i] = byteAt(a, version, i);
+    }
+    reader.commit(name);
+    return true;
+};
 for (let op = 0; op < operations; op++)
 {
     if (op % 64 === 0)
@@ -104,8 +139,43 @@ for (let op = 0; op < operations; op++)
         // Between turns the keeper's messages arrive: segments made and let go.
         await new Promise(resolve=>setImmediate(resolve));
     }
-    const name = `n${next() % pool}`;
     const roll = next() % 100;
+    if ((next() & 1) === 0)
+    {
+        const writer = roll < 40 ? thread : next() % threads;
+        const name = `o${writer}-${next() % owned}`;
+        if (writer === thread && roll < 25)
+        {
+            const version = (versions.get(name) ?? 0) + 1;
+            if (write(name, version, 16 + (next() % 4096)))
+            {
+                versions.set(name, version);
+                highest.set(name, Math.max(highest.get(name) ?? 0, version));
+            }
+            continue;
+        }
+        let version = 0;
+        const failure = reader.with(name, body=>{
+            version = new DataView(body.buffer, body.byteOffset).getUint32(8, true);
+            return check(name, body);
+        }, { wait: (next() & 1) === 0 });
+        if (failure === undefined)
+        {
+            continue;
+        }
+        counts.ownHits++;
+        if (failure !== null)
+        {
+            failures.push(failure);
+        }
+        else if (version < (highest.get(name) ?? 0))
+        {
+            failures.push(`${name}: version ${version} read after ${highest.get(name)}`);
+        }
+        highest.set(name, Math.max(highest.get(name) ?? 0, version));
+        continue;
+    }
+    const name = `n${next() % pool}`;
     if (roll < 60)
     {
         counts.reads++;
@@ -122,22 +192,8 @@ for (let op = 0; op < operations; op++)
     else if (roll < 92)
     {
         counts.writes++;
-        const length = 16 + (next() % (12 * 1024));
-        const into = reader.reserve(name, length);
-        if (into !== null)
+        if (write(name, next(), 16 + (next() % (12 * 1024))))
         {
-            const [a, b] = hashName(name);
-            const version = next();
-            const view = new DataView(into.buffer, into.byteOffset, into.byteLength);
-            view.setInt32(0, a, true);
-            view.setInt32(4, b, true);
-            view.setUint32(8, version, true);
-            view.setUint32(12, length, true);
-            for (let i = 16; i < length; i++)
-            {
-                into[i] = byteAt(a, version, i);
-            }
-            reader.commit(name);
             counts.written++;
         }
     }

@@ -261,3 +261,240 @@ test('where memory cannot be shared the cache is one thread\'s, every part of it
         globalThis.SharedArrayBuffer = shared;
     }
 });
+
+test('a name written anew while read keeps leading to its new body after the table grows', async()=>{
+    const { reader, keeper, step, said } = await cacheOf({ budget: 8 * 1024 * KIB,
+        segmentBytes: 1024 * KIB });
+    reader.put('a', bodyOf(100, 1));
+    reader.with('a', ()=>{
+        reader.put('a', bodyOf(100, 2));
+    });
+    step(1);
+    // Past the first table's half: it is made larger from what it leads to.
+    for (let i = 0; i < 600; i++)
+    {
+        reader.put(`n${i}`, bodyOf(16, i));
+    }
+    // A reader that remembers no record, over the larger table as it was sent.
+    const table = said.filter(message=>message.table !== undefined).at(-1).table;
+    const late = createReader({ shared: { ...keeper.shared, table }, segments: keeper.segmentBuffers(),
+        keeper: /** @type {any} */ ({}) });
+    assert.equal(late.with('a', body=>body[1]), (31 + 2) & 255, 'the body committed last');
+    reader.with('a', ()=>{
+        reader.put('a', bodyOf(100, 3));
+    });
+    step(1);
+    assert.equal(keeper.figures().hotBytes, 100 + 600 * 16, 'one body a name');
+});
+
+test('a thread joining after the table grew is handed the larger table', async()=>{
+    const { reader, keeper } = await cacheOf({ budget: 8 * 1024 * KIB, segmentBytes: 1024 * KIB });
+    for (let i = 0; i < 2000; i++)
+    {
+        reader.put(`n${i}`, bodyOf(16, i));
+    }
+    const late = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers(),
+        keeper: /** @type {any} */ ({}) });
+    for (let i = 0; i < 2000; i++)
+    {
+        assert.equal(late.look(`n${i}`), 'hot', `n${i}`);
+    }
+});
+
+test('a reserve refused leaves the name\'s body as it was, hot or on the disk', async()=>{
+    const disk = memoryDisk();
+    const { reader, keeper } = await cacheOf({ disk });
+    reader.put('doc', bodyOf(5000, 7), { onlyCopy: true });
+    // Refused: no segment the writer has, and a body no block holds.
+    assert.equal(keeper.reserve('doc', 5000, { onlyCopy: true, known: 0 }), null);
+    assert.equal(reader.put('doc', new Uint8Array(0), { onlyCopy: true }), false);
+    assert.deepEqual(reader.with('doc', body=>[...body]), [...bodyOf(5000, 7)]);
+    keeper.close();
+    const next = await cacheOf({ disk });
+    assert.deepEqual(next.reader.with('doc', body=>[...body], { wait: true }), [...bodyOf(5000, 7)]);
+});
+
+test('a body rewritten into a full cache takes its own block, written over in place', async()=>{
+    const { reader } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
+    for (let i = 0; i < 16; i++)
+    {
+        assert.equal(reader.put(`n${i}`, bodyOf(UNIT, i), { onlyCopy: true }), true);
+    }
+    assert.equal(reader.put('n3', bodyOf(UNIT - 100, 40), { onlyCopy: true }), true);
+    assert.deepEqual(reader.with('n3', body=>[...body]), [...bodyOf(UNIT - 100, 40)]);
+    assert.equal(reader.put('n4', bodyOf(2 * UNIT, 41), { onlyCopy: true }), false, 'no block holds it');
+    assert.deepEqual(reader.with('n4', body=>[...body]), [...bodyOf(UNIT, 4)], 'kept');
+});
+
+test('a drop asked while read, then the name written anew while still read, gives the old room back',
+    async()=>{
+        const { reader, keeper, step } = await cacheOf();
+        reader.put('a', bodyOf(20000, 1));
+        reader.with('a', ()=>{
+            keeper.drop('a');
+            reader.put('a', bodyOf(100, 2));
+        });
+        step(1);
+        const figures = keeper.figures();
+        assert.equal(figures.placedBytes, UNIT);
+        assert.equal(figures.hotBytes, 100);
+        assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(100, 2)], 'the write after the drop');
+    });
+
+test('a reservation let go of, or reserved again before its commit, gives its room back', async()=>{
+    const { reader, keeper, step } = await cacheOf();
+    reader.put('a', bodyOf(100, 1));
+    const into = reader.reserve('a', 9000);
+    assert.ok(into);
+    reader.abandon('a');
+    assert.throws(()=>reader.commit('a'), /not reserved/);
+    assert.equal(reader.look('a'), null, 'no body: the reserve took the one before');
+    assert.ok(reader.reserve('b', 9000));
+    assert.ok(reader.reserve('b', 5000));
+    reader.commit('b');
+    step(1);
+    const figures = keeper.figures();
+    assert.equal(figures.placedBytes, 2 * UNIT, 'the second b alone');
+    assert.equal(reader.figures().abandoned, 2);
+});
+
+test('a cold body is raised only into a segment the asking thread has', async()=>{
+    const { keeper, reader, step } = await cacheOf({ disk: memoryDisk() });
+    reader.put('a', bodyOf(60 * KIB, 1));
+    step(100);
+    assert.equal(reader.look('a'), 'cold');
+    // A thread that knows the first segment only, which a body fills now.
+    const late = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers().slice(0, 1),
+        keeper: {
+            reserve: (name, length, options)=>keeper.reserve(name, length, options),
+            raise: (name, options)=>keeper.raise(name, options),
+            raiseLater: ()=>{}, drop: ()=>{},
+        } });
+    assert.equal(late.put('b', bodyOf(60 * KIB, 2)), true);
+    assert.equal(late.with('a', body=>body[1], { wait: true }), (31 + 1) & 255);
+});
+
+test('a body the disk holds less of than the index says is gone, not answered with other bytes',
+    async()=>{
+        const disk = memoryDisk();
+        const first = await cacheOf({ disk });
+        first.reader.put('doc', bodyOf(8000, 5), { onlyCopy: true });
+        first.keeper.close();
+        disk.files.delete('pack-0');
+        const second = await cacheOf({ disk });
+        second.reader.put('other', bodyOf(8000, 99));
+        second.keeper.drop('other');
+        assert.equal(second.reader.with('doc', body=>body.slice(), { wait: true }), undefined);
+        assert.equal(second.reader.look('doc'), null);
+        assert.equal(second.keeper.figures().lostOnDisk, 1);
+    });
+
+test('a body saved by a run of larger segments is not raised, and moves nothing', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk, budget: 512 * KIB, segmentBytes: 128 * KIB });
+    first.reader.put('big', bodyOf(100 * KIB, 1));
+    first.keeper.close();
+    const second = await cacheOf({ disk });
+    for (let i = 0; i < 4; i++)
+    {
+        second.reader.put(`n${i}`, bodyOf(32 * KIB, i));
+    }
+    assert.equal(second.reader.with('big', ()=>1, { wait: true }), undefined);
+    assert.equal(second.keeper.figures().cooled, 0);
+});
+
+test('a name past what the names hold is refused, not written where it cannot be found', async()=>{
+    const { reader, keeper } = await cacheOf({ budget: 1024 * KIB, segmentBytes: 1024 * KIB });
+    const long = 'x'.repeat(1 << 20);
+    let n = 0;
+    while (reader.put(`${n}${long}`, bodyOf(16, n)))
+    {
+        assert.equal(reader.with(`${n}${long}`, body=>body[1]), (31 + n) & 255);
+        n++;
+    }
+    assert.equal(n, 31, 'names of 2^20 units in 2^25');
+    const records = keeper.figures().records;
+    assert.equal(reader.put(`${n}${long}`, bodyOf(16, n)), false);
+    assert.equal(keeper.figures().records, records, 'no record for a name not held');
+    assert.equal(reader.put('short', bodyOf(16, 1)), true, 'a name that fits still does');
+});
+
+test('a name longer than a call takes as arguments is saved and found by the next run', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    const long = 'n'.repeat(300_000);
+    first.reader.put(long, bodyOf(100, 1), { onlyCopy: true });
+    first.keeper.close();
+    const second = await cacheOf({ disk });
+    assert.equal(second.reader.with(long, body=>body[1], { wait: true }), (31 + 1) & 255);
+});
+
+test('past 24.8 days of the clock, idle is still told by how long', async()=>{
+    const { reader, step } = await cacheOf({ disk: memoryDisk(), coldAfterMs: 30_000 });
+    step(2 ** 31 + 1000);
+    reader.put('a', bodyOf(100, 1));
+    step(10);
+    assert.equal(reader.look('a'), 'hot', 'used 10 ms ago, across the wrap');
+    step(30_000);
+    assert.equal(reader.look('a'), 'cold');
+});
+
+test('a disk that fails to flush fails the save, and close still lets go of every file', async()=>{
+    const base = memoryDisk();
+    let failing = false;
+    /** @type {Set<string>} */
+    const open = new Set();
+    const disk = {
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            open.add(name);
+            return { ...file,
+                flush(){
+                    if (failing && name.startsWith('pack'))
+                    {
+                        throw new Error('flush failed');
+                    }
+                },
+                close(){
+                    open.delete(name);
+                } };
+        },
+    };
+    const { reader, keeper, step } = await cacheOf({ disk });
+    reader.put('a', bodyOf(100, 1));
+    assert.equal(keeper.save(), true);
+    failing = true;
+    step(1);
+    assert.equal(keeper.save(), false);
+    assert.equal(keeper.close(), false);
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.deepEqual([...open], []);
+    assert.ok(keeper.figures().diskFailures > 0);
+});
+
+test('close lets go of the pack still opening', async()=>{
+    const base = memoryDisk();
+    /** @type {Set<string>} */
+    const open = new Set();
+    /** @type {(() => void)[]} */
+    const later = [];
+    const disk = {
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            if (name === 'pack-0')
+            {
+                await new Promise(resolve=>later.push(()=>resolve(undefined)));
+            }
+            open.add(name);
+            return { ...file,
+                close(){
+                    open.delete(name);
+                } };
+        },
+    };
+    const keeper = await openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk });
+    keeper.close();
+    later.forEach(go=>go());
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.deepEqual([...open], []);
+});

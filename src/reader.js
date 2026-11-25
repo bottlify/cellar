@@ -19,7 +19,7 @@
  */
 
 import {
-    COLD, HOT, R_LENGTH, R_OFFSET, R_SEGMENT, R_STATE, WRITING, stateWord, viewIndex,
+    COLD, GONE, HOT, R_LENGTH, R_OFFSET, R_SEGMENT, R_STATE, WRITING, stateWord, viewIndex,
 } from './shared.js';
 
 /**
@@ -29,7 +29,8 @@ import {
  * @typedef {Object} KeeperCalls
  * @property {(name: string, length: number, options: { onlyCopy: boolean, known: number })
  *     => { id: number, segment: number, offset: number } | null} reserve
- * @property {(name: string) => boolean} raise
+ * @property {(name: string, options: { known: number }) => boolean} raise
+ *     `known`: the segments this reader has; a body placed past them could not be read here
  * @property {(name: string) => void} raiseLater
  * @property {(name: string) => void} drop
  */
@@ -60,6 +61,7 @@ export function createReader({ shared, segments = [], keeper }){
     const writing = new Map();
     const counts = {
         hits: 0, misses: 0, cold: 0, unseen: 0, raisedWaiting: 0, reserved: 0, refused: 0,
+        abandoned: 0,
     };
 
     /**
@@ -130,7 +132,7 @@ export function createReader({ shared, segments = [], keeper }){
         }
     };
 
-    return {
+    const self = {
         /**
          * A message from the keeper: a segment made or let go, a larger table.
          *
@@ -186,7 +188,7 @@ export function createReader({ shared, segments = [], keeper }){
                 return undefined;
             }
             let got = readHot(id, read);
-            if (got === NOT_HERE_COLD && wait && keeper.raise(name))
+            if (got === NOT_HERE_COLD && wait && keeper.raise(name, { known: views.length }))
             {
                 counts.raisedWaiting++;
                 got = readHot(id, read);
@@ -221,14 +223,21 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name @param {number} length @param {{ onlyCopy?: boolean }} [options]
          */
         reserve(name, length, { onlyCopy = false } = {}){
+            // A second reserve of a name not committed yet replaces the first.
+            self.abandon(name);
             const place = keeper.reserve(name, length, { onlyCopy, known: views.length });
             const view = place === null ? null : views[place.segment];
+            if (place !== null)
+            {
+                writing.set(name, place.id);
+            }
             if (place === null || view === null || view === undefined)
             {
+                // Placed where this reader cannot write: given back.
+                self.abandon(name);
                 counts.refused++;
                 return null;
             }
-            writing.set(name, place.id);
             counts.reserved++;
             return view.subarray(place.offset, place.offset + length);
         },
@@ -256,18 +265,43 @@ export function createReader({ shared, segments = [], keeper }){
         },
 
         /**
+         * Lets go of a reservation without a body (a writer that failed):
+         * the name is left with none, as `reserve` took its body before away,
+         * and the room goes back to the keeper at its next sweep. Nothing
+         * where `name` is not reserved here.
+         *
+         * @param {string} name
+         */
+        abandon(name){
+            const id = writing.get(name);
+            if (id === undefined)
+            {
+                return;
+            }
+            writing.delete(name);
+            counts.abandoned++;
+            // No body, the writer out; or only the writer out of a record
+            // retired under it.
+            if (Atomics.compareExchange(index.words, index.at(id) + R_STATE,
+                stateWord(WRITING, 1), stateWord(GONE)) !== stateWord(WRITING, 1))
+            {
+                index.leave(id);
+            }
+        },
+
+        /**
          * `reserve`, a copy of `bytes`, `commit`: false where there was no room.
          *
          * @param {string} name @param {Uint8Array} bytes @param {{ onlyCopy?: boolean }} [options]
          */
         put(name, bytes, options){
-            const into = this.reserve(name, bytes.length, options);
+            const into = self.reserve(name, bytes.length, options);
             if (into === null)
             {
                 return false;
             }
             into.set(bytes);
-            this.commit(name);
+            self.commit(name);
             return true;
         },
 
@@ -278,6 +312,7 @@ export function createReader({ shared, segments = [], keeper }){
 
         figures: ()=>({ ...counts }),
     };
+    return self;
 }
 
 /** @typedef {ReturnType<typeof createReader>} Reader */
