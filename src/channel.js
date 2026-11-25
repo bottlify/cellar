@@ -35,6 +35,9 @@
  * between that look and the wait is either seen by the look or rung for.
  */
 
+import { SPIN_MS, deadlineOf, publish as publishWord, waitFor as waitWord,
+    waitForAsync as waitWordAsync } from './bell.js';
+
 /** The header, in 32-bit words. */
 const HEADER_WORDS = 16;
 /** Requests written. */
@@ -54,10 +57,6 @@ const CLOSED = 6;
 const SLOTS = 7;
 const SLOT_BYTES = 8;
 
-/** How long a side looks before it sleeps, in ms: an answer often comes sooner. */
-const SPIN_MS = 0.05;
-/** Looks between two readings of the clock while it spins, less one (a mask). */
-const SPIN_LOOKS = 255;
 
 /**
  * @typedef {Object} ChannelOptions
@@ -109,7 +108,6 @@ function endOver(memory, { spinMs = SPIN_MS }){
     const stride = slotStride(slotBytes);
     const requests = HEADER_WORDS * 4;
     const answers = requests + slots * stride;
-    const clock = globalThis.performance ?? Date;
 
     /**
      * The `n`th slot of a side, its bytes as written, read in place.
@@ -157,15 +155,8 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} value @param {number} sleeps
      */
     const publish = (counter, value, sleeps)=>{
-        Atomics.store(words, counter, value | 0);
-        if (Atomics.load(words, sleeps) !== 0)
-        {
-            Atomics.notify(words, counter);
-        }
+        publishWord(words, counter, value, sleeps);
     };
-
-    /** @param {number} counter @param {number} seen */
-    const moved = (counter, seen)=>Atomics.load(words, counter) !== (seen | 0);
 
     /**
      * Blocks until `counter` is no longer `seen`, the channel closes or the
@@ -174,48 +165,12 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} seen @param {number} sleeps @param {number} deadline
      */
     const waitFor = (counter, seen, sleeps, deadline)=>{
-        // The clock is asked once in a while, and not at all before the first
-        // few hundred looks: each answer of it is a number made on the heap,
-        // and an answer often comes sooner.
-        let spinUntil = -1;
-        for (let looks = 1; !moved(counter, seen); looks++)
+        const end = waitWord(words, counter, seen, { sleeps, deadline, spinMs, closed: CLOSED });
+        if (end === 'closed')
         {
-            if ((looks & SPIN_LOOKS) === 0)
-            {
-                if (Atomics.load(words, CLOSED) !== 0)
-                {
-                    throw new ChannelClosed();
-                }
-                const now = clock.now();
-                if (spinUntil < 0)
-                {
-                    spinUntil = Math.min(deadline, now + spinMs);
-                }
-                else if (now >= spinUntil)
-                {
-                    break;
-                }
-            }
+            throw new ChannelClosed();
         }
-        while (!moved(counter, seen))
-        {
-            const left = deadline - clock.now();
-            if (left <= 0)
-            {
-                return false;
-            }
-            Atomics.add(words, sleeps, 1);
-            if (!moved(counter, seen) && Atomics.load(words, CLOSED) === 0)
-            {
-                Atomics.wait(words, counter, seen | 0, left === Infinity ? undefined : left);
-            }
-            Atomics.sub(words, sleeps, 1);
-            if (Atomics.load(words, CLOSED) !== 0 && !moved(counter, seen))
-            {
-                throw new ChannelClosed();
-            }
-        }
-        return true;
+        return end !== 'timed-out';
     };
 
     /**
@@ -226,45 +181,12 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @returns {Promise<boolean>}
      */
     const waitForAsync = async(counter, seen, sleeps, deadline)=>{
-        while (!moved(counter, seen))
+        const end = await waitWordAsync(words, counter, seen, { sleeps, deadline, closed: CLOSED });
+        if (end === 'closed')
         {
-            if (Atomics.load(words, CLOSED) !== 0)
-            {
-                throw new ChannelClosed();
-            }
-            const left = deadline - clock.now();
-            if (left <= 0)
-            {
-                return false;
-            }
-            Atomics.add(words, sleeps, 1);
-            if (!moved(counter, seen) && Atomics.load(words, CLOSED) === 0)
-            {
-                const waited = /** @type {any} */ (Atomics).waitAsync?.(words, counter,
-                    seen | 0, left === Infinity ? undefined : left);
-                if (waited?.async)
-                {
-                    // Node lets a thread whose loop has only this wait end:
-                    // something of the loop's own keeps it while it waits.
-                    const holding = setInterval(()=>{}, 1 << 30);
-                    try
-                    {
-                        await waited.value;
-                    }
-                    finally
-                    {
-                        clearInterval(holding);
-                    }
-                }
-                else if (!waited)
-                {
-                    // No waitAsync here: look again on the next turn of the loop.
-                    await new Promise(resolve=>setTimeout(resolve, 1));
-                }
-            }
-            Atomics.sub(words, sleeps, 1);
+            throw new ChannelClosed();
         }
-        return true;
+        return end !== 'timed-out';
     };
 
     return {
@@ -280,14 +202,6 @@ function endOver(memory, { spinMs = SPIN_MS }){
         closed: ()=>Atomics.load(words, CLOSED) !== 0,
     };
 }
-
-/**
- * The deadline of a wait of `timeoutMs`.
- *
- * @param {number | undefined} timeoutMs
- */
-const deadlineOf = timeoutMs=>(timeoutMs === undefined || timeoutMs === Infinity
-    ? Infinity : (globalThis.performance ?? Date).now() + timeoutMs);
 
 /**
  * @template T

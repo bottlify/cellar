@@ -6,7 +6,7 @@ bodies to the disk (the Origin Private File System) and brings them back when as
 [Bottlify](https://github.com/bottlify/bottlify), whose processes share one cache across their
 workers; nothing in it is Bottlify's.
 
-Status: the cache and its concurrency gate, the channel and its gate; not yet on npm. Every version is built into a
+Status: the cache and its concurrency gate, the channel, the ring and the bell under both, with their gates; not yet on npm. Every version is built into a
 [release](https://github.com/bottlify/cellar/releases): `cellar.js`, `cellar.min.js`, the
 declarations and their checksums.
 
@@ -90,6 +90,35 @@ process of its own (node 22, a 4-core x86 VM, 3 runs an arm, medians):
 | peak resident memory | 140 MiB | 77 MiB |
 
 `examples/call-a-worker.mjs` shows the same calls as a page would write them.
+
+## Ring and bell
+
+The channel is calls; a ring is records one way, of any length, read in place: one writer, one
+reader, a record that does not fit refused rather than overwritten. Both stand on the bell, the one
+way two threads wait on each other here: a wait looks at a shared word for a moment, then sleeps
+on it, counted beside it; whoever moves the word notifies only when a wait sleeps. A doorbell is a
+bell several rings share, so a thread reading several waits once for all of them.
+
+```js
+import { createRingMemory, openRing, createDoorbell, openDoorbell } from '@bottlify/cellar';
+
+const bell = createDoorbell();                       // one per reading thread
+const memory = createRingMemory(1 << 20, bell);      // hand it to both threads
+
+openRing(memory).write(bytes);                       // the writer: false when it does not fit
+
+const ring = openRing(memory);                       // the reader
+const doorbell = openDoorbell(bell);
+for (;;)
+{
+    const seen = doorbell.seen();                    // before the look: nothing written after it is missed
+    ring.drain(record=>take(record));                // each record a view, valid inside the call
+    doorbell.wait(seen);                             // blocks; waitAsync keeps the event loop
+}
+```
+
+`waitFor`, `waitForAsync`, `wake` and `publish` are the bell over any word of a shared
+`Int32Array`, for a protocol of its own.
 
 ## Requirements
 

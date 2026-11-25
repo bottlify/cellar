@@ -13,6 +13,9 @@
 export { openKeeper } from './keeper.js';
 export { createReader } from './reader.js';
 export { ChannelClosed, createChannel, openClient, openServer } from './channel.js';
+export { SPIN_MS, createDoorbell, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
+    waitForAsync } from './bell.js';
+export { createRingMemory, openRing } from './ring.js';
 
 /** @typedef {import('./keeper.js').Keeper} Keeper */
 /** @typedef {import('./keeper.js').KeeperOptions} KeeperOptions */
@@ -23,3 +26,9 @@ export { ChannelClosed, createChannel, openClient, openServer } from './channel.
 /** @typedef {import('./shared.js').SharedIndex} SharedIndex */
 /** @typedef {import('./channel.js').ChannelOptions} ChannelOptions */
 /** @typedef {import('./channel.js').Handler} ChannelHandler */
+/** @typedef {import('./bell.js').WaitEnd} WaitEnd */
+/** @typedef {import('./bell.js').WaitOptions} WaitOptions */
+/** @typedef {import('./bell.js').DoorbellMemory} DoorbellMemory */
+/** @typedef {import('./bell.js').Doorbell} Doorbell */
+/** @typedef {import('./ring.js').RingMemory} RingMemory */
+/** @typedef {import('./ring.js').Ring} Ring */
