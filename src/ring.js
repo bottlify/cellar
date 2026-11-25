@@ -29,10 +29,6 @@
  * them. It is rung after the record is published, and wakes the reader only
  * when the reader sleeps on it.
  *
- * The words each side writes lie a cache line apart (128 bytes, an Apple M
- * processor's): the writer's count and the reader's do not drag one line
- * back and forth between two cores at every record.
- *
  * Either side may close the ring, when it goes or knows the other went: a
  * writer waiting for room and a write after it end with `RingClosed`, and the
  * reader is rung to find it closed, after it has read what was written before.
@@ -40,17 +36,19 @@
 
 import { createDoorbell, deadlineOf, openDoorbell, waitFor, waitForAsync, wake } from './bell.js';
 
-/** Words of a cache line: 128 bytes. */
-const LINE = 32;
-/** The writer's line: bytes ever written, and its waits asleep on `ROOM`. */
+/**
+ * Words of the control block: bytes ever written and the writer's waits
+ * asleep on `ROOM`; bytes ever read and a count the reader moves when it frees
+ * room; not zero once either side closed the ring. On one cache line: the two
+ * sides' words on lines of their own streamed 20 M records of 8 bytes no
+ * faster (3.00 against 3.01 M a second, 8 runs each, x86).
+ */
 const WRITTEN = 0;
 const ROOM_SLEEPS = 1;
-/** The reader's line: bytes ever read, and a count it moves when it frees room. */
-const READ = LINE;
-const ROOM = LINE + 1;
-/** Not zero once either side closed the ring. */
-const CLOSED = 2 * LINE;
-const CONTROL_WORDS = 3 * LINE;
+const READ = 2;
+const ROOM = 3;
+const CLOSED = 4;
+const CONTROL_WORDS = 5;
 
 /** Why a write, or a wait for room, ended without writing. */
 export class RingClosed extends Error {
