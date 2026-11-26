@@ -72,6 +72,11 @@ const KNOWN_MOST = 1 << 16;
  * @typedef {{ id: number, nameAt: number }} Found
  */
 
+/** How a reservation ended (`finish`). */
+const LATE = 0;
+const ENDED = 1;
+const LEFT = 2;
+
 /**
  * @param {Object} options
  * @param {import('./shared.js').SharedIndex} options.shared
@@ -203,28 +208,29 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
-     * Ends the reservation `place` as `state` (HOT for a commit, GONE for an
-     * abandon): false where the keeper took it back, its writer too late. A
-     * reservation whose name was written anew meanwhile only lets its writer
-     * out: the newer write is the name's.
+     * Ends the reservation `place` with its state word `word` (a body
+     * published, entered once; or gone, for an abandon): `ENDED`, or `LEFT`
+     * where the name was written anew meanwhile and the newer write is the
+     * name's, the record retired and only its writer let out of it; `LATE`
+     * where the keeper took it back, its writer too late.
      *
-     * @param {Place} place @param {number} state
+     * @param {Place} place @param {number} word
      */
-    const finish = (place, state)=>{
+    const finish = (place, word)=>{
         const words = index.cover(place.id);
         const at = index.at(place.id) + R_STATE;
         const mine = stateWord(WRITING, place.mark);
-        if (Atomics.compareExchange(words, at, mine, stateWord(state)) === mine)
+        if (Atomics.compareExchange(words, at, mine, word) === mine)
         {
-            return true;
+            return ENDED;
         }
         const retired = stateWord(RETIRED_WRITING, place.mark);
         if (Atomics.compareExchange(words, at, retired, stateWord(RETIRED)) === retired)
         {
-            return true;
+            return LEFT;
         }
         counts.late++;
-        return false;
+        return LATE;
     };
 
     /**
@@ -247,18 +253,22 @@ export function createReader({ shared, segments = [], keeper }){
 
     /**
      * The body written at `place` made readable: false where it came too
-     * late, the reservation taken back. Stamped once published: a record
-     * taken back, and perhaps another name's now, is stamped by nothing here.
+     * late, the reservation taken back. Published entered, as a reader
+     * enters it, and stamped before it is left: a record no one is in can be
+     * taken back and given to the next reservation, whose age a stamp landing
+     * late would set to the last sweep's. A record retired meanwhile no name
+     * leads to: nothing stamps it.
      *
      * @param {Place} place @returns {boolean}
      */
     const publish = place=>{
-        const published = finish(place, HOT);
-        if (published)
+        const ended = finish(place, stateWord(HOT, 1));
+        if (ended === ENDED)
         {
             index.stamp(place.id);
+            index.leave(place.id);
         }
-        return published;
+        return ended !== LATE;
     };
 
     /**
@@ -284,7 +294,7 @@ export function createReader({ shared, segments = [], keeper }){
         {
             // Placed where this reader cannot write: given back.
             counts.abandoned++;
-            finish(place, GONE);
+            finish(place, stateWord(GONE));
             counts.refused++;
             return null;
         }
@@ -477,7 +487,7 @@ export function createReader({ shared, segments = [], keeper }){
             }
             writing.delete(name);
             counts.abandoned++;
-            finish(place, GONE);
+            finish(place, stateWord(GONE));
         },
 
         /**
@@ -505,7 +515,7 @@ export function createReader({ shared, segments = [], keeper }){
             }
             catch (e){
                 counts.abandoned++;
-                finish(place, GONE);
+                finish(place, stateWord(GONE));
                 throw e;
             }
             return publish(place);

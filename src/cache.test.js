@@ -15,7 +15,7 @@ import { UNIT } from './buddy.js';
 import { bodyOf, cacheOf } from './cache.fixture.js';
 import { crashDisk } from './disk.fixture.js';
 import { createReader } from './reader.js';
-import { HEADER_WORDS, HOT, H_NAMES, MOVING, RECORD_WORDS, R_STATE, stateWord, viewIndex } from './shared.js';
+import { HEADER_WORDS, HOT, H_NAMES, H_TICK, MOVING, RECORD_WORDS, R_STATE, stateWord, viewIndex } from './shared.js';
 
 const KIB = 1024;
 
@@ -419,6 +419,87 @@ test('a reservation made long after the last sweep counts its age from when it w
     assert.equal(later.keeper.figures().takenBack, 1, 'held its 10');
     assert.equal(later.reader.commit('c'), false);
     assert.equal(later.reader.look('c'), null);
+});
+
+/**
+ * Runs `act` with the keeper's work `between` done where a writer's commit
+ * loads the clock to stamp its body and before it stores the stamp: the
+ * interleaving of a writer descheduled there, made in one thread. `between`
+ * runs once, after `act` where the commit stamped nothing.
+ *
+ * @param {() => unknown} act @param {() => void} between
+ */
+const stampedAfter = (act, between)=>{
+    const load = Atomics.load;
+    let armed = true;
+    /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ index)=>{
+        const value = load(array, index);
+        if (armed && index === H_TICK)
+        {
+            armed = false;
+            between();
+        }
+        return value;
+    };
+    try
+    {
+        return act();
+    }
+    finally
+    {
+        Atomics.load = load;
+        if (armed)
+        {
+            between();
+        }
+    }
+};
+
+test('a commit\'s stamp lands on its own body, not on the reservation its record is given to next',
+    async()=>{
+    for (const retired of [false, true])
+    {
+        const label = retired ? 'replaced while written' : 'published';
+        const { keeper, reader, step, wait } = await cacheOf({ abandonAfterMs: 10, coldAfterMs: 1e6 });
+        // Another thread's reader of the same cache: the other writer.
+        const other = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers(),
+            keeper: { reserve: (name, length, opts)=>keeper.reserve(name, length, opts),
+                raise: name=>keeper.raise(name), raiseLater(){}, drop(){} } });
+        const into = reader.reserve('a', 16);
+        assert.ok(into, label);
+        into.set(bodyOf(16, 1));
+        if (retired)
+        {
+            // Another writer's body for the name: this one's record retired as it is written.
+            assert.equal(other.put('a', bodyOf(16, 2)), true, label);
+        }
+        // The keeper's last sweep long ago: the clock a stamp loads is 100 ms old.
+        wait(100);
+        /** @type {Uint8Array | null} */
+        let next = null;
+        // The next reservation: of the name again, which takes the record
+        // in place where no one reads its body; or, the record retired, of
+        // another name, which takes the record a sweep let go of.
+        const name = retired ? 'c' : 'a';
+        const committed = stampedAfter(()=>reader.commit('a'), ()=>{
+            if (retired)
+            {
+                step(0);
+            }
+            next = other.reserve(name, 16);
+        });
+        assert.equal(committed, true, label);
+        assert.ok(next, label);
+        /** @type {Uint8Array} */ (next).set(bodyOf(16, 4));
+        step(9);
+        assert.equal(keeper.figures().takenBack, 0, `${label}: the next reservation held 9 ms of its 10`);
+        assert.equal(other.commit(name), true, label);
+        assert.deepEqual(reader.with(name, body=>[...body]), [...bodyOf(16, 4)], label);
+        if (retired)
+        {
+            assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(16, 2)], label);
+        }
+    }
 });
 
 test('a large reserve refused in a tick does not refuse a small one the same tick could place', async()=>{
