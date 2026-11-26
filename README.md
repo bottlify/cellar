@@ -311,8 +311,9 @@ time: a wait with no deadline never reads the clock). A doorbell's, a ring write
 end's waits learn how long to look (`createSpin`, also a `spinMs` of `waitFor`): a wait that went
 to sleep all the same makes the next look an eighth less, down to a few hundred looks, one that
 saw the word move keeps twice what it needed, and one in sixteen looks the whole way; so a side
-that waits on long work stops spinning a core away from the side doing it. A wait given a
-`spinMs` of its own looks that long. A timeout or a spin that is
+that waits on long work stops spinning a core away from the side doing it; what each learnt is
+`doorbell.spin`, `ring.roomSpin` and a channel end's `spin`. A wait given a `spinMs` of its own
+looks that long. A timeout or a spin that is
 not a number is refused. The count of waits asleep is kept by the waits themselves: a worker
 terminated while asleep stays counted, and every move after notifies once for it (about 50 ns more a move, x86).
 

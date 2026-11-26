@@ -569,3 +569,39 @@ test('a record growing while its writer waits for room is written as long as it 
     ring.drain(()=>{}, 1);
     assert.equal(ring.peek()?.length, 4);
 });
+
+test('a writer\'s waits for room learn their spin: a reader that frees room only once the writer'
+    + ' sleeps makes it look an eighth less at each wait', { timeout: 60_000 }, async()=>{
+    // Four records of 12 bytes fill a ring of 64; the reader takes one only
+    // once the writer counted itself asleep for room (the control block's
+    // second word) and the wait before it said it ended.
+    const memory = createRingMemory(64);
+    const ended = new Int32Array(new SharedArrayBuffer(4));
+    const ring = openRing(memory);
+    for (let n = 0; n < 4; n++)
+    {
+        assert.equal(ring.write(record(n, 12)), true);
+    }
+    const reader = inWorker(`
+        const r = ring.openRing(memory);
+        const control = new Int32Array(memory.control);
+        const ended = new Int32Array(data.ended);
+        const nap = new Int32Array(new SharedArrayBuffer(4));
+        for (let n = 0; n < 3; n++)
+        {
+            while (Atomics.load(ended, 0) !== n || Atomics.load(control, 1) === 0)
+                Atomics.wait(nap, 0, 0, 1);
+            r.drain(()=>{}, 1);
+        }
+        return true;`, { memory, ended: ended.buffer });
+    for (let n = 0; n < 3; n++)
+    {
+        assert.ok(ring.reserveWaiting(12) >= 0);
+        ring.commit();
+        Atomics.store(ended, 0, n + 1);
+    }
+    await new Promise(resolve=>reader.once('message', resolve));
+    await reader.terminate();
+    assert.equal(ring.roomSpin.waits, 3, 'each wait for room took the learning spin');
+    assert.equal(ring.roomSpin.looks, 3351, 'an eighth less for each of three waits that slept');
+});

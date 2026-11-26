@@ -270,6 +270,8 @@ function endOver(memory, { spinMs }){
     return {
         words, requests, answers, slots, slotAt, writeSlot, writeFailure, failureAt, publish,
         waitFor, waitForAsync,
+        /** What this end's blocking waits learnt of their spin; null for a `spinMs` of its own. */
+        spin: typeof spin === 'object' ? spin : null,
         /**
          * Ends the channel for both sides: every wait on it ends with
          * ChannelClosed. The bells are moved, not only notified: a wait that
@@ -513,6 +515,8 @@ export function openClient(memory, options = {}){
 
         /** Requests out, not answered yet. */
         out: ()=>waiting.length,
+        /** What this side's blocking waits learnt of their spin, for diagnostics. */
+        spin: end.spin,
         close: end.close,
         closed: end.closed,
     };
@@ -617,6 +621,8 @@ export function openServer(memory, options = {}){
 
         /** Requests written and not answered yet. */
         waiting: ()=>(Atomics.load(words, ASKED) - taken) >>> 0,
+        /** What this side's blocking waits learnt of their spin, for diagnostics. */
+        spin: end.spin,
         close: end.close,
         closed: end.closed,
     };

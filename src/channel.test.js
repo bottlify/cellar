@@ -416,3 +416,65 @@ test('a request that grows while it is written is written as long as it was', as
     assert.deepEqual([...await answer], [8]);
     assert.deepEqual(lengths, [8]);
 });
+
+test('a serving side\'s blocking waits learn their spin from requests that come only once it'
+    + ' sleeps', { timeout: 60_000 }, async()=>{
+    const memory = createChannel({ slots: 2, slotBytes: 8 });
+    const server = openServer(memory);
+    // The asking thread asks only once the serving side counted itself asleep
+    // (the header's sixth word); its next ask waits for the answer to the last.
+    const asking = new Worker(`
+        const { workerData } = require('node:worker_threads');
+        import(workerData.channel).then(({ openClient })=>{
+            const words = new Int32Array(workerData.memory);
+            const client = openClient(workerData.memory, { spinMs: 0 });
+            const nap = new Int32Array(new SharedArrayBuffer(4));
+            for (let n = 0; n < 3; n++)
+            {
+                while (Atomics.load(words, 5) === 0)
+                    Atomics.wait(nap, 0, 0, 1);
+                client.ask([n]);
+            }
+        });`, { eval: true, workerData: { channel: new URL('./channel.js', import.meta.url).href,
+        memory } });
+    for (let n = 0; n < 3; n++)
+    {
+        assert.equal(server.serve(request=>[request[0] + 1]), 1);
+    }
+    await asking.terminate();
+    assert.equal(server.spin?.waits, 3, 'each wait for a request took the learning spin');
+    assert.equal(server.spin?.looks, 3351, 'an eighth less for each of three waits that slept');
+    assert.equal(openServer(memory, { spinMs: 0.01 }).spin, null, 'a spin of its own learns nothing');
+});
+
+test('an asking side\'s blocking waits learn their spin from answers that come only once it'
+    + ' sleeps', { timeout: 60_000 }, async()=>{
+    const memory = createChannel({ slots: 2, slotBytes: 8 });
+    const client = openClient(memory);
+    // The handler answers only once the asking side counted itself asleep
+    // (the header's third word).
+    const serving = new Worker(`
+        const { workerData } = require('node:worker_threads');
+        import(workerData.channel).then(({ openServer })=>{
+            const words = new Int32Array(workerData.memory);
+            const server = openServer(workerData.memory, { spinMs: 0 });
+            const nap = new Int32Array(new SharedArrayBuffer(4));
+            for (let n = 0; n < 3; n++)
+            {
+                server.serve(request=>{
+                    while (Atomics.load(words, 2) === 0)
+                        Atomics.wait(nap, 0, 0, 1);
+                    return [request[0] * 2];
+                });
+            }
+        });`, { eval: true, workerData: { channel: new URL('./channel.js', import.meta.url).href,
+        memory } });
+    for (let n = 0; n < 3; n++)
+    {
+        assert.deepEqual([...client.ask([n + 1])], [(n + 1) * 2]);
+    }
+    await serving.terminate();
+    assert.equal(client.spin?.waits, 3, 'each wait for an answer took the learning spin');
+    assert.equal(client.spin?.looks, 3351, 'an eighth less for each of three waits that slept');
+    assert.equal(openClient(memory, { spinMs: 0 }).spin, null, 'a spin of its own learns nothing');
+});

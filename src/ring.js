@@ -144,6 +144,8 @@ export function openRing(memory){
         capacity,
         maxRecord,
         bell,
+        /** What the writer's waits for room learnt of their spin, for diagnostics. */
+        roomSpin,
         /**
          * The whole buffer of records, for the writer to build a record in
          * where `reserve` says: `bytes[at]` up to `bytes[at + length]`.
