@@ -599,7 +599,7 @@ test('a writer\'s waits for room learn their spin: a reader that frees room only
 });
 
 /**
- * The README's reader loop: the doorbell's count, then the closed word, then
+ * The reader loop of docs/ring.md: the doorbell's count, then the closed word, then
  * the drain, and out once a drain followed a close. `between` runs at the
  * point named: as the writer would on another thread.
  *
@@ -630,7 +630,7 @@ function readUntilClosed(ring, doorbell, take, at, between){
 
 /** @typedef {import('./ring.js').Ring} Ring */
 
-test('the close gate: a reader looping as the README says reads every record written before the'
+test('the close gate: a reader looping as docs/ring.md says reads every record written before the'
     + ' close, wherever the writer\'s last record and close fall in its loop', ()=>{
     for (const at of ['before the count', 'before the closed word', 'before the drain',
         'before the wait'])
@@ -658,7 +658,7 @@ test('the close gate: a reader looping as the README says reads every record wri
 
 test('the close gate across threads: every trial\'s reader reads every record written before the'
     + ' close', { timeout: 120_000 }, async t=>{
-    // The reader in a worker loops over the rings in turn as the README says;
+    // The reader in a worker loops over the rings in turn as docs/ring.md says;
     // this thread writes each ring's records, the last after a pause in which
     // the reader drained and went to wait, then closes it.
     const TRIALS = 100;

@@ -5,8 +5,8 @@
  */
 
 /**
- * Draws the README's charts into docs/: bars of what the examples measured,
- * each pair postMessage against Cellar. The numbers are the README's tables
+ * Draws the charts of the README and docs/benchmarks.md into docs/: bars of what the examples measured,
+ * each pair postMessage against Cellar. The numbers are docs/benchmarks.md's tables
  * (`examples/call-a-worker.mjs`, `examples/memory.mjs`, `examples/ring.mjs`,
  * node 22, a 4-core x86 VM, medians of 3 runs); measured again, they are
  * changed here and in the tables together.

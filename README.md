@@ -2,508 +2,114 @@
 
 **Many threads. One memory.**
 
-Cellar is a lightweight shared-memory library for multithreaded JavaScript. Threads share data,
-call each other, stream records and wait on each other through shared memory, without going
-through the event loop for every exchange.
+Cellar is a lightweight shared-memory library for multithreaded JavaScript. Threads share data, call each other, stream records and wait on each other without going through the event loop for every exchange.
 
-- **Cache** - bodies in shared memory, read in place by name from any thread, under one memory
-  budget, idle ones kept on the disk (OPFS) and brought back when asked.
-- **Channel** - calls between two threads, blocking or not, the request and the answer read where
-  they lie.
-- **Ring** - a bounded stream of records one way, read in place, a full ring refusing rather than
-  overwriting.
-- **Journal** - records one thread writes and any number read, the newest kept and the oldest
-  written over: a log, a trace, the times frames were shown. The writer never waits.
-- **Bell** - one thread waits on a shared word, another wakes it, and only when it sleeps.
-- **Doorbell** - one wait for everything a thread is sent, whatever it came through.
+Built for [Bottlify](https://github.com/bottlify/bottlify), and useful wherever JavaScript workers share data and do work together. Browser-first, with Node.js support. No runtime dependencies. MPL-2.0.
 
-Cellar is browser code: a page and its workers sharing memory, in a cross-origin isolated page.
-Node runs it too (its tests run there), with `worker_threads` for workers. It works with what the
-platform has: a thread blocks only where the platform lets it (a worker, never a page's own
-thread), and a wait on the event loop uses `Atomics.waitAsync` where there is one.
-
-Built for [Bottlify](https://github.com/bottlify/bottlify), whose processes and workers share
-memory and wait on each other; nothing in it is Bottlify's, and it suits any page that runs work in
-several threads. No runtime dependencies, the browser's own primitives (`SharedArrayBuffer`,
-`Atomics`, OPFS), MPL-2.0.
+| Primitive | What it does |
+| --- | --- |
+| [Cache](docs/cache.md) | Shared bodies by name, read in place, one memory budget, optional disk storage. |
+| [Channel](docs/channel.md) | Blocking or asynchronous RPC between two threads. |
+| [Ring](docs/ring.md) | A bounded one-writer, one-reader byte stream, with backpressure and in-place writing. |
+| [Journal](docs/journal.md) | One writer, many readers; older records are overwritten, and the writer never waits for readers. |
+| [Bell](docs/bell.md) | Wait on a shared word; notify only when a wait is registered. |
+| [Doorbell](docs/bell.md#doorbell) | One wait for several sources of work. |
 
 ![Round trip between two threads: postMessage against Cellar](docs/latency.svg)
 
 ![Memory of a worker summing shared samples: postMessage against a channel](docs/memory.svg)
 
-The figures are `examples/call-a-worker.mjs`, `examples/memory.mjs` and `examples/ring.mjs`
-(Cellar 0.5.9, node 22, a 4-core x86 VM, 3 runs an arm, medians); the tables below give every number. How each
-mechanism works, drawn: [examples/README.md](examples/README.md).
-
-Status: the bell, the ring, the channel and the cache, each with its gate.
-
 ## Install
 
-Not on npm yet. Every version is built into a
-[release](https://github.com/bottlify/cellar/releases): `cellar.js`, `cellar.min.js`, the
-declarations (`types/`) and their checksums; take them from there. The examples below import it
-by the name it will have on npm.
+Not on npm yet. Each [release](https://github.com/bottlify/cellar/releases) contains `cellar.js`, `cellar.min.js`, TypeScript declarations (`types/`) and checksums. The examples use the future package name `@bottlify/cellar`; use your local module path or an import map with the release files today.
 
-## Use
+## Quick start
 
-Every example below is two files: `page.js`, the page's own thread, which may never block, and
-`worker.js`, a module worker, which may. The shared memory is made on one side and handed to the
-other once, by `postMessage`; from then on the two talk through it.
+A function in a worker, called from the page. The shared memory is handed over once with `postMessage`; requests and answers then travel through the channel.
 
-The keeper runs in one thread, here the page's. It hands each worker the index and the segments,
-and answers the few calls a worker makes of it (room to write, a body brought back from the disk)
-over a channel:
+**page.js**
 
 ```js
-// page.js
-import { createChannel, openKeeper, openServer } from '@bottlify/cellar';
-
-/** @type {Worker | undefined} */
-let worker;
-const keeper = await openKeeper({
-    budget: 256 << 20,                                   // bytes of shared memory for hot bodies, at most
-    disk: null,                                          // or OPFS sync handles, opened in a worker
-    announce: message=>worker?.postMessage(message),     // segments made and let go, a larger table
-});
-setInterval(()=>keeper.sweep(), 1000);                   // idle bodies go cold, then away
-
-// The worker's calls to the keeper, answered on the page's event loop.
-const channel = createChannel();
-const server = openServer(channel);
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-(async()=>{
-    for (;;)
-    {
-        await server.serveAsync(request=>{
-            const { op, name, length, options } = JSON.parse(decoder.decode(request));
-            const answer = op === 'reserve' ? keeper.reserve(name, length, options)
-                : op === 'raise' ? keeper.raise(name, options) : keeper.drop(name);
-            return encoder.encode(JSON.stringify(answer));
-        });
-    }
-})();
-
-// The index and the segments as they are now; the ones made after come by `announce`.
-worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-worker.postMessage({ shared: keeper.shared, segments: keeper.segmentBuffers(), channel });
-```
-
-```js
-// worker.js
-import { createReader, openClient } from '@bottlify/cellar';
-
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-let cache = null;
-
-self.onmessage = ({ data })=>{
-    if (data.shared === undefined)
-    {
-        cache.adopt(data);                               // a segment made or let go, a larger table
-        return;
-    }
-    const client = openClient(data.channel);
-    const send = call=>encoder.encode(JSON.stringify(call));
-    // A worker may block: room to write is asked and waited for.
-    const ask = call=>JSON.parse(decoder.decode(client.ask(send(call))));
-    cache = createReader({ shared: data.shared, segments: data.segments, keeper: {
-        reserve: (name, length, options)=>ask({ op: 'reserve', name, length, options }),
-        raise: (name, options)=>ask({ op: 'raise', name, options }),
-        raiseLater: name=>{
-            client.call(send({ op: 'raise', name })).catch(()=>{});   // not waited for
-        },
-        drop: name=>{
-            client.call(send({ op: 'drop', name })).catch(()=>{});
-        },
-    } });
-
-    cache.put('blocks/42', bytes);                       // reserve, copy, commit
-    const sum = cache.with('blocks/42', body=>checksum(body));   // read in place; undefined on a miss
-};
-```
-
-A body is read only inside `with`: the keeper never takes a body a reader is in. A body the keeper
-is moving (to the disk, back from it, or held while room for the name's next body is found) is
-there: `look` says `'cold'`, `with` misses it and asks for it back, and `with` given `{ wait: true }`
-reads it once the move is over. A name is a string; anything else is refused (`TypeError`). A body
-that can be made again goes away when there is no room and no disk; one marked `onlyCopy` never
-does. Room is made only where it forms a block for the body asked: a body leaves only with the
-others in that block, and a request no block can be formed for moves nothing.
-`readSaved([indexA, indexB])` reads what a keeper's disk holds without a keeper and without
-writing: the bytes of `INDEX_FILES` in, each body's pack (`packFile(n)`), offset and length out,
-as the last whole save names them (a page asking how much of a cache is there), an entry that says
-no body (in a pack the index does not list, of no bytes) left out as a keeper opening it leaves it.
-`disk` says where a body may go on the disk: `'kept'` (the default) there and in the saved index
-for the next run; `'run'` there while cold, never named in the index, for a body that means
-nothing to the next run (texels a GPU was handed); `'never'` not at all, so an idle body that can
-be made again goes away and an only copy stays in memory.
-An owner whose names are its own (`texels/<root>/...`) is weighed and let go of by their prefix:
-`keeper.under(prefix)` says the bodies and bytes held under it, and `keeper.release(prefix)` lets
-go of all of them at once, only copies included, as the owner goes, answering what was there and
-how many are still read or written (those go once no one reads them, as a `drop` leaves them).
-
-A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
-`commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`: the
-name has no body then, and the room goes back. A reservation neither committed nor abandoned within
-`abandonAfterMs` (five minutes by default) is taken back by the sweep after: its writer is taken for
-gone, its room goes back, and a `commit` after it answers false, as `put` then does; a reader handed
-such a place later (room asked for ahead) refuses it, `reserve` answering null. A writer still
-writing past that writes into room another body may be given, so one that can take longer raises
-it. A thread terminated inside `with` stays counted, as a bell's wait terminated asleep does: its
-body stays hot and its room held for the run. The count is one word of the record, no thread's in
-particular; only the host knows a thread died, and a count taken back by time would take a body
-from a reader that was only slow. A thread joining later is handed `keeper.shared` and
-`keeper.segmentBuffers()` as they are then. Memory that is not a cache of this layout is refused when a
-reader is made over it (`createReader` throws). A write the disk takes in part counts as not written,
-and a flush the disk fails may have lost what the pack took since the one before: no body written
-there since is trusted to the disk (a hot one is written again, a cold one that can be made again
-goes, counted in `lostOnDisk`). A body the disk reads back short is gone where it can be made again
-(`lostOnDisk`); an only copy stays cold and the read counts as a failure (`diskFailures`): the
-keeper never lets an only copy go on its own judgement, and a run reading the pack afresh skips it
-there if the pack is short (`skippedEntries`). `save()` writes the hot bodies the disk lacks, then
-an index of exactly the bodies the disk holds, after the packs are flushed: the index is always
-true, and `false` says some body stayed in memory only (the disk refused it, or the next pack was
-not open yet). A save writes what changed since the last one, appended to the index file (a few
-dozen bytes a body; nothing when nothing changed), and the whole index into the other file once the
-changes outgrow it. A save torn or failed at the index leaves the one before it, which the next run
-reads; an entry of it that does not fit its pack's file is skipped and counted (`skippedEntries`).
-An index file the disk fails to read, or reads short, keeps the keeper from opening (`openKeeper`
-rejects, the disk left as it was): a keeper that went on without it could let go of, write over or
-outdate what the next run reads, so the program goes on without the disk (`disk: null`) and the next
-run tries again. An index of Cellar 0.9.0 and before is read too. Packs are compacted: a pack its
-bodies fill less than a quarter of has what is left written anew in the current pack (a hot body
-too, from memory, so that its copy on the disk stays named), and the save after lets the file go
-(removed where the disk has `remove`, else cut to nothing), unless an index file the next run may
-read still names an only copy there; a keeper opening an index lets go of the packs no body of it is
-in (what a run wrote with `disk: 'run'`). Every save lists each pack whose file may be on the disk,
-the one still opening and one let go of until its file is gone, so a crash before a removal, or a
-removal the disk failed, leaves the file to the next run to let go of, and none stays that no index
-lists. A pack's number is given from past the highest either index file names, so the numbers of
-packs let go of come back. When the disk refuses a write, the next sweep makes room from the pack
-used longest ago of those holding no only copy (one could not move while the disk refuses, and what
-went beside it would free nothing): what can be made again there goes, so newer bodies take its
-place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they
-call none of its methods. One that throws (an `announce` also one whose promise rejects) is counted
-(`announceFailures`, `diskFailures`) and the keeper goes on: a thread not told of a segment is never placed in it. After `close()` the files are
-let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
-good), a cold one is the next run's, on the disk, and no body of this run any more. A cold only copy
-no whole save names where it lies (the save failed, or it is a body for this run) is brought back
-into memory first, room made from what can be made again; one memory has no room for is counted
-(`lostAtClose`).
-`budget` is a finite number of bytes; `segmentBytes` a power of two from 4 KiB to 1 GiB;
-`packBytes` under 2 GiB; a body's length a whole number of bytes. The spans (`coldAfterMs`,
-`goneAfterMs`, `releaseAfterMs`, `abandonAfterMs`) are under 24.8 days: the keeper's
-clock is a 32-bit word. Names are not reused within a run: a run holds 2^20 names and 2^25 UTF-16
-units of them, past which a new name is refused; a record a name was written anew under while it
-was read goes back for another name once its readers are out. The `raise` a reader is given
-takes `{ known }`, the segments that reader has: a body is brought back only where it can read it.
-What the `reserve` it is given answers is handed to it whole: `{ id, segment, offset, mark }`, the
-mark naming the reservation its `commit` ends.
-
-## Channel
-
-Calls between two threads without a message: a request is written where the other thread reads it,
-the answer where the asking thread reads it, each side sleeping on a shared word until rung. A
-message clones what it carries and waits for the other thread's event loop; a channel copies a
-request once and need not wait for anything but the answer. What is large is not sent at all: the
-request names where it lies (a body in the cache, a range of a shared buffer).
-
-```js
-// page.js - the page's own thread may not block: it calls and awaits.
 import { createChannel, openClient } from '@bottlify/cellar';
 
-const channel = createChannel({ slots: 16, slotBytes: 4096 });   // slots a power of two
-const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-worker.postMessage({ channel });                                 // the shared memory, once
-
-const client = openClient(channel);
-const sum = await client.call(Uint8Array.of(1, 2, 3), { read: answer=>answer[0] });   // 6
-client.close();                                                  // the worker's serve ends
-```
-
-```js
-// worker.js - a worker may block: it serves, asleep on the channel between requests.
-import { ChannelClosed, openServer } from '@bottlify/cellar';
-
-self.onmessage = ({ data })=>{
-    const server = openServer(data.channel);
-    try
-    {
-        for (;;)
-        {
-            // The request read where it lies; the answer's bytes returned.
-            server.serve(request=>[request.reduce((sum, value)=>sum + value, 0)]);
-        }
-    }
-    catch (e)
-    {
-        if (!(e instanceof ChannelClosed))
-        {
-            throw e;
-        }
-    }
-};
-```
-
-A worker that asks blocks for its answer, with no promise and no garbage: `client.ask(request)`
-answers it at once (a copy, or `{ read }` reads it in place). A worker that must keep its event
-loop serves with `await server.serveAsync(handler)` instead of `serve`.
-
-
-One asking side and one serving side for the channel's life; a thread that needs a new link (a
-worker started again) makes a new channel. Answers come back in order, as many requests out at
-once as there are slots; a call waiting for room goes out as soon as one answer frees a slot. A
-blocking ask makes no garbage, answered at once or after its handler worked a while: the request
-and answer are read where they lie, and a wait reads the clock only when it has a deadline.
-Either side closes the channel when it goes: every wait on it ends with `ChannelClosed`, and every
-call and ask after it, but what came before the close still arrives - a request sent before it is
-served, an answer written before it is the asker's. Memory that is not a channel of this layout
-(made by `createChannel`) is refused when an end opens over it.
-
-A handler that throws, or answers more than a slot holds, answers its request with the failure:
-the call or ask fails with `ChannelFailed`, saying what the handler threw (as much as a slot
-holds), and the next request is served. A `serve` from inside its own handler, and an `ask` or a
-`call` from inside the reading of an answer, throw: each would take a slot that is in use. An
-`ask` on a thread that may not block throws there when it would sleep, and its answer, when it
-comes, goes to nobody.
-
-`examples/memory.mjs` calls a function in a worker by postMessage and by the channel, each arm in a
-process of its own (node 22, a 4-core x86 VM, 3 runs an arm, medians):
-
-| | postMessage | channel |
-| --- | --- | --- |
-| a small call (100 000): time | 38 us | 2.2 us |
-| collections, asking thread / worker | 80 / 34 | 8 / 0 (the 8: the process's start) |
-| peak resident memory | 88 MiB | 80 MiB |
-| 8 MiB of samples summed (200): time | 5.8 ms | 1.3 ms |
-| collections in the worker | 50 | 0 |
-| the worker's buffers at most | 32 MiB (copies) | 0 |
-| peak resident memory | 133 MiB | 77 MiB |
-
-`examples/call-a-worker.mjs` shows the same calls as a page would write them.
-
-## Ring and bell
-
-The channel is calls; a ring is records one way, of any length, read in place: one writer, one
-reader, a record that does not fit refused rather than overwritten. Both stand on the bell, the one
-way two threads wait on each other here: a wait looks at a shared word for a moment, then sleeps
-on it, counted beside it; whoever moves the word notifies only when a wait sleeps. A doorbell is a
-bell several rings share, so a thread reading several waits once for all of them.
-
-```js
-// page.js - pointer moves to a worker busy with long work, which reads them between its steps.
-import { createDoorbell, createRingMemory, openRing } from '@bottlify/cellar';
-
-const bell = createDoorbell();                       // one per reading thread
-const memory = createRingMemory(1 << 16, bell);
+const memory = createChannel({ slots: 16, slotBytes: 4096 });
 const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 worker.postMessage({ memory });
 
-const ring = openRing(memory);
-const record = new Uint8Array(8);
-const fields = new DataView(record.buffer);
-addEventListener('pointermove', event=>{
-    fields.setInt32(0, event.clientX, true);
-    fields.setInt32(4, event.clientY, true);
-    ring.write(record);                              // false when the ring is full
+const client = openClient(memory);
+const sum = await client.call(Uint8Array.of(1, 2, 3), {
+    read: answer=>answer[0],
 });
+console.log(sum); // 6
+client.close();
 ```
 
+**worker.js**
+
 ```js
-// worker.js
-import { openDoorbell, openRing } from '@bottlify/cellar';
+import { ChannelClosed, openServer } from '@bottlify/cellar';
 
 self.onmessage = ({ data })=>{
-    const ring = openRing(data.memory);
-    const doorbell = openDoorbell(data.memory.bell);
-    for (;;)
+    const server = openServer(data.memory);
+    try
     {
-        const seen = doorbell.seen();                // before the look: nothing written after it is missed
-        const closed = ring.closed();                // before the drain: what came before the close is drained
-        ring.drain(record=>{                         // each record a view, valid inside the call
-            const fields = new DataView(record.buffer, record.byteOffset, record.length);
-            move(fields.getInt32(0, true), fields.getInt32(4, true));
-        });
-        if (closed)
-        {
-            break;
-        }
-        doorbell.wait(seen);                         // blocks; waitAsync keeps the event loop
+        for (;;) server.serve(request=>[request.reduce((a, b)=>a + b, 0)]);
+    }
+    catch (e)
+    {
+        if (!(e instanceof ChannelClosed)) throw e;
     }
 };
 ```
 
-A record need not be built elsewhere and copied in: `reserve(length)` gives room for one at
-`ring.bytes[at]`, the writer builds it there, and `commit(length)` publishes it, as long as it
-turned out (no longer than was reserved); `abandon()` gives the room back. One reservation at a
-time; `reserveWaiting` and `reserveWaitingAsync` wait for room as the writes do. `write` is the
-same three steps with a copy between.
+A worker may also use `client.ask()` to block for an answer, or `server.serveAsync()` to keep its event loop available. See [Channel](docs/channel.md).
 
-```js
-// recorder.worker.js - a batch of commands for another worker, built where it will be read.
-const at = ring.reserveWaiting(BATCH_BYTES);         // blocks until the reader makes room
-const words = new DataView(ring.bytes.buffer);
-let end = at;
-for (const command of commands)
-{
-    words.setUint32(end, command.op, true);
-    words.setUint32(end + 4, command.argument, true);
-    end += 8;
-}
-ring.commit(end - at);
-```
+## Which primitive?
 
-A writer that may not block (a page) waits for room with `writeWaitingAsync`; `drain(take, most)`
-takes at most `most` records, so one ring written without a pause does not starve the others a
-thread reads (a reader that took `most` drains again before it waits: what is left will not ring
-again). Either side closes a ring when it goes or knows the other went: a writer waiting for
-room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
-reading what was written before: it looks at `closed()` before its drain, as the loop above does,
-and goes once a drain followed a close (one that looked after the drain would leave a record
-written just before the close unread). Memory that is not a ring of this layout is refused when a
-side opens over it. A `take` may not drain its own ring (it holds the record being
-taken), and `release` frees only a record `peek` returned: either throws rather than free a
-record not read. A record is bytes, as a channel's request and answer and a body the cache is
-handed are: a `Uint8Array` (or another view of one-byte elements) or an array of integers from 0
-to 255. Anything else is refused with a `TypeError` rather than written as something it is not: a
-wider typed array, a `DataView`, a buffer, a string, an object with only a length, a number past a
-byte.
+- **Cache:** resources used by many workers, under one budget; optionally cold on disk.
+- **Channel:** ask another thread to do something and return an answer.
+- **Ring:** deliver commands or batches without overwriting unread data; build directly in shared memory with `reserve()` and `commit()`.
+- **Journal:** logs, traces and measurements; each reader follows its own sequence and can miss old records without stopping the writer.
+- **Bell / Doorbell:** wait for a change or for work from several rings.
 
-`waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
-`Int32Array`, for a protocol of its own (a wait given a closed word ends `'closed'` once it is set,
-unless its word moved before: then that move is what it answers); `deadlineOf(timeoutMs)` is a
-deadline on the clock they read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
-time: a wait with no deadline never reads the clock). A doorbell's, a ring writer's and a channel
-end's waits learn how long to look (`createSpin`, also a `spinMs` of `waitFor`): a wait that went
-to sleep all the same makes the next look an eighth less, down to a few hundred looks, one that
-saw the word move keeps twice what it needed, and one in sixteen looks the whole way; so a side
-that waits on long work stops spinning a core away from the side doing it; what each learnt is
-`doorbell.spin`, `ring.roomSpin` and a channel end's `spin`. A wait given a `spinMs` of its own
-looks that long. A timeout or a spin that is
-not a number is refused. The count of waits asleep is kept by the waits themselves: a worker
-terminated while asleep stays counted, and every move after notifies once for it (about 50 ns more a move, x86).
+## Performance
 
-`examples/ring.mjs` sends 20 000 pointer moves to a worker busy with 2 000 steps of work, then
-2 000 events one at a time to it idle, each answered (node 22, a 4-core x86 VM, 3 runs, medians):
+Selected round-trip and memory measurements from Cellar 0.5.9 (Node.js 22, 4-core x86 VM, median of three runs):
 
-| | postMessage | ring |
-| --- | --- | --- |
-| a step of the busy worker (it yields after each to hear a message) | 190 us | 164 us |
-| an event there and back, the worker idle | 38 us | 1.5 us |
+| Work | postMessage | Cellar |
+| --- | ---: | ---: |
+| Small RPC | 38 µs | 2.2 µs |
+| Idle event round trip | 38 µs | 1.5 µs |
+| Sum 8 MiB of samples | 5.8 ms | 1.3 ms |
+| Peak RSS, 8 MiB samples | 133 MiB | 77 MiB |
 
-`examples/batches.mjs` hands batches of bytes from one worker to another, the same work to build
-and to read each way: posted with the buffer transferred and posted back, copied into a ring
-(`write`), and built in the ring (`reserve`, `commit`). Batches go one after another, a gibibyte a
-run (a million batches at most). Wall time a batch, and in brackets the processor time of both
-threads a batch, their waits included: a ring's side looks a moment before it sleeps, a posting
-side sleeps in its event loop (node 26 / node 22, a 4-core x86 VM, load ~3.5, 5 runs an arm
-alternated, medians):
+These measurements compare the example workloads, not every use of `postMessage`. The batch benchmarks also compare transferred buffers with copied and in-place ring writes. See [Benchmarks](docs/benchmarks.md) for the full numbers, methods and limitations.
 
-| batch | postMessage | ring `write` | ring `reserve` |
-| --- | --- | --- | --- |
-| 64 B | 3.6 / 3.8 us (6.1 / 6.7) | 0.35 / 0.33 us (0.57 / 0.59) | 0.35 / 0.34 us (0.62 / 0.59) |
-| 8 KiB | 10.5 / 8.2 us (16.4 / 14.4) | 4.5 / 4.4 us (8.6 / 8.2) | 4.0 / 3.1 us (7.3 / 5.4) |
-| 64 KiB | 86 / 40 us (111 / 62) | 26 / 30 us (44 / 56) | 20 / 19 us (36 / 34) |
-| 256 KiB | 312 / 128 us (387 / 203) | 95 / 147 us (168 / 201) | 69 / 70 us (124 / 128) |
+## Requirements and important contracts
 
-A post transfers its buffer and copies nothing; `write` copies the batch in, which for a large
-one costs about what a post does on node 22 (node 26 pays a post in proportion to its size). Built
-in the ring, a batch is copied by nobody and costs least on both. With four other threads busy on
-the same four cores, the waits that learn their spin take 64 KiB built in the ring from 43 to 34 us
-of processor time a batch.
+- Cross-origin isolation and `SharedArrayBuffer` for sharing memory between browser threads. Without shared memory, the cache can run within one thread.
+- Growable buffers for the cache index. `Atomics.waitAsync` is used where available; otherwise asynchronous waits poll. Node.js 22 or later.
+- Never block the browser's main thread. Use the asynchronous APIs there. Views handed out for reading or writing have limited lifetimes; follow each primitive's contract.
+- Journal copies records into private scratch memory. Its cross-thread integrity check relies on how current engines implement sequentially consistent Atomics, not solely on the ECMAScript memory model. See [Journal](docs/journal.md#memory-ordering).
+- Optional disk storage uses a single Keeper per directory. OPFS synchronous handles belong in a worker.
+- A cache write reservation has an expiry; a live writer must finish before it expires. See [Cache](docs/cache.md#writing-and-ownership).
 
-## Journal
+For browser isolation, a common starting configuration is `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`; ensure the page and its resources meet the policy.
 
-A ring hands every record to its one reader and makes the writer wait when it is full; a journal
-never makes its writer wait. Any number of threads read it, each by sequence, and a reader that
-falls behind finds the records the writer lapped gone, never torn.
+## Documentation and examples
 
-```js
-// engine.worker.js - the writer: a record drafted, then copied in.
-import { createJournalMemory, openJournal } from '@bottlify/cellar';
+[Cache](docs/cache.md) · [Channel](docs/channel.md) · [Ring](docs/ring.md) · [Journal](docs/journal.md) · [Bell and Doorbell](docs/bell.md) · [Benchmarks](docs/benchmarks.md)
 
-const memory = createJournalMemory({ records: 4096, bytes: 1 << 20 });
-postMessage({ journal: memory });                     // to whoever reads it
-const journal = openJournal(memory);
-function note(level, value){
-    const record = journal.draft(16);                 // a DataView of the writer's own memory
-    record.setUint32(0, level, true);
-    record.setFloat64(8, value, true);
-    return journal.commit();                          // copied into the journal; its sequence
-}
-```
-
-```js
-// page.js - a reader, as late as it likes.
-import { openJournal } from '@bottlify/cellar';
-
-/** What a reader keeps of a record: handed a copy of its own, whole, and the length. */
-const valueOf = (record, _length)=>record.getFloat64(8, true);
-
-worker.onmessage = ({ data })=>{
-    const journal = openJournal(data.journal);
-    let next = journal.oldest();
-    setInterval(()=>{
-        for (const end = journal.written(); next !== end; next = (next + 1) >>> 0)
-        {
-            const value = journal.read(next, valueOf);    // undefined if the writer reached it first
-            if (value !== undefined) show(value);
-        }
-    }, 250);
-};
-```
-
-`draft(length)` gives the writer a view of a record of its own memory, the first `length` bytes
-of which it fills; `commit()` copies them into the journal and answers the record's sequence.
-`read(sequence, take)` copies the record into the reader's own memory, checks the copy, and hands
-it to `take` as a `DataView` and its length, answering what `take` returns; or undefined when the
-record was not there: not written yet, or written over before the copy was whole (the writer
-moves its count of bytes before it writes a word, and the read checks it after its last). `take`
-is handed only a whole record, and keeps nothing of the view: the next read copies over it (a read
-inside `take` copies into a view of its own). Both copies are plain; what keeps the check honest
-on a processor that reorders plain loads and stores around atomic ones, arm64 among them, is a
-sequentially consistent store and load in a row on each side, which no engine lets pass the plain
-accesses around them: the writer stores its count and loads it again before it writes a word, the
-reader stores a word of its own and then loads the count after its copy. That rests on how engines
-compile `Atomics` (a locked instruction or mfence on x86; a store-release then a load-acquire, or a
-dmb, on arm64), not on the JavaScript memory model, which orders racing plain accesses by nothing.
-A view the journal handed out stays its own until a longer record than any before needs a larger
-one; one kept past that fails where it is used. `oldest()` and `written()` bound what can be
-asked for; `first` in the memory's options starts the count where a journal it takes over from
-ended. Counts wrap at 2^32 and are compared by their difference, past 2^32 records too. Over an
-`ArrayBuffer` (`shared: false`) the readers are on the writer's own thread. Writing a record and
-reading it back make nothing on the heap, but for a record longer than any before (its view grows,
-once).
-
-The copies are what a record costs: V8 runs each `Atomics` load or store as a call of its own
-(about 9 and 12 ns, x86), and a record takes one a word besides a few for the counts. A record of 16
-bytes takes about 125 ns to write and 95 ns to read, one of 8 bytes about 100 ns either way (node
-22 and node 26 alike, a 4-core x86 VM, 11 runs alternated, medians).
-
-## Requirements
-
-- `SharedArrayBuffer`, in a cross-origin isolated page, for anything shared between threads.
-  Without it the cache is one thread's, on buffers of its own, and works the same there.
-- Growable buffers (`maxByteLength`) for the cache's index: an engine without them is told so
-  when the keeper opens.
-- `Atomics.waitAsync` for waits on the event loop (`waitForAsync`, `call`, `serveAsync`,
-  `writeWaitingAsync`); where there is none they look again every millisecond.
-- The disk (OPFS synchronous handles, in a worker) is optional, and one keeper's: nothing in the
-  keeper guards a directory against a second keeper, which would write over the first one's packs
-  and index. OPFS's synchronous handles lock their files, so a second keeper there fails to open;
-  over a disk without such locks the program keeps to one keeper a directory.
+[How Cellar works, drawn](examples/README.md) - diagrams and runnable examples.
 
 ## Develop
 
 ```sh
 npm ci
-npm run check     # types (JSDoc, tsc), unit tests, the concurrency gate, the build
+npm run check
 ```
 
-`npm run build` writes `dist/`: one ES module (`cellar.js`, `cellar.min.js`), the declarations
-(`types/`) and `checksums.json`. A push to `main` runs the same checks on GitHub and, for a
-version in `package.json` no release carries yet, releases it with the built files.
+The check runs type checking, unit tests, integration gates and the build. `npm run build` writes the ES modules, declarations and checksums to `dist/`. GitHub CI runs the checks and publishes new versions as releases.
 
 ## License
 
