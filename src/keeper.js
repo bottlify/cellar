@@ -246,7 +246,7 @@ export async function openKeeper(options){
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
         segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
-        reclaimedBytes: 0, evicted: 0,
+        reclaimedBytes: 0, evicted: 0, lostAtClose: 0,
     };
 
     /**
@@ -849,6 +849,63 @@ export async function openKeeper(options){
         return true;
     };
 
+    /**
+     * Brings cold record `id` back into a segment below `known`: true where
+     * it is hot there now.
+     *
+     * @param {number} id @param {number} known
+     */
+    const raiseRecord = (id, known)=>{
+        const length = get(id, R_LENGTH);
+        // Saved by a run of larger segments: no segment of this one holds it.
+        if (length > segmentBytes)
+        {
+            counts.raiseFailed++;
+            return false;
+        }
+        store(id, MOVING);
+        const found = room(length, known);
+        if (found === null)
+        {
+            store(id, COLD);
+            counts[segments.length > known ? 'refusedUnseen' : 'raiseFailed']++;
+            return false;
+        }
+        const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[found.segment]);
+        let read = 0;
+        try
+        {
+            read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(found.offset,
+                found.offset + length), { at: get(id, R_PACK_OFFSET) });
+        }
+        catch {
+            giveRoom(found.segment, found.offset, length);
+            counts.diskFailures++;
+            store(id, COLD);
+            counts.raiseFailed++;
+            return false;
+        }
+        if (read !== length)
+        {
+            // The pack holds less than the index says (cut, or removed in
+            // the origin): the body is not on the disk any more.
+            giveRoom(found.segment, found.offset, length);
+            forgetDisk(id);
+            set(id, R_FLAGS, 0);
+            store(id, GONE);
+            counts.lostOnDisk++;
+            counts.raiseFailed++;
+            return false;
+        }
+        set(id, R_SEGMENT, found.segment);
+        set(id, R_OFFSET, found.offset);
+        set(id, R_TICK, Atomics.load(words, H_TICK));
+        store(id, HOT);
+        counts.raised++;
+        keepSpare();
+        return true;
+    };
+
     // --- room on the disk ---------------------------------------------------
 
     /** Bytes a body is read into on its way from one pack to another. */
@@ -1291,54 +1348,7 @@ export async function openKeeper(options){
             {
                 return state === HOT && get(id, R_SEGMENT) < known;
             }
-            const length = get(id, R_LENGTH);
-            // Saved by a run of larger segments: no segment of this one holds it.
-            if (length > segmentBytes)
-            {
-                counts.raiseFailed++;
-                return false;
-            }
-            store(id, MOVING);
-            const found = room(length, known);
-            if (found === null)
-            {
-                store(id, COLD);
-                counts[segments.length > known ? 'refusedUnseen' : 'raiseFailed']++;
-                return false;
-            }
-            const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[found.segment]);
-            let read = 0;
-            try
-            {
-                read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(found.offset,
-                    found.offset + length), { at: get(id, R_PACK_OFFSET) });
-            }
-            catch {
-                giveRoom(found.segment, found.offset, length);
-                counts.diskFailures++;
-                store(id, COLD);
-                counts.raiseFailed++;
-                return false;
-            }
-            if (read !== length)
-            {
-                // The pack holds less than the index says (cut, or removed in
-                // the origin): the body is not on the disk any more.
-                giveRoom(found.segment, found.offset, length);
-                forgetDisk(id);
-                set(id, R_FLAGS, 0);
-                store(id, GONE);
-                counts.lostOnDisk++;
-                counts.raiseFailed++;
-                return false;
-            }
-            set(id, R_SEGMENT, found.segment);
-            set(id, R_OFFSET, found.offset);
-            set(id, R_TICK, Atomics.load(words, H_TICK));
-            store(id, HOT);
-            counts.raised++;
-            keepSpare();
-            return true;
+            return raiseRecord(id, known);
         },
 
         /** @param {string} name */
@@ -1585,19 +1595,42 @@ export async function openKeeper(options){
             // Memory's only from here: a hot body the disk held stays until it
             // can be made again or is let go, an only copy for good; a cold one
             // is the next run's, on the disk, and no body of this run any more.
+            // A cold only copy no whole save names where it lies (the save
+            // failed, or it is this run's) would be no one's: it is brought
+            // back first, room made from what can be made again.
+            /** @type {number[]} */
+            const unnamed = [];
             for (let id = 0; id < words[H_COUNT]; id++)
             {
-                const state = stateOf(stateWordOf(id));
-                if (state === COLD)
+                if (stateOf(stateWordOf(id)) !== COLD)
+                {
+                    set(id, R_FLAGS, get(id, R_FLAGS) & ~F_ON_DISK);
+                    set(id, R_PACK, -1);
+                }
+                else if ((get(id, R_FLAGS) & F_ONLY_COPY) !== 0 && (!indexed(id) || changed.has(id)))
+                {
+                    unnamed.push(id);
+                }
+            }
+            for (const id of unnamed)
+            {
+                if (raiseRecord(id, Infinity))
+                {
+                    set(id, R_FLAGS, get(id, R_FLAGS) & ~F_ON_DISK);
+                    set(id, R_PACK, -1);
+                }
+                else if (stateOf(stateWordOf(id)) === COLD)
+                {
+                    counts.lostAtClose++;
+                }
+            }
+            for (let id = 0; id < words[H_COUNT]; id++)
+            {
+                if (stateOf(stateWordOf(id)) === COLD)
                 {
                     set(id, R_FLAGS, 0);
                     set(id, R_PACK, -1);
                     store(id, GONE);
-                }
-                else
-                {
-                    set(id, R_FLAGS, get(id, R_FLAGS) & ~F_ON_DISK);
-                    set(id, R_PACK, -1);
                 }
             }
             for (const file of [...packs.values(), ...slots.map(slot=>slot.file),

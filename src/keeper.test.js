@@ -1631,3 +1631,55 @@ test('a pack compacted moves a hot body as it moves a cold one: an only copy rea
     assert.deepEqual(await nextRunReads(disk.crash(), ['only', 'b']),
         [[...bodyOf(10 * KIB, 1)], [...bodyOf(10 * KIB, 9)]]);
 });
+
+test('a close whose save fails brings back into memory the cold only copies no whole save names, and'
+    + ' a body for this run; one memory has no room for is counted', async()=>{
+    for (const fault of ['none', 'index', 'pack'])
+    {
+        const disk = crashDisk();
+        const { reader, keeper, step } = await cacheOf({ disk, packBytes: 16 * KIB });
+        reader.put('first', bodyOf(12 * KIB, 1));
+        step(150);
+        await settle();
+        keeper.save();
+        keeper.save();
+        reader.put('only', bodyOf(12 * KIB, 2), { onlyCopy: true });
+        reader.put('texels', bodyOf(2 * KIB, 3), { onlyCopy: true, disk: 'run' });
+        step(150);
+        await settle();
+        assert.deepEqual([reader.look('only'), reader.look('texels')], ['cold', 'cold'], fault);
+        if (fault === 'index')
+        {
+            disk.failing.write.add('index-a').add('index-b');
+        }
+        else if (fault === 'pack')
+        {
+            disk.failing.flush.add('pack-0');
+        }
+        assert.equal(keeper.close(), fault === 'none', fault);
+        assert.deepEqual(reader.with('texels', body=>[...body]), [...bodyOf(2 * KIB, 3)], fault);
+        assert.equal(reader.look('first'), null, `${fault}: named, so the next run's`);
+        assert.equal(keeper.figures().lostAtClose, 0);
+        if (fault === 'none')
+        {
+            assert.equal(reader.look('only'), null, 'named, so the next run\'s');
+            continue;
+        }
+        assert.deepEqual(reader.with('only', body=>[...body]), [...bodyOf(12 * KIB, 2)], fault);
+        step(1000);
+        assert.equal(reader.look('only'), 'hot', `${fault}: memory's for good`);
+    }
+    // Memory full of only copies that stay: the one brought back has no room.
+    const disk = crashDisk();
+    const { reader, keeper, step } = await cacheOf({ disk, budget: 128 * KIB });
+    reader.put('only', bodyOf(60 * KIB, 4), { onlyCopy: true });
+    step(150);
+    for (const name of ['h1', 'h2'])
+    {
+        assert.equal(reader.put(name, bodyOf(60 * KIB, 5), { onlyCopy: true, disk: 'never' }), true);
+    }
+    disk.failing.write.add('index-a').add('index-b');
+    assert.equal(keeper.close(), false);
+    assert.equal(reader.look('only'), null);
+    assert.equal(keeper.figures().lostAtClose, 1);
+});

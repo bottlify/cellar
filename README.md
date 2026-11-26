@@ -157,7 +157,10 @@ pack used longest ago: what can be made again there goes, so newer bodies take i
 none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the keeper
 goes on: a thread not told of a segment is never placed in it. After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
-good), a cold one is the next run's, on the disk, and no body of this run any more.
+good), a cold one is the next run's, on the disk, and no body of this run any more. A cold only
+copy no whole save names where it lies (the save failed, or it is a body for this run) is brought
+back into memory first, room made from what can be made again; one memory has no room for is
+counted (`lostAtClose`).
 `budget` is a finite number of bytes; `segmentBytes` a power of two from 4 KiB to 1 GiB;
 `packBytes` under 2 GiB; a body's length a whole number of bytes. The idle spans (`coldAfterMs`,
 `goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's
