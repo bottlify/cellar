@@ -432,7 +432,10 @@ the writer's own thread. Writing a record and reading it back make nothing on th
   when the keeper opens.
 - `Atomics.waitAsync` for waits on the event loop (`waitForAsync`, `call`, `serveAsync`,
   `writeWaitingAsync`); where there is none they look again every millisecond.
-- The disk (OPFS synchronous handles, in a worker) is optional.
+- The disk (OPFS synchronous handles, in a worker) is optional, and one keeper's: nothing in the
+  keeper guards a directory against a second keeper, which would write over the first one's packs
+  and index. OPFS's synchronous handles lock their files, so a second keeper there fails to open;
+  over a disk without such locks the program keeps to one keeper a directory.
 
 ## Develop
 
