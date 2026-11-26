@@ -42,7 +42,7 @@ worker.onmessage = ({ data })=>{
 
 Do not retain the scratch view beyond the callback. The next read reuses it; a nested read gets a view of its own. A longer record can require a larger scratch allocation, invalidating an older view. Normal writes and reads reuse scratch storage.
 
-`oldest()` and `written()` bound candidate sequences; bytes may be overwritten before a reader reaches them. Counts use unsigned 32-bit wrapping arithmetic, including after 2^32 records. The `first` memory option starts the sequence at a specified value. `shared: false` uses an ArrayBuffer for readers on the writer's own thread.
+`oldest()` and `written()` bound candidate sequences; bytes may be overwritten before a reader reaches them. Counts use unsigned 32-bit wrapping arithmetic, including after 2^32 records and after 2^32 bytes: the journal marks where the count of bytes last wrapped, so a record whose bytes were written over is reported absent even when the writer has since written whole multiples of 4 GiB and the index still names it. The `first` memory option starts the sequence at a specified value. `shared: false` uses an ArrayBuffer for readers on the writer's own thread.
 
 ## Memory ordering
 

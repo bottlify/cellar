@@ -47,8 +47,9 @@
  *
  * Counts are of bytes ever written and records ever committed, in 32-bit
  * words that wrap, compared by their unsigned difference: exact as long as no
- * reader falls 2^31 records behind, and no read lasts while the writer writes
- * 4 GiB. The buffer's size is a power of two, so a count of bytes maps to the
+ * reader falls 2^31 records behind. Where the count of bytes wrapped is marked
+ * too (`EPOCH`), so an entry of the index that outlived its record's bytes by
+ * 4 GiB is not taken for it. The buffer's size is a power of two, so a count of bytes maps to the
  * same place on either side of a wrap; so is the index's length, for the
  * count of records.
  *
@@ -71,14 +72,31 @@ const WRITTEN = 5;
  * from then on, though the count of records wraps back to small numbers.
  */
 const FULL = 6;
-const CONTROL_WORDS = 8;
+/**
+ * The sequence of the first record that starts since the count of bytes last
+ * wrapped at 2^32, and the one of the wrap before (the first sequence until
+ * there was one). The index keeps where a record starts by the count's low 32
+ * bits, and an entry outlives its bytes when few records are many bytes: past
+ * 4 GiB the count comes back round to where a record began, and the distance
+ * from it reads small again while a later record lies there. A record that
+ * starts before the last wrap is still there only if it starts after the
+ * count now, and only if it starts after the wrap before that. Stored before
+ * the count of bytes that wrapped, the earlier wrap's first, and loaded after
+ * a reader loads the count, this wrap's first: a reader that sees the count
+ * past a wrap sees both.
+ */
+const EPOCH = 7;
+const PRIOR = 8;
+const CONTROL_WORDS = 16;
 const CONTROL_BYTES = CONTROL_WORDS * 4;
 /** The word of bytes ever written, for a test that starts a journal near a wrap of it. */
 export const HEAD_WORD = HEAD;
+/** The marks of the count of bytes' wraps, for tests of the order of accesses. */
+export const EPOCH_WORDS = [EPOCH, PRIOR];
 /** The word of records ever committed, for a test that starts a journal near a wrap of it. */
 export const WRITTEN_WORD = WRITTEN;
 
-const LAYOUT = 2;
+const LAYOUT = 3;
 
 /** A record's header: its length, then its sequence; its bytes after. */
 const HEADER = 8;
@@ -175,6 +193,8 @@ export function createJournalMemory({ records = 4096, bytes = 1 << 20, first = 0
     control[RECORDS] = records;
     control[BYTES] = size;
     control[FIRST] = first | 0;
+    control[EPOCH] = first | 0;
+    control[PRIOR] = first | 0;
     return { buffer };
 }
 
@@ -198,6 +218,8 @@ class Journal {
     #head;
     #count;
     #full;
+    /** The first sequence that starts since the count of bytes wrapped (`EPOCH`). */
+    #epoch;
     /** The length of the record drafted and not committed, or -1. */
     #drafted = -1;
     /** The writer's draft, and the same bytes as words to copy. */
@@ -253,6 +275,7 @@ class Journal {
             throw new Error('journal: the memory is not a journal of this layout');
         }
         this.#head = Atomics.load(words, HEAD) >>> 0;
+        this.#epoch = Atomics.load(words, EPOCH) >>> 0;
         this.#count = Atomics.load(words, WRITTEN) >>> 0;
         this.#full = Atomics.load(words, FULL) !== 0;
     }
@@ -313,8 +336,18 @@ class Journal {
             // where each record starts, so no reader looks for a marker.
             start = (start + (capacity - at)) >>> 0;
         }
-        this.#head = (start + need) >>> 0;
+        const sequence = (this.#firstSequence + this.#count) >>> 0;
+        const head = (start + need) >>> 0;
         const words = this.#words;
+        if (start < this.#head || head < start)
+        {
+            // The count of bytes wraps: at this record's start where the
+            // skipped tail took it past 2^32, else after its end (`EPOCH`).
+            Atomics.store(words, PRIOR, this.#epoch | 0);
+            this.#epoch = (start < this.#head ? sequence : sequence + 1) >>> 0;
+            Atomics.store(words, EPOCH, this.#epoch | 0);
+        }
+        this.#head = head;
         // Moved before a word is written over: a reader checks its copy
         // against it after, and the check is honest only if it covers them.
         // Loaded again before the first of them: the pair holds the plain
@@ -324,7 +357,6 @@ class Journal {
         {
             Atomics.load(words, HEAD);
         }
-        const sequence = (this.#firstSequence + this.#count) >>> 0;
         const place = this.#base + ((start & this.#mask) >> 2);
         words[place] = length;
         words[place + 1] = sequence | 0;
@@ -439,7 +471,20 @@ class Journal {
         {
             Atomics.store(this.#ownWord, 0, 0);
         }
-        return ((Atomics.load(words, HEAD) - start) >>> 0) <= this.capacity ? length : -1;
+        const head = Atomics.load(words, HEAD) >>> 0;
+        if (((head - start) >>> 0) > this.capacity)
+        {
+            return -1;
+        }
+        // After the count: a count past a wrap is seen with its marks. A
+        // record that starts before the last wrap is there while it starts
+        // after the count, if no wrap came between (`EPOCH`).
+        if (((sequence - Atomics.load(words, EPOCH)) | 0) < 0
+            && (start <= head || ((sequence - Atomics.load(words, PRIOR)) | 0) < 0))
+        {
+            return -1;
+        }
+        return length;
     }
 
     /**

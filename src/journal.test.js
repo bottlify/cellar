@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { HEAD_WORD, WRITTEN_WORD, createJournalMemory, openJournal } from './journal.js';
+import { EPOCH_WORDS, HEAD_WORD, WRITTEN_WORD, createJournalMemory, openJournal } from './journal.js';
 
 /** @param {number} seed */
 function random(seed){
@@ -264,9 +264,12 @@ test('the writer moves the count of bytes and loads it again before a word of a 
             assert.equal(got?.length, length, `read ${n}: answered`);
             const expected = Uint8Array.from({ length }, (_, at)=>(n * 7 + at + 1) & 0xff ^ 0x5a);
             assert.deepEqual(got, expected, `read ${n}: copied whole before its own word was stored`);
-            const last = log.slice(-2).map(entry=>[entry.op, entry.journal, entry.journal ? entry.index : -1]);
+            const own = log.findIndex(entry=>entry.op === 'store' && !entry.journal);
+            const last = log.slice(own, own + 2).map(entry=>[entry.op, entry.journal, entry.journal ? entry.index : -1]);
             assert.deepEqual(last, [['store', false, -1], ['load', true, HEAD_WORD]],
-                `read ${n}: its own word stored, then the count of bytes loaded, last`);
+                `read ${n}: its own word stored, then the count of bytes loaded`);
+            assert.ok(log.slice(own + 2).every(entry=>entry.op === 'load' && EPOCH_WORDS.includes(entry.index)),
+                `read ${n}: after them, only the marks of the count's wraps`);
         }
     }
     finally
@@ -348,10 +351,29 @@ test('sequences and the count of bytes wrap at 2^32 and read as a journal that j
     assert.equal(journal.oldest(), (0xffffff00 + 1000 - 16) >>> 0);
 });
 
+test('a record the skipped tail of the buffer takes past 2^32 bytes is read, and the one before it',
+    ()=>{
+    const memory = createJournalMemory({ records: 16, bytes: 64, shared: false });
+    // 8 bytes short of 2^32, 8 short of the buffer's end: a record of 16
+    // starts the buffer again, and its start is the first past the wrap.
+    new Int32Array(memory.buffer)[HEAD_WORD] = -24;
+    const journal = openJournal(memory);
+    const before = put(journal, Uint8Array.of(1));
+    const after = put(journal, Uint8Array.of(2));
+    assert.deepEqual([journal.read(before, copy), journal.read(after, copy)],
+        [Uint8Array.of(1), Uint8Array.of(2)]);
+});
+
 test('past 2^32 records committed, the records just before the count wrapped are found', ()=>{
     const memory = createJournalMemory({ records: 4096, bytes: 1 << 16, shared: false });
-    // The state of a journal that committed 2^32 - 3 records.
-    new Int32Array(memory.buffer)[WRITTEN_WORD] = -3;
+    // The state of a journal that committed 2^32 - 3 records, its count of
+    // bytes last wrapped at the next.
+    const words = new Int32Array(memory.buffer);
+    words[WRITTEN_WORD] = -3;
+    for (const word of EPOCH_WORDS)
+    {
+        words[word] = -3;
+    }
     const journal = openJournal(memory);
     /** @type {number[]} */
     const sequences = [];
@@ -403,6 +425,64 @@ test('a sequence before the first, or not committed yet, is no record', ()=>{
     const empty = openJournal(createJournalMemory({ records: 4, bytes: 64, first: 1 }));
     assert.equal(empty.read(0, ()=>'handed'), undefined, 'a header never written is no record');
     assert.equal(empty.oldest(), 1);
+});
+
+test('a record whose bytes the count of bytes wrapped past is gone, though the index still names it',
+    ()=>{
+        // Few records, 4 GiB of bytes: record 1's index entry is never
+        // reused, while the count of bytes comes back round to where record 1
+        // began. The bytes there now are a later record's, made to look like
+        // record 1's header; the read must say record 1 is gone.
+        const capacity = 1 << 20;
+        const journal = openJournal(createJournalMemory({ records: 8192, bytes: capacity,
+            shared: false }));
+        journal.draft(8).setUint32(0, 100, true);
+        journal.commit();
+        journal.draft(8).setUint32(0, 123, true);
+        const sequence = journal.commit();
+        const read = ()=>journal.read(sequence, view=>view.getUint32(0, true));
+        assert.equal(read(), 123);
+        for (let n = 0; n < 4095; n++)
+        {
+            const draft = journal.draft(capacity - 8);
+            // At record 1's place, past this record's own header: a header
+            // naming record 1 and its value.
+            draft.setUint32(8, 8, true);
+            draft.setUint32(12, sequence, true);
+            draft.setUint32(16, 999, true);
+            journal.commit();
+        }
+        assert.equal(read(), undefined, 'written over');
+        journal.draft(8).setUint32(0, 777, true);
+        journal.commit();
+        assert.equal(read(), undefined, 'and still gone once the count of bytes is back round');
+        assert.equal(journal.read(journal.written() - 1, view=>view.getUint32(0, true)), 777,
+            'the newest record read as it was');
+    });
+
+test('a record that starts before the wrap of the count of bytes before last is gone, though '
+    + 'it starts just past the count', ()=>{
+    // Record 0 starts 16 bytes short of 2^32 and ends on it; 4 GiB later the
+    // count is round again, 16 bytes past where record 0 began, the record
+    // ending there made to look like record 0 at its place. By the bytes
+    // alone it starts after the count, as a record of the last wrap would.
+    const capacity = 1 << 20;
+    const memory = createJournalMemory({ records: 8192, bytes: capacity, shared: false });
+    new Int32Array(memory.buffer)[HEAD_WORD] = -16;
+    const journal = openJournal(memory);
+    journal.draft(8).setUint32(0, 123, true);
+    const sequence = journal.commit();
+    const read = ()=>journal.read(sequence, view=>view.getUint32(0, true));
+    assert.equal(read(), 123);
+    for (let n = 0; n < 4096; n++)
+    {
+        const draft = journal.draft(capacity - 8);
+        draft.setUint32(capacity - 24, 8, true);
+        draft.setUint32(capacity - 20, sequence, true);
+        draft.setUint32(capacity - 16, 999, true);
+        journal.commit();
+    }
+    assert.equal(read(), undefined, 'two wraps ago');
 });
 
 test('a read inside take copies into a view of its own: the outer read\'s copy stays whole', ()=>{
