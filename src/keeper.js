@@ -1485,7 +1485,11 @@ export async function openKeeper(options){
             {
                 listed.push(readyPack.number);
             }
-            const bytes = writer.finish({ kind: asBase ? BASE : DELTA, generation: generation + 1,
+            // Spent though the write fails: a chunk the disk took without a
+            // flush may be read all the same, and a later one of the same
+            // generation would tie with it, the next run taking either.
+            generation++;
+            const bytes = writer.finish({ kind: asBase ? BASE : DELTA, generation,
                 nextPack: nextPackNumber, packs: listed });
             const slot = slots[target];
             try
@@ -1505,11 +1509,12 @@ export async function openKeeper(options){
                 // A delta cut short may have left a torn tail: the next save
                 // writes a base into the other file. A base that failed leaves
                 // the next one to this file again, so the whole one is never
-                // the one written over.
+                // the one written over. The file may hold what it held or what
+                // was written: the packs either names an only copy in stay.
                 basesOwed = Math.max(basesOwed, 1);
+                slot.onlyCopies = new Set([...slot.onlyCopies, ...onlyCopies]);
                 return false;
             }
-            generation++;
             counts.saved++;
             counts.savedBytes += bytes.length;
             slot.onlyCopies = onlyCopies;

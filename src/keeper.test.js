@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createBuddy, UNIT } from './buddy.js';
 import { openKeeper } from './keeper.js';
 import { createReader } from './reader.js';
-import { memoryDisk } from './disk.fixture.js';
+import { crashDisk, memoryDisk } from './disk.fixture.js';
 import { readIndexFile } from './index-file.js';
 import { COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, viewIndex } from './shared.js';
@@ -1546,4 +1546,35 @@ test('what a saved index names is read without a keeper as a keeper opening it r
     assert.equal(readSaved(after)?.bodies.has('n6'), false, 'torn: the index before it');
     assert.equal(readSaved([null, null]), null);
     keeper.close();
+});
+
+/**
+ * The bodies a run after this one finds, read by a keeper over `files` and
+ * closed: each name's body as an array, or null where it has none.
+ *
+ * @param {Map<string, Uint8Array>} files @param {string[]} names @param {object} [options]
+ */
+async function nextRunReads(files, names, options = {}){
+    const run = await cacheOf({ disk: crashDisk(files), ...options });
+    const out = names.map(name=>run.reader.with(name, body=>[...body], { wait: true }) ?? null);
+    run.keeper.close();
+    return out;
+}
+
+test('a save whose index the disk took but did not flush spends its generation: the save after it'
+    + ' is the newer one', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper } = await cacheOf({ disk });
+    reader.put('a', bodyOf(5000, 1), { onlyCopy: true });
+    assert.equal(keeper.save(), true);
+    assert.equal(keeper.save(), true, 'a base into each file');
+    reader.put('b', bodyOf(5000, 2), { onlyCopy: true });
+    // A delta written whole, its flush refused: the bytes are on the disk all the same.
+    disk.failing.flush.add('index-a').add('index-b');
+    assert.equal(keeper.save(), false);
+    disk.failing.flush.clear();
+    reader.put('c', bodyOf(5000, 3), { onlyCopy: true });
+    assert.equal(keeper.close(), true);
+    assert.deepEqual(await nextRunReads(disk.current(), ['a', 'b', 'c']),
+        [[...bodyOf(5000, 1)], [...bodyOf(5000, 2)], [...bodyOf(5000, 3)]]);
 });
