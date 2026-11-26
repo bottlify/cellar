@@ -88,6 +88,8 @@ A refused Keeper reservation leaves the previous body as it was. A granted one r
 
 A reservation expires after `abandonAfterMs` (five minutes by default) and the next sweep reclaims it. A late `commit` or `put` returns false; a stale placement handed back to a Reader is refused. **A writer must stop using its view before expiry**: continued writing can corrupt another body's reused space. Raise the timeout for work that legitimately takes longer.
 
+An idle hot body goes by the Keeper's `coldAfterMs`: to the disk, or away when it has nowhere to go. `idle: 'stay'` on `reserve` or `put` keeps such a body hot however long it is idle; it leaves only when its room is wanted, as the least recently used. That suits a body read again long after it was written (a translator's function, at a relink). The policy is the run's: a body read back from an earlier run's disk goes by the idle rule.
+
 KeeperCalls must carry the whole placement `{ id, segment, offset, mark }`. The mark identifies the particular reservation. The `known` option limits placement and promotion to segments the Reader has heard of.
 
 ## Disk policies

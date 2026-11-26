@@ -391,6 +391,26 @@ test('a full cache walks its records once for many reserves, and a body read sin
         `${keeper.figures().oldestListed - listed} walks for 100 reserves of 16 bodies`);
 });
 
+test('a body put to stay when idle stays hot past coldAfterMs, and leaves for room as any other', async()=>{
+    // A body read again only long after it was written (a translator's
+    // function, at a relink): the keeper's idle rule would take exactly
+    // those. With no disk an idle body goes away, so the two differ at once.
+    const { keeper, reader, step } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
+    assert.equal(reader.put('stays', bodyOf(UNIT, 1), { idle: 'stay' }), true);
+    assert.equal(reader.put('goes', bodyOf(UNIT, 2)), true);
+    step(200);
+    assert.equal(reader.look('goes'), null, 'idle past coldAfterMs, with no disk: gone');
+    assert.equal(reader.look('stays'), 'hot', 'idle as long, and still there');
+    // Fifteen more fill the sixteen blocks: room for the last is made from it.
+    for (let i = 0; i < 16; i++)
+    {
+        assert.equal(reader.put(`n${i}`, bodyOf(UNIT, 10 + i)), true, `n${i}`);
+    }
+    assert.equal(reader.look('stays'), null, 'the least recently used, it left for room');
+    await assert.rejects(async()=>keeper.reserve('x', UNIT, { idle: /** @type {any} */ ('maybe') }),
+        RangeError);
+});
+
 test('a cache nothing in can leave walks its records once a tick for reserves it refuses, not once each',
     async()=>{
     const { keeper, reader, step } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });

@@ -79,6 +79,12 @@ export const F_DROP = 4;
 export const F_THIS_RUN = 8;
 /** Never written to the disk (`disk: 'never'`). */
 export const F_NO_DISK = 16;
+/**
+ * Idle, it stays hot: it leaves only when its room is wanted (`idle: 'stay'`),
+ * for a body read again long after it was written. This run's alone: a saved
+ * index keeps no more of a body's flags than `F_ONLY_COPY`.
+ */
+export const F_FOR_ROOM = 32;
 
 /** No body: never had one, or dropped; or a record no name leads to any more. */
 export const GONE = 0;

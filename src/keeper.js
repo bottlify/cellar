@@ -34,7 +34,7 @@
 import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
-    COLD, F_DROP, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
+    COLD, F_DROP, F_FOR_ROOM, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
     CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_NAMES, H_TICK, MAX_RECORDS,
     MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
@@ -1654,15 +1654,21 @@ export async function openKeeper(options){
          * once it has written.
          *
          * @param {string} name @param {number} length
-         * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, known?: number }} [options]
+         * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, idle?: 'go' | 'stay',
+         *     known?: number }} [options]
          * @returns {import('./reader.js').Place | null}
          */
-        reserve(name, length, { onlyCopy = false, disk: policy = 'kept', known = Infinity } = {}){
+        reserve(name, length, { onlyCopy = false, disk: policy = 'kept', idle = 'go',
+            known = Infinity } = {}){
             checkName(name);
             const policyFlags = POLICY_FLAGS[policy];
             if (policyFlags === undefined)
             {
                 throw new RangeError(`cache: a disk policy of ${String(policy)}`);
+            }
+            if (idle !== 'go' && idle !== 'stay')
+            {
+                throw new RangeError(`cache: an idle policy of ${String(idle)}`);
             }
             if (!Number.isInteger(length))
             {
@@ -1732,7 +1738,8 @@ export async function openKeeper(options){
                 id = fresh;
             }
             forgetDisk(id);
-            set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags);
+            set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags
+                | (idle === 'stay' ? F_FOR_ROOM : 0));
             store(id, MOVING);
             placeBody(id, found);
             set(id, R_LENGTH, length);
@@ -1904,6 +1911,7 @@ export async function openKeeper(options){
                     drop(id);
                 }
                 else if (state === HOT && readersOf(word) === 0
+                    && (get(id, R_FLAGS) & F_FOR_ROOM) === 0
                     && age(at, get(id, R_TICK)) >= coldAfterMs)
                 {
                     cool(id);

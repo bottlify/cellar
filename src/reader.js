@@ -41,7 +41,8 @@ import { bytesOf } from './bytes.js';
  *
  * @typedef {Object} KeeperCalls
  * @property {(name: string, length: number, options: { onlyCopy: boolean,
- *     disk?: import('./keeper.js').DiskPolicy, known: number }) => Place | null} reserve
+ *     disk?: import('./keeper.js').DiskPolicy, idle?: 'go' | 'stay', known: number })
+ *     => Place | null} reserve
  * @property {(name: string, options: { known: number }) => boolean} raise
  *     `known`: the segments this reader has; a body placed past them could not be read here
  * @property {(name: string) => void} raiseLater
@@ -353,16 +354,19 @@ export function createReader({ shared, segments = [], keeper }){
          * Room for `name`'s body: a view to write it into, or null where the
          * keeper has none. The body is not seen by anyone until `commit`.
          *
-         * `disk` says where the body may go on the disk (`DiskPolicy`).
+         * `disk` says where the body may go on the disk (`DiskPolicy`); `idle`
+         * whether an idle body goes by the keeper's idle rule (`'go'`) or stays
+         * until its room is wanted (`'stay'`).
          *
          * @param {string} name @param {number} length
-         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy }} [options]
+         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
+         *     idle?: 'go' | 'stay' }} [options]
          */
-        reserve(name, length, { onlyCopy = false, disk = 'kept' } = {}){
+        reserve(name, length, { onlyCopy = false, disk = 'kept', idle = 'go' } = {}){
             checkName(name);
             // A second reserve of a name not committed yet replaces the first.
             self.abandon(name);
-            const place = keeper.reserve(name, length, { onlyCopy, disk, known: heard });
+            const place = keeper.reserve(name, length, { onlyCopy, disk, idle, known: heard });
             const view = place === null ? null : views[place.segment];
             if (place !== null)
             {
@@ -428,7 +432,8 @@ export function createReader({ shared, segments = [], keeper }){
          * room, or the commit came too late.
          *
          * @param {string} name @param {Uint8Array} bytes
-         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy }} [options]
+         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
+         *     idle?: 'go' | 'stay' }} [options]
          */
         put(name, bytes, options){
             checkName(name);
