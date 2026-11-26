@@ -266,6 +266,19 @@ export async function openKeeper(options){
      * @type {Set<number>}
      */
     const changed = new Set();
+    /**
+     * Record `id`'s entry is owed to the next save: noted only where there is
+     * a disk to save to, so a keeper of memory alone, or one closed, keeps
+     * nothing for a save that never comes.
+     *
+     * @param {number} id
+     */
+    const owe = id=>{
+        if (disk !== null)
+        {
+            changed.add(id);
+        }
+    };
     /** The packs whose file may be on the disk are not the ones the last save listed. */
     let packsChanged = false;
     /** Closed: no file is opened any more. */
@@ -463,7 +476,7 @@ export async function openKeeper(options){
         }
         // The name leads to the new record: its entry is said by that one.
         changed.delete(old);
-        changed.add(id);
+        owe(id);
         counts.replaced++;
         return id;
     };
@@ -1122,7 +1135,7 @@ export async function openKeeper(options){
         set(id, R_PACK_OFFSET, at);
         set(id, R_FLAGS, get(id, R_FLAGS) | F_ON_DISK);
         addLive(pack, length);
-        changed.add(id);
+        owe(id);
         counts.written++;
         counts.writtenBytes += length;
         return true;
@@ -1141,7 +1154,7 @@ export async function openKeeper(options){
             addLive(get(id, R_PACK), -get(id, R_LENGTH));
             if (named)
             {
-                changed.add(id);
+                owe(id);
             }
         }
         set(id, R_FLAGS, get(id, R_FLAGS) & ~F_ON_DISK);
@@ -1474,7 +1487,7 @@ export async function openKeeper(options){
             addLive(pack, length);
             set(id, R_PACK, pack);
             set(id, R_PACK_OFFSET, at);
-            changed.add(id);
+            owe(id);
             counts.compactedBytes += length;
             if (flags & F_ONLY_COPY)
             {
@@ -2260,8 +2273,13 @@ export async function openKeeper(options){
             packs.clear();
             live.clear();
             filled.clear();
+            durable.clear();
+            changed.clear();
             slots.length = 0;
             readyPack = null;
+            // A body as large as the largest moved between packs: no pack is
+            // emptied any more.
+            carry = new Uint8Array(0);
             return whole;
         },
 
