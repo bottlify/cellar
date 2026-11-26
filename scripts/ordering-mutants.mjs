@@ -14,9 +14,10 @@
  *
  *   node scripts/ordering-mutants.mjs
  *
- * The reader's side must be killed: without it the copy's loads may come
- * after the check (measured on an M4 Pro, docs/journal.md). The writer's
- * side alone is reported, not required: no run so far has needed it.
+ * The journal without its bracket must be killed. One side alone is
+ * reported, not required: which side a machine tears without depends on the
+ * machine (docs/journal.md: Linux ARM64 tore without the writer's side and
+ * not without the reader's; a Chrome copy on an M4 Pro the other way round).
  */
 
 import { spawnSync } from 'node:child_process';
@@ -30,8 +31,8 @@ const mustMeasure = process.env.CELLAR_EXPECT_REORDERING === '1';
 const READER = '            Atomics.store(this.#ownWord, 0, 0);\n';
 const WRITER = '            Atomics.load(words, HEAD);\n';
 const mutants = [
-    { name: 'no reader side', cut: [READER], required: true },
     { name: 'no bracket', cut: [READER, WRITER], required: true },
+    { name: 'no reader side', cut: [READER], required: false },
     { name: 'no writer side', cut: [WRITER], required: false },
 ];
 

@@ -63,6 +63,17 @@ Measured on ARM64, 2026-11-26: Apple M4 Pro (8 performance and 4 efficiency core
 
 Without the bracket, plain copies tear on this processor. With it on both sides, none did. The bracket on the writer alone does not hold. The torn copies hold words newer than the sequence the reader checked: the reader's plain loads were satisfied after its second load of the sequence. The reader's side is what closes that, and it gave 0 in 5,483,084 copies, where the unbracketed rate predicts about 4,150. The writer's side guards the store order the reader relies on. It is kept although these runs did not need it. On x86 every arm gave 0, so x86 cannot tell the arms apart.
 
-The contract is held by a gate, not by this table. [`src/ordering.itest.js`](../src/ordering.itest.js) races the journal's writer against two readers, and fails on any torn record it is handed. It then runs a control with no atomics and a copy with no bracket. A machine that tears neither cannot show that the bracket is what holds the journal, and there the second test says "not measured". [`scripts/ordering-mutants.mjs`](../scripts/ordering-mutants.mjs) (`npm run test:ordering`) takes the bracket out of the journal, on the reader's side and on both. It requires the first test to fail on each. CI runs both on ARM64 (Linux and macOS) with `CELLAR_EXPECT_REORDERING=1`, where "not measured" fails the job.
+The journal itself, under the gate below, on CI's runners with Node 22, 2026-11-26 (one run each, 3 s a mutant, one writer and two readers):
+
+| Journal | macOS ARM64 (`macos-latest`) torn / read | Linux ARM64 (`ubuntu-24.04-arm`) torn / read |
+| --- | --- | --- |
+| as it is | 0 | 0 |
+| no bracket | 3,303 / 17,378,006 | 184,957 / 1,723,701 |
+| no reader's side | 0 / 16,653,583 | 0 / 8,084,708 |
+| no writer's side | 0 / 12,753,600 | 233 / 114,205 |
+
+The journal tears without its bracket on both machines. Which side alone a machine needs differs: the Linux runner needed the writer's, the Chrome copy on the M4 Pro the reader's. So the contract is both sides.
+
+The contract is held by a gate, not by these tables. [`src/ordering.itest.js`](../src/ordering.itest.js) races the journal's writer against two readers, and fails on any torn record it is handed. It then runs a control with no atomics and a copy with no bracket. A machine that tears neither cannot show that the bracket is what holds the journal, and there the second test says "not measured". [`scripts/ordering-mutants.mjs`](../scripts/ordering-mutants.mjs) (`npm run test:ordering`) takes the bracket out of the journal: both sides, and each side alone. It requires the first test to fail without the bracket and reports each side alone, which machines answer differently. CI runs both on ARM64 (Linux and macOS) with `CELLAR_EXPECT_REORDERING=1`, where "not measured" fails the job.
 
 See the source comments in [`src/journal.js`](../src/journal.js) and the [benchmark notes](benchmarks.md#journal).
