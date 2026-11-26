@@ -1,7 +1,8 @@
 name: ci
 
 # Every push to main: the checks, the build, and, for a version no release
-# carries yet, a release with the built files.
+# carries yet, a release with the built files; then, for a version npm does
+# not have yet, the package published to npm.
 on:
   push:
     branches: [main]
@@ -69,3 +70,32 @@ jobs:
           gh release create "$version" --target "$GITHUB_SHA" --title "Cellar $version" \
             --notes "Built from $GITHUB_SHA." \
             dist/cellar.js dist/cellar.min.js dist/checksums.json cellar-types.tar.gz
+
+  # Only once every check above passed on main: npm's trusted publisher for
+  # this workflow (OIDC, no token kept here), with provenance. A version npm
+  # has already is left as it is: a version is published once, and a rerun
+  # publishes nothing.
+  publish:
+    needs: check-and-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing takes npm 11.5.1 or later.
+      - run: npm install -g npm@^11.5.1
+      - run: npm ci
+      - name: Publish the version if npm does not have it
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "@bottlify/cellar@$version" version --registry https://registry.npmjs.org | grep -qx "$version"; then
+            echo "$version is on npm already"
+            exit 0
+          fi
+          npm publish
