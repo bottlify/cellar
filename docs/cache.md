@@ -28,7 +28,7 @@ const decoder = new TextDecoder();
     for (;;)
     {
         await server.serveAsync(request=>{
-            const { op, name, length, options } = JSON.parse(decoder.decode(request));
+            const { op, name, length, options } = JSON.parse(decoder.decode(request.slice())); // a browser decodes no shared view
             const answer = op === 'reserve' ? keeper.reserve(name, length, options)
                 : op === 'raise' ? keeper.raise(name, options) : keeper.drop(name);
             return encoder.encode(JSON.stringify(answer));
