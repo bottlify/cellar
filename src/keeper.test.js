@@ -7,10 +7,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBuddy, UNIT } from './buddy.js';
-import { openKeeper } from './keeper.js';
+import { INDEX_FILES, openKeeper, readSaved } from './keeper.js';
 import { createReader } from './reader.js';
 import { crashDisk, memoryDisk } from './disk.fixture.js';
-import { readIndexFile } from './index-file.js';
+import { BASE, chunkWriter, readIndexFile } from './index-file.js';
 import { COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, viewIndex } from './shared.js';
 
@@ -1228,9 +1228,11 @@ test('a save of what changed leaves the index a base would: seeded runs of write
         keeper.close();
         // A pack let go of is removed behind a promise, as on OPFS.
         await new Promise(resolve=>setTimeout(resolve, 0));
-        const listed = savedIndex(disk.files).packs;
-        assert.deepEqual([...disk.files.keys()].filter(file=>file.startsWith('pack-')).sort(),
-            listed.map(number=>`pack-${number}`).sort(), 'no pack on the disk the index does not list');
+        const listed = savedIndex(disk.files).packs.map(number=>`pack-${number}`);
+        for (const file of [...disk.files.keys()].filter(name=>name.startsWith('pack-')))
+        {
+            assert.ok(listed.includes(file), `seed ${seed}: ${file} on the disk, not listed`);
+        }
         const again = await cacheOf({ disk, packBytes: 48 * KIB });
         for (const [name] of left)
         {
@@ -1385,8 +1387,9 @@ test('a keeper opening an index lets go of the packs no body of it is in: what t
     assert.ok('pack-0' in packFiles(disk.files), 'its bodies were this run\'s to the end');
     const second = await cacheOf({ disk, packBytes: 64 * KIB });
     await settle();
-    assert.equal(second.keeper.figures().packsRemoved, 1);
-    assert.ok(!('pack-0' in packFiles(disk.files)));
+    assert.equal(second.keeper.figures().packsRemoved, 2, 'pack-0, and pack-2 opened ahead at the close');
+    assert.deepEqual(Object.keys(packFiles(disk.files)), ['pack-1', 'pack-3'],
+        'the block\'s, and the one this run opened ahead');
     assert.equal(second.reader.look('texels0'), null);
     assert.deepEqual(second.reader.with('block', body=>[...body], { wait: true }),
         [...bodyOf(10 * KIB, 9)]);
@@ -1791,4 +1794,164 @@ test('compaction passes over a pack it has emptied that an index still names an 
     }
     assert.ok(compacted[1] >= 3 * 6 * KIB, `${compacted[1]} bytes moved`);
     assert.equal(compacted[0], compacted[1], 'as much moved with the emptied pack still named');
+});
+
+/** The pack files of `files`, and the packs the index they hold lists. @param {Map<string, Uint8Array>} files */
+const packsOf = files=>({
+    files: [...files.keys()].filter(name=>name.startsWith('pack-')).sort(),
+    listed: (readSaved(INDEX_FILES.map(name=>files.get(name) ?? null))?.packs ?? [])
+        .map(number=>`pack-${number}`).sort(),
+});
+
+/**
+ * A run whose `pack-0` is compacted out of, `pack-1` in use: the next save
+ * lets `pack-0` go.
+ *
+ * @param {ReturnType<typeof crashDisk>} disk
+ */
+async function packLetGo(disk){
+    const cache = await cacheOf({ disk, packBytes: 64 * KIB });
+    for (let i = 0; i < 6; i++)
+    {
+        cache.reader.put(`a${i}`, bodyOf(10 * KIB, i));
+    }
+    cache.step(150);
+    await settle();
+    cache.keeper.save();
+    cache.keeper.save();
+    cache.reader.put('b', bodyOf(10 * KIB, 9));
+    cache.step(150);
+    await settle();
+    for (let i = 0; i < 5; i++)
+    {
+        cache.reader.drop(`a${i}`);
+    }
+    cache.step(1);
+    assert.equal(cache.keeper.figures().compactedBytes, 10 * KIB);
+    return cache;
+}
+
+test('a pack is listed until its file is gone: a crash before the removal a save started, a removal'
+    + ' the disk failed, a cut not flushed, a pack opening during a save leave no file no index lists',
+    async()=>{
+    /**
+     * Every pack file on the disk is listed, and so it is after a run over it.
+     *
+     * @param {Map<string, Uint8Array>} files @param {string} what
+     */
+    const noneLeft = async(files, what)=>{
+        const { files: on, listed } = packsOf(files);
+        assert.deepEqual(on.filter(file=>!listed.includes(file)), [], `${what}: on the disk, not listed`);
+        const disk = crashDisk(files);
+        const run = await cacheOf({ disk, packBytes: 64 * KIB });
+        await settle();
+        run.keeper.close();
+        await settle();
+        const after = packsOf(disk.current());
+        assert.deepEqual(after.files.filter(file=>!after.listed.includes(file)), [], `${what}: after a run`);
+        return after.files;
+    };
+
+    // A crash after the save that let pack-0 go, before its removal ran.
+    const crashed = crashDisk();
+    const a = await packLetGo(crashed);
+    a.keeper.save();
+    const left = crashed.crash(()=>true);
+    assert.ok(left.has('pack-0'), 'the removal had not run');
+    assert.ok(!(await noneLeft(left, 'crash before the removal')).includes('pack-0'));
+
+    // A removal the disk failed: listed by the close after it.
+    const failing = crashDisk();
+    const b = await packLetGo(failing);
+    failing.failing.remove.add('pack-0');
+    b.keeper.save();
+    await settle();
+    assert.ok(b.keeper.figures().diskFailures > 0);
+    b.keeper.close();
+    await settle();
+    assert.ok(!(await noneLeft(failing.current(), 'removal failed')).includes('pack-0'));
+
+    // A disk that cuts rather than removes: the cut is flushed before the file is left.
+    const cutting = crashDisk(new Map(), { remove: false });
+    const c = await packLetGo(cutting);
+    c.keeper.save();
+    assert.equal(cutting.crash().get('pack-0')?.length, 0, 'cut, and the cut on the disk');
+    c.keeper.close();
+
+    // A save while the next pack opens: it is listed, so a body written there after, and a crash
+    // before the next save, leave no file no index lists.
+    const base = crashDisk();
+    /** @type {(() => void) | null} */
+    let release = null;
+    const slow = { remove: base.remove, async open(/** @type {string} */ name){
+        const file = await base.open(name);
+        if (name === 'pack-1')
+        {
+            await new Promise(resolve=>{
+                release = ()=>resolve(undefined);
+            });
+        }
+        return file;
+    } };
+    const d = await cacheOf({ disk: slow, packBytes: 16 * KIB });
+    d.reader.put('a', bodyOf(12 * KIB, 1));
+    d.step(150);
+    await settle();
+    assert.ok(release !== null, 'pack-1 opening');
+    assert.equal(d.keeper.save(), true);
+    /** @type {() => void} */ (release)();
+    await settle();
+    d.reader.put('b', bodyOf(12 * KIB, 2));
+    d.step(150);
+    assert.equal(d.reader.look('b'), 'cold', 'in pack-1, flushed by the sweep');
+    const opened = base.crash();
+    assert.ok((opened.get('pack-1')?.length ?? 0) > 0);
+    assert.ok(!(await noneLeft(opened, 'opening during a save')).includes('pack-1'));
+});
+
+/**
+ * An index base of `entries`, each [name, pack, length] at the pack's start.
+ *
+ * @param {number} generation @param {number} nextPack @param {number[]} packs
+ * @param {[string, number, number][]} entries
+ */
+function baseOf(generation, nextPack, packs, entries){
+    const writer = chunkWriter();
+    for (const [name, pack, length] of entries)
+    {
+        writer.entry(pack, 0, length, 0, Uint16Array.from(name, unit=>unit.charCodeAt(0)), 0, name.length);
+    }
+    return writer.finish({ kind: BASE, generation, nextPack, packs });
+}
+
+test('pack numbers are given from past the highest either index file names, not from the count the'
+    + ' run before reached: a disk whose count reached what a run reads still takes bodies', async()=>{
+    const full = crashDisk(new Map([['index-a', baseOf(5, 1 << 20, [], [])]]));
+    const run = await cacheOf({ disk: full });
+    run.reader.put('only', bodyOf(4000, 1), { onlyCopy: true });
+    run.reader.put('block', bodyOf(4000, 2));
+    run.step(150);
+    await settle();
+    assert.deepEqual([run.reader.look('only'), run.reader.look('block')], ['cold', 'cold']);
+    assert.equal(run.keeper.close(), true);
+    assert.deepEqual(await nextRunReads(full.current(), ['only', 'block']),
+        [[...bodyOf(4000, 1)], [...bodyOf(4000, 2)]]);
+
+    // The older file names pack-7, the newer pack-2: neither number is given again.
+    const disk = crashDisk(new Map([
+        ['index-a', baseOf(3, 8, [7], [['x', 7, 100]])], ['pack-7', bodyOf(100, 3)],
+        ['index-b', baseOf(4, 5, [2], [['y', 2, 100]])], ['pack-2', bodyOf(100, 4)],
+    ]));
+    const later = await cacheOf({ disk });
+    assert.deepEqual(later.reader.with('y', body=>[...body], { wait: true }), [...bodyOf(100, 4)]);
+    assert.deepEqual(packsOf(disk.current()).files, ['pack-2', 'pack-7', 'pack-8'], 'pack-8 opened ahead');
+    later.keeper.close();
+
+    // A file a crash left before any index listed it: its number given again, what it held cut.
+    const left = crashDisk(new Map([['pack-0', bodyOf(50 * KIB, 5)]]));
+    const again = await cacheOf({ disk: left });
+    again.reader.put('a', bodyOf(4000, 6));
+    again.step(150);
+    again.keeper.close();
+    assert.equal(left.current().get('pack-0')?.length, 4000);
 });

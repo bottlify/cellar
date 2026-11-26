@@ -206,12 +206,22 @@ export async function openKeeper(options){
      *     emptySince: number } | null)[]} */
     const segments = [];
     /**
-     * The packs on the disk by number, `pack-<number>`. A number is never
-     * given twice: the index of a run before may still name a pack let go.
+     * The packs on the disk by number, `pack-<number>`. A number is not given
+     * twice in a run, nor one either index file names: a run after a torn
+     * save may still read a pack let go of.
      *
      * @type {Map<number, DiskFile>}
      */
     const packs = new Map();
+    /**
+     * Packs let go of whose file may still be on the disk: removed behind a
+     * promise not kept yet, or the disk failed to remove or cut it. Every
+     * save lists them, so that a run reading the index lets go of what this
+     * one could not, and no file is left that no index lists.
+     *
+     * @type {Set<number>}
+     */
+    const going = new Set();
     /** Bytes each pack's file holds as far as this run knows, and of them bodies a record leads to. */
     /** @type {Map<number, number>} */
     const filled = new Map();
@@ -224,6 +234,8 @@ export async function openKeeper(options){
     let packTop = 0;
     /** The next pack, opened ahead: opening a file may not be synchronous. @type {Promise<DiskFile> | null} */
     let nextPack = null;
+    /** Its number while it opens, -1 for none: listed, since its file may be made already. */
+    let opening = -1;
     /** @type {{ number: number, file: DiskFile } | null} */
     let readyPack = null;
     /** The disk refused a write since the last sweep: room is made on it then. */
@@ -235,7 +247,7 @@ export async function openKeeper(options){
      * @type {Set<number>}
      */
     const changed = new Set();
-    /** The packs on the disk are not the ones the last save listed. */
+    /** The packs whose file may be on the disk are not the ones the last save listed. */
     let packsChanged = false;
     /** Closed: no file is opened any more. */
     let closed = false;
@@ -601,29 +613,44 @@ export async function openKeeper(options){
             && nextPackNumber < MAX_PACKS)
         {
             const number = nextPackNumber++;
-            const opening = disk;
+            const opener = disk;
+            opening = number;
+            packsChanged = true;
             // A disk that throws at once fails the same way as one whose
             // promise does: counted, and the body that wanted it stays.
-            nextPack = Promise.resolve().then(()=>opening.open(packFile(number)))
+            nextPack = Promise.resolve().then(()=>opener.open(packFile(number)))
                 .then(file=>{
                     nextPack = null;
+                    opening = -1;
                     // Opened after the keeper closed: let go of here, once, and
-                    // removed where the disk can, since no index lists it.
+                    // removed where the disk can; the last index lists it, for
+                    // the next run to let go of where this one did not.
                     if (closed)
                     {
                         closeFile(file);
-                        Promise.resolve().then(()=>opening.remove?.(packFile(number)))
+                        Promise.resolve().then(()=>opener.remove?.(packFile(number)))
                             .catch(()=>{
                                 counts.diskFailures++;
                             });
                         return file;
                     }
+                    try
+                    {
+                        // A number no index names may still be a file a run
+                        // left behind (a crash before it was listed): what it
+                        // held is no one's.
+                        file.truncate(0);
+                    }
+                    catch {
+                        counts.diskFailures++;
+                    }
                     readyPack = { number, file };
-                    packsChanged = true;
                     return file;
                 }, e=>{
                     counts.diskFailures++;
                     nextPack = null;
+                    opening = -1;
+                    packsChanged = true;
                     throw e;
                 });
             nextPack.catch(()=>{});
@@ -659,7 +686,6 @@ export async function openKeeper(options){
             live.set(pack, 0);
             packTop = 0;
             readyPack = null;
-            packsChanged = true;
             openNextPack();
         }
         const file = /** @type {DiskFile} */ (packs.get(pack));
@@ -740,14 +766,15 @@ export async function openKeeper(options){
 
     /**
      * Lets go of pack `number`, which no record leads to and no index on the
-     * disk names an only copy in: removed where the disk can, else cut to
-     * nothing. A disk that fails is counted, the file left.
+     * disk names an only copy in: removed where the disk can (opened or not),
+     * else cut to nothing and flushed. It stays `going`, listed, until that
+     * is done; a disk that fails is counted, the file left to the next run.
      *
      * @param {number} number
      */
     const removePack = number=>{
-        const file = /** @type {DiskFile} */ (packs.get(number));
-        const opening = disk;
+        const file = packs.get(number);
+        const remover = disk;
         packs.delete(number);
         live.delete(number);
         counts.reclaimedBytes += filled.get(number) ?? 0;
@@ -756,23 +783,35 @@ export async function openKeeper(options){
         {
             pack = -1;
         }
-        packsChanged = true;
         counts.packsRemoved++;
-        if (opening?.remove === undefined)
+        going.add(number);
+        /** The file is gone, or holds nothing: the next save need not list it. */
+        const gone = ()=>{
+            going.delete(number);
+            packsChanged = true;
+        };
+        if (remover?.remove === undefined)
         {
+            const cut = /** @type {DiskFile} */ (file);
             try
             {
-                file.truncate(0);
+                // Flushed: a cut a crash undid would leave the bytes in a file no index lists.
+                cut.truncate(0);
+                cut.flush();
+                gone();
             }
             catch {
                 counts.diskFailures++;
             }
-            closeFile(file);
+            closeFile(cut);
             return;
         }
         // A handle open on a file keeps it on OPFS: closed first.
-        closeFile(file);
-        Promise.resolve().then(()=>opening.remove?.(packFile(number))).catch(()=>{
+        if (file !== undefined)
+        {
+            closeFile(file);
+        }
+        Promise.resolve().then(()=>remover.remove?.(packFile(number))).then(gone, ()=>{
             counts.diskFailures++;
         });
     };
@@ -1153,6 +1192,16 @@ export async function openKeeper(options){
         const read = slots.map((slot, at)=>readIndex(slot.file, INDEX_FILES[at]));
         read.forEach((state, at)=>{
             slots[at].onlyCopies = state?.onlyCopies ?? new Set();
+            // Numbers given from past the highest either file names, not from
+            // the count the run before reached: a pack let go of gives its
+            // number back, so the numbers a run reads never run out.
+            /** @param {number} number */
+            const named = number=>{
+                nextPackNumber = Math.max(nextPackNumber, number + 1);
+            };
+            state?.packs.forEach(named);
+            state?.onlyCopies.forEach(named);
+            state?.entries.forEach(entry=>named(entry.pack));
         });
         const chosen = newerIndex(read);
         const saved = read[chosen];
@@ -1163,10 +1212,19 @@ export async function openKeeper(options){
         current = chosen;
         slots[chosen].end = saved.end;
         generation = saved.generation;
-        nextPackNumber = saved.nextPack;
         counts.skippedEntries += saved.skipped;
+        /** @param {number} number */
+        const spokenFor = number=>slots.some(slot=>slot.onlyCopies.has(number));
+        const withBodies = new Set([...saved.entries.values()].map(entry=>entry.pack));
         for (const number of saved.packs)
         {
+            if (disk.remove !== undefined && !withBodies.has(number) && !spokenFor(number))
+            {
+                // A pack no body of the index is in (below) is removed by its
+                // name, unopened: opening makes a file the run before removed.
+                removePack(number);
+                continue;
+            }
             const file = await disk.open(packFile(number));
             packs.set(number, file);
             filled.set(number, file.getSize());
@@ -1208,7 +1266,7 @@ export async function openKeeper(options){
         // file, which a torn save leaves to the next run, names an only copy there.
         for (const number of [...packs.keys()])
         {
-            if (live.get(number) === 0 && !slots.some(slot=>slot.onlyCopies.has(number)))
+            if (live.get(number) === 0 && !spokenFor(number))
             {
                 removePack(number);
             }
@@ -1526,16 +1584,20 @@ export async function openKeeper(options){
                 }
             }
             // Packs no record leads to and neither file, once this one is
-            // written, names an only copy in: not listed, and let go of.
+            // written, names an only copy in: let go of after it.
             const other = slots[1 - target].onlyCopies;
             const leaving = [...packs.keys()].filter(number=>number !== pack
                 && live.get(number) === 0 && !onlyCopies.has(number) && !other.has(number));
-            // The pack opened ahead is listed too: a file on the disk no index
-            // lists would be no run's to let go of.
-            const listed = [...packs.keys()].filter(number=>!leaving.includes(number));
-            if (readyPack !== null)
+            // Listed: every pack whose file may be on the disk, those let go
+            // of until it is gone and the one still opening too; a file no
+            // index lists would be no run's to let go of.
+            const listed = [...packs.keys(), ...going];
+            for (const number of [readyPack?.number ?? -1, opening])
             {
-                listed.push(readyPack.number);
+                if (number >= 0)
+                {
+                    listed.push(number);
+                }
             }
             // Spent though the write fails: a chunk the disk took without a
             // flush may be read all the same, and a later one of the same
@@ -1585,12 +1647,12 @@ export async function openKeeper(options){
                 deltaBytes += bytes.length;
             }
             changed.clear();
+            // The packs as listed; one let go of at once is not listed any more.
+            packsChanged = false;
             for (const number of leaving)
             {
                 removePack(number);
             }
-            // The packs as listed: those let go of are not in the list.
-            packsChanged = false;
             return whole;
         },
 

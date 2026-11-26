@@ -152,7 +152,11 @@ has what is left written anew in the current pack (a hot body too, from memory, 
 on the disk stays named), and the save after lets the file go (removed
 where the disk has `remove`, else cut to nothing), unless an index file the next run may read still
 names an only copy there; a keeper opening an index lets go of the packs no body of it is in (what
-a run wrote with `disk: 'run'`). When the disk refuses a write, the next sweep makes room from the
+a run wrote with `disk: 'run'`). Every save lists each pack whose file may be on the disk, the one
+still opening and one let go of until its file is gone, so a crash before a removal, or a removal
+the disk failed, leaves the file to the next run to let go of, and none stays that no index lists.
+A pack's number is given from past the highest either index file names, so the numbers of packs let
+go of come back. When the disk refuses a write, the next sweep makes room from the
 pack used longest ago of those holding no only copy (one could not move while the disk refuses, and
 what went beside it would free nothing): what can be made again there goes, so newer bodies take
 its place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
