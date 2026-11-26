@@ -364,18 +364,17 @@ never makes its writer wait. Any number of threads read it, each by sequence, an
 falls behind finds the records the writer lapped gone, never torn.
 
 ```js
-// engine.worker.js - the writer: a record built where it will be read.
+// engine.worker.js - the writer: a record drafted, then copied in.
 import { createJournalMemory, openJournal } from '@bottlify/cellar';
 
 const memory = createJournalMemory({ records: 4096, bytes: 1 << 20 });
 postMessage({ journal: memory });                     // to whoever reads it
 const journal = openJournal(memory);
-const words = new DataView(journal.bytes.buffer);
 function note(level, value){
-    const at = journal.reserve(16);                   // eight-aligned, whole in the buffer
-    words.setUint32(at, level, true);
-    words.setFloat64(at + 8, value, true);
-    return journal.commit();                          // its sequence
+    const record = journal.draft(16);                 // a DataView of the writer's own memory
+    record.setUint32(0, level, true);
+    record.setFloat64(8, value, true);
+    return journal.commit();                          // copied into the journal; its sequence
 }
 ```
 
@@ -383,29 +382,43 @@ function note(level, value){
 // page.js - a reader, as late as it likes.
 import { openJournal } from '@bottlify/cellar';
 
+/** What a reader keeps of a record: handed a copy of its own, whole, and the length. */
+const valueOf = (record, _length)=>record.getFloat64(8, true);
+
 worker.onmessage = ({ data })=>{
     const journal = openJournal(data.journal);
-    const words = new DataView(journal.bytes.buffer);
     let next = journal.oldest();
     setInterval(()=>{
         for (const end = journal.written(); next !== end; next = (next + 1) >>> 0)
         {
-            // In place, inside the call: undefined if the writer reached it first.
-            const value = journal.read(next, (_bytes, at)=>words.getFloat64(at + 8, true));
+            const value = journal.read(next, valueOf);    // undefined if the writer reached it first
             if (value !== undefined) show(value);
         }
     }, 250);
 };
 ```
 
-`read(sequence, take)` hands `take` the buffer, the record's offset and length, and answers what
-`take` returns, or undefined when the record was not there: not written yet, lapped before the
-read, or reached by the writer while `take` read it (the writer moves its count of bytes before
-it writes one, and the read checks it after). So `take` decodes or copies what it keeps and keeps
-nothing of the view. `oldest()` and `written()` bound what can be asked for; `first` in the
-memory's options starts the count where a journal it takes over from ended. Counts wrap at 2^32
-and are compared by their difference. Over an `ArrayBuffer` (`shared: false`) the readers are on
-the writer's own thread. Writing a record and reading it back make nothing on the heap.
+`draft(length)` gives the writer a view of a record of its own memory, the first `length` bytes
+of which it fills; `commit()` copies them into the journal and answers the record's sequence.
+`read(sequence, take)` copies the record into the reader's own memory, checks the copy, and hands
+it to `take` as a `DataView` and its length, answering what `take` returns; or undefined when the
+record was not there: not written yet, or written over before the copy was whole (the writer
+moves its count of bytes before it writes a word, and the read checks it after its last). `take`
+is handed only a whole record, and keeps nothing of the view: the next read copies over it (a read
+inside `take` copies into a view of its own). Both copies go word by word through `Atomics`, which
+is what keeps the check honest on a processor that reorders plain loads and stores, arm64 among
+them; a plain access to the journal's memory, by either side, would not be ordered against it.
+A view the journal handed out stays its own until a longer record than any before needs a larger
+one; one kept past that fails where it is used. `oldest()` and `written()` bound what can be
+asked for; `first` in the memory's options starts the count where a journal it takes over from
+ended. Counts wrap at 2^32 and are compared by their difference, past 2^32 records too. Over an
+`ArrayBuffer` (`shared: false`) the readers are on the writer's own thread. Writing a record and
+reading it back make nothing on the heap.
+
+The copies are what a record costs: V8 runs each `Atomics` load or store as a call of its own
+(about 9 and 12 ns, x86), and a record takes one a word besides a few for the counts. A record of 16
+bytes takes about 125 ns to write and 95 ns to read, one of 8 bytes about 100 ns either way (node
+22 and node 26 alike, a 4-core x86 VM, 11 runs alternated, medians).
 
 ## Requirements
 
