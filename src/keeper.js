@@ -278,6 +278,7 @@ export async function openKeeper(options){
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
         segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
         reclaimedBytes: 0, evicted: 0, lostAtClose: 0, takenBack: 0, oldestListed: 0,
+        released: 0, releasedBytes: 0,
     };
 
     /**
@@ -1145,6 +1146,28 @@ export async function openKeeper(options){
     };
 
     /**
+     * Whether record `id`'s name begins with `prefix`, compared where the
+     * name lies.
+     *
+     * @param {number} id @param {string} prefix
+     */
+    const namedUnder = (id, prefix)=>{
+        const at = get(id, R_NAME);
+        if (get(id, R_NAME_LENGTH) < prefix.length)
+        {
+            return false;
+        }
+        for (let i = 0; i < prefix.length; i++)
+        {
+            if (names[at + i] !== prefix.charCodeAt(i))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    /**
      * Takes record `id`'s body away: false where it is read or written now,
      * and is marked to go once committed and no one reads it (`F_DROP`).
      *
@@ -1739,6 +1762,65 @@ export async function openKeeper(options){
             checkName(name);
             const id = index.find(name);
             return id < 0 || drop(id);
+        },
+
+        /**
+         * What is held under the names that begin with `prefix` - an owner's,
+         * when its names are its own (`texels/<root>/`): the bodies and their
+         * bytes, every record of such a name that is not gone counted, one a
+         * name was written anew over and is still read included.
+         *
+         * @param {string} prefix
+         * @returns {{ bodies: number, bytes: number }}
+         */
+        under(prefix){
+            checkName(prefix);
+            let bodies = 0;
+            let bytes = 0;
+            for (let id = 0; id < words[H_COUNT]; id++)
+            {
+                if (stateOf(stateWordOf(id)) !== GONE && namedUnder(id, prefix))
+                {
+                    bodies++;
+                    bytes += get(id, R_LENGTH);
+                }
+            }
+            return { bodies, bytes };
+        },
+
+        /**
+         * Lets go of every body under the names that begin with `prefix`, as
+         * an owner that goes takes what it held with it: what was there, and
+         * how many of those are still read or written (they go once no one
+         * reads them, as a `drop` of each would leave them).
+         *
+         * @param {string} prefix
+         * @returns {{ bodies: number, bytes: number, waiting: number }}
+         */
+        release(prefix){
+            checkName(prefix);
+            let bodies = 0;
+            let bytes = 0;
+            let waiting = 0;
+            for (let id = 0; id < words[H_COUNT]; id++)
+            {
+                const state = stateOf(stateWordOf(id));
+                if (state === GONE || !namedUnder(id, prefix))
+                {
+                    continue;
+                }
+                bodies++;
+                bytes += get(id, R_LENGTH);
+                // A name written anew is another record's now: its old body
+                // goes when its readers leave, by no drop.
+                if (state === RETIRED || state === RETIRED_WRITING || !drop(id))
+                {
+                    waiting++;
+                }
+            }
+            counts.released += bodies;
+            counts.releasedBytes += bytes;
+            return { bodies, bytes, waiting };
         },
 
         /**

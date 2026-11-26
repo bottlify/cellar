@@ -138,6 +138,10 @@ no body (in a pack the index does not list, of no bytes) left out as a keeper op
 for the next run; `'run'` there while cold, never named in the index, for a body that means
 nothing to the next run (texels a GPU was handed); `'never'` not at all, so an idle body that can
 be made again goes away and an only copy stays in memory.
+An owner whose names are its own (`texels/<root>/...`) is weighed and let go of by their prefix:
+`keeper.under(prefix)` says the bodies and bytes held under it, and `keeper.release(prefix)` lets
+go of all of them at once, only copies included, as the owner goes, answering what was there and
+how many are still read or written (those go once no one reads them, as a `drop` leaves them).
 
 A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`: the

@@ -502,3 +502,31 @@ test('a reservation let go of without a body is counted as its room goes back', 
     assert.ok(reader.reserve('blocks/2', 1000));
     assert.equal(keeper.figures().abandoned, 2);
 });
+
+test('an owner\'s names are let go together: what was under its prefix, and what is still read goes '
+    + 'once no one reads it; names of another prefix stay', async()=>{
+    const { keeper, reader } = await cacheOf();
+    for (const name of ['texels/1/a', 'texels/1/b', 'texels/10/a', 'texels/2/a', 'reads/x'])
+    {
+        assert.equal(reader.put(name, bodyOf(1000, name.length), { onlyCopy: true }), true, name);
+    }
+    // One being written, one being read, as the owner goes.
+    assert.ok(reader.reserve('texels/1/c', 500, { onlyCopy: true }));
+    assert.deepEqual(keeper.under('texels/1/'), { bodies: 3, bytes: 2500 });
+    let released = null;
+    reader.with('texels/1/a', ()=>{
+        released = keeper.release('texels/1/');
+    });
+    assert.deepEqual(released, { bodies: 3, bytes: 2500, waiting: 2 },
+        'the one read and the one written wait for their readers and writer');
+    assert.equal(reader.look('texels/1/b'), null, 'one no one held is gone at once');
+    assert.equal(reader.commit('texels/1/c'), true);
+    keeper.sweep();
+    assert.deepEqual(keeper.under('texels/1/'), { bodies: 0, bytes: 0 }, 'no tail once they are let go of');
+    for (const name of ['texels/10/a', 'texels/2/a', 'reads/x'])
+    {
+        assert.equal(reader.look(name), 'hot', `${name} is another owner's`);
+    }
+    assert.equal(keeper.figures().released, 3);
+    assert.throws(()=>keeper.release(/** @type {any} */ (7)), TypeError);
+});
