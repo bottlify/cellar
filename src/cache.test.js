@@ -234,6 +234,32 @@ test('a record given to another name between a reader\'s lookup and its entering
     assert.deepEqual(fresh.with('x', body=>[...body]), [...bodyOf(200, 2)]);
 });
 
+test('memory held is never taken back: written and read in place by its holder for as long as it '
+    + 'holds it, counted under its name, its room given back when it lets go', async()=>{
+    const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 10,
+        goneAfterMs: 20, budget: 4 * UNIT, segmentBytes: 4 * UNIT });
+    const held = reader.hold('sound/table', 2 * UNIT);
+    assert.ok(held, 'room for it');
+    held.set(bodyOf(2 * UNIT, 5));
+    step(5000);
+    assert.equal(keeper.figures().takenBack, 0, 'held five times abandonAfterMs');
+    held[0] = 77;
+    assert.equal(held[0], 77, 'still its holder\'s to write');
+    assert.deepEqual(keeper.under('sound/'), { bodies: 1, bytes: 2 * UNIT, hotBytes: 2 * UNIT,
+        placedBytes: 2 * UNIT }, 'counted where the run weighs its spaces');
+    assert.equal(reader.look('sound/table'), null, 'nothing anyone reads: memory, not a body');
+    // Room for others is made around it, never from it.
+    assert.equal(reader.put('a', bodyOf(2 * UNIT, 1)), true);
+    assert.equal(reader.put('b', bodyOf(2 * UNIT, 2)), true, 'a goes for b, the held memory stays');
+    assert.equal(reader.look('a'), null);
+    assert.equal(held[0], 77);
+    // Let go of, its room is the next body's.
+    reader.abandon('sound/table');
+    step(1);
+    assert.equal(reader.put('c', bodyOf(2 * UNIT, 3)), true, 'its room given back');
+    assert.deepEqual(keeper.under('sound/').bodies, 0);
+});
+
 test('a reservation never committed is taken back after abandonAfterMs, and its commit then fails',
     async()=>{
         const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,
