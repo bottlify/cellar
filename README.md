@@ -12,6 +12,8 @@ through the event loop for every exchange.
   they lie.
 - **Ring** - a bounded stream of records one way, read in place, a full ring refusing rather than
   overwriting.
+- **Journal** - records one thread writes and any number read, the newest kept and the oldest
+  written over: a log, a trace, the times frames were shown. The writer never waits.
 - **Bell** - one thread waits on a shared word, another wakes it, and only when it sleeps.
 - **Doorbell** - one wait for everything a thread is sent, whatever it came through.
 
@@ -338,6 +340,56 @@ one costs about what a post does on node 22 (node 26 pays a post in proportion t
 in the ring, a batch is copied by nobody and costs least on both. With four other threads busy on
 the same four cores, the waits that learn their spin take 64 KiB built in the ring from 43 to 34 us
 of processor time a batch.
+
+## Journal
+
+A ring hands every record to its one reader and makes the writer wait when it is full; a journal
+never makes its writer wait. Any number of threads read it, each by sequence, and a reader that
+falls behind finds the records the writer lapped gone, never torn.
+
+```js
+// engine.worker.js - the writer: a record built where it will be read.
+import { createJournalMemory, openJournal } from '@bottlify/cellar';
+
+const memory = createJournalMemory({ records: 4096, bytes: 1 << 20 });
+postMessage({ journal: memory });                     // to whoever reads it
+const journal = openJournal(memory);
+const words = new DataView(journal.bytes.buffer);
+function note(level, value){
+    const at = journal.reserve(16);                   // eight-aligned, whole in the buffer
+    words.setUint32(at, level, true);
+    words.setFloat64(at + 8, value, true);
+    return journal.commit();                          // its sequence
+}
+```
+
+```js
+// page.js - a reader, as late as it likes.
+import { openJournal } from '@bottlify/cellar';
+
+worker.onmessage = ({ data })=>{
+    const journal = openJournal(data.journal);
+    const words = new DataView(journal.bytes.buffer);
+    let next = journal.oldest();
+    setInterval(()=>{
+        for (const end = journal.written(); next !== end; next = (next + 1) >>> 0)
+        {
+            // In place, inside the call: undefined if the writer reached it first.
+            const value = journal.read(next, (_bytes, at)=>words.getFloat64(at + 8, true));
+            if (value !== undefined) show(value);
+        }
+    }, 250);
+};
+```
+
+`read(sequence, take)` hands `take` the buffer, the record's offset and length, and answers what
+`take` returns, or undefined when the record was not there: not written yet, lapped before the
+read, or reached by the writer while `take` read it (the writer moves its count of bytes before
+it writes one, and the read checks it after). So `take` decodes or copies what it keeps and keeps
+nothing of the view. `oldest()` and `written()` bound what can be asked for; `first` in the
+memory's options starts the count where a journal it takes over from ended. Counts wrap at 2^32
+and are compared by their difference. Over an `ArrayBuffer` (`shared: false`) the readers are on
+the writer's own thread. Writing a record and reading it back make nothing on the heap.
 
 ## Requirements
 
