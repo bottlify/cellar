@@ -11,8 +11,8 @@
  * them and lets segments go. No thread may read a body that is not its name's
  * or that changes while it is inside, nor a name's version older than one it
  * saw (`concurrency.worker.fixture.js`); the keeper's figures show the moves
- * happened and the table grew under them, so the gate cannot pass on a cache
- * that moved nothing. Once the threads are gone every name is dropped, and no
+ * happened, the table grew and records went back to be taken by other names
+ * under them, so the gate cannot pass on a cache that moved nothing. Once the threads are gone every name is dropped, and no
  * room may be left held: a body or a reservation the keeper lost track of.
  */
 
@@ -102,6 +102,8 @@ async function gate(options){
     assert.ok(sum('ownHits') > 1000, `owned names read ${sum('ownHits')}`);
     assert.ok(figures.replaced > 10, `written anew while read ${figures.replaced}`);
     assert.ok(figures.records > 512, `records ${figures.records}: the first table never grew`);
+    assert.ok(figures.records < figures.names + figures.replaced,
+        `records ${figures.records} for ${figures.names} names and ${figures.replaced} rewrites: none taken again`);
 
     // Every name dropped, the threads gone: nothing may stay placed.
     const names = [...Array.from({ length: POOL }, (_, i)=>`n${i}`),

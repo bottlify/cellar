@@ -10,52 +10,12 @@ import { createBuddy, UNIT } from './buddy.js';
 import { INDEX_FILES, openKeeper, readSaved } from './keeper.js';
 import { createReader } from './reader.js';
 import { crashDisk, memoryDisk } from './disk.fixture.js';
+import { bodyOf, cacheOf } from './cache.fixture.js';
 import { BASE, chunkWriter, readIndexFile } from './index-file.js';
 import { COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, hashName, viewIndex } from './shared.js';
 
 const KIB = 1024;
-
-/** A keeper and a reader in one thread, the clock stepped by hand. */
-async function cacheOf(options = {}){
-    let clock = 0;
-    /** @type {any[]} */
-    const said = [];
-    /** @type {import('./reader.js').Reader | null} */
-    let reader = null;
-    const keeper = await openKeeper({
-        budget: 256 * KIB, segmentBytes: 64 * KIB, coldAfterMs: 100, goneAfterMs: 1000,
-        releaseAfterMs: 50, now: ()=>clock,
-        announce: message=>{
-            said.push(message);
-            reader?.adopt(message);
-        },
-        ...options,
-    });
-    reader = createReader({
-        shared: keeper.shared, segments: keeper.segmentBuffers(),
-        keeper: {
-            reserve: (name, length, opts)=>keeper.reserve(name, length, opts),
-            raise: name=>keeper.raise(name),
-            raiseLater: name=>{
-                keeper.raise(name);
-            },
-            drop: name=>{
-                keeper.drop(name);
-            },
-        },
-    });
-    // The first pack opens behind a promise, as on OPFS.
-    await new Promise(resolve=>setTimeout(resolve, 0));
-    return {
-        keeper, reader, said,
-        /** @param {number} ms */
-        step(ms){
-            clock += ms;
-            keeper.sweep();
-        },
-    };
-}
 
 /**
  * The newer index file of a disk and what it says, as Cellar 0.9.0 wrote an
@@ -80,9 +40,6 @@ const json = saved=>new TextEncoder().encode(JSON.stringify(saved));
 
 /** Lets the promises of the disk settle: a pack opened ahead, a pack removed. */
 const settle = ()=>new Promise(resolve=>setTimeout(resolve, 0));
-
-/** @param {number} length @param {number} seed */
-const bodyOf = (length, seed)=>Uint8Array.from({ length }, (_, i)=>(i * 31 + seed) & 255);
 
 test('a buddy block given back joins its twin, and a segment emptied is one block again', ()=>{
     const buddy = createBuddy(64 * KIB);

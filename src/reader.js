@@ -12,16 +12,28 @@
  *
  * A body is read only inside `with`: the record counts the reader while the
  * callback runs, and the keeper takes no body a reader is in. A view kept past
- * the callback would see whatever the keeper put there next.
+ * the callback would see whatever the keeper put there next. The count is one
+ * word of the record, no thread's in particular: a thread terminated inside
+ * `with` stays counted, and the body stays hot and its room held for the run.
+ * Only the host knows a thread died, and a count taken back by time would
+ * take a body from a reader that was only slow.
  *
  * A segment reaches this thread by a message (`adopt`); a body in a segment
  * not adopted yet reads as a miss, which a cache may answer.
  */
 
 import {
-    COLD, GONE, HOT, R_LENGTH, R_OFFSET, R_SEGMENT, R_STATE, WRITING, stateWord, viewIndex,
+    COLD, GONE, HOT, MOVING, RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT,
+    R_STATE, WRITING, checkName, stateWord, viewIndex,
 } from './shared.js';
 import { bytesOf } from './bytes.js';
+
+/**
+ * Room the keeper granted: the record, where to write, and the reservation's
+ * mark, which `commit` names.
+ *
+ * @typedef {{ id: number, segment: number, offset: number, mark: number }} Place
+ */
 
 /**
  * What the reader asks the keeper: `reserve` and `raise` answer at once,
@@ -29,8 +41,7 @@ import { bytesOf } from './bytes.js';
  *
  * @typedef {Object} KeeperCalls
  * @property {(name: string, length: number, options: { onlyCopy: boolean,
- *     disk?: import('./keeper.js').DiskPolicy, known: number })
- *     => { id: number, segment: number, offset: number } | null} reserve
+ *     disk?: import('./keeper.js').DiskPolicy, known: number }) => Place | null} reserve
  * @property {(name: string, options: { known: number }) => boolean} raise
  *     `known`: the segments this reader has; a body placed past them could not be read here
  * @property {(name: string) => void} raiseLater
@@ -41,13 +52,24 @@ import { bytesOf } from './bytes.js';
 const DONE = 0;
 /** The body is cold: on the disk, not in a segment. */
 const NOT_HERE_COLD = 1;
-/** The body is in no state to be read (written, moved, retired). */
+/** The body is in no state to be read (written, retired, gone). */
 const NOT_HOT = 2;
 /** The body is in a segment this reader has not been told of yet. */
 const UNSEEN = 3;
+/** The keeper is moving the body: it is there, hot or cold once the move is over. */
+const MOVED_NOW = 4;
+/** The record is not the name's any more: it went back for another name. */
+const STALE = 5;
 
 /** Names a reader remembers the records of, at most: past it it forgets them all. */
 const KNOWN_MOST = 1 << 16;
+
+/**
+ * What a reader remembers of a name it found: its record, and where the name
+ * lies, which a record is checked against once inside.
+ *
+ * @typedef {{ id: number, nameAt: number }} Found
+ */
 
 /**
  * @param {Object} options
@@ -65,45 +87,41 @@ export function createReader({ shared, segments = [], keeper }){
      * leaves a gap, and nothing past the gap is counted.
      */
     let heard = views.length;
-    /** Reserved and not committed yet, by name. @type {Map<string, number>} */
+    /** Reserved and not committed yet, by name. @type {Map<string, Place>} */
     const writing = new Map();
     const counts = {
-        hits: 0, misses: 0, cold: 0, unseen: 0, raisedWaiting: 0, reserved: 0, refused: 0,
-        abandoned: 0,
+        hits: 0, misses: 0, cold: 0, moving: 0, unseen: 0, raisedWaiting: 0, reserved: 0,
+        refused: 0, abandoned: 0, late: 0,
     };
 
     /**
-     * Names this reader found, by their record. A record is never used again
-     * for another name: one still hot or cold is still its name's (a name
-     * written anew gets a new record, and the old one is retired at its
-     * commit), and any other state sends the name to the index again. Asked
-     * first, it spares a hit the hash and the walk over the shared index.
+     * Names this reader found (`Found`). Asked first, it spares a hit the
+     * hash and the walk over the shared index. A record no name leads to goes
+     * back to the keeper for another name, so what is remembered is checked
+     * once inside (`holds`): a record that is not the name's, or one the name
+     * left (neither hot, cold nor moving), sends the name to the index again.
      *
-     * @type {Map<string, number>}
+     * @type {Map<string, Found>}
      */
     const known = new Map();
 
-    /** @param {string} name @returns {number} its record, or -1 */
-    const idOf = name=>{
-        const id = known.get(name);
-        if (id !== undefined)
+    /**
+     * `name` looked up in the index and remembered, or undefined.
+     *
+     * @param {string} name @returns {Found | undefined}
+     */
+    const lookUp = name=>{
+        const id = index.find(name);
+        if (id < 0)
         {
-            const state = index.state(id);
-            if (state === HOT || state === COLD)
-            {
-                return id;
-            }
-            known.delete(name);
+            return undefined;
         }
-        const found = index.find(name);
-        if (found >= 0)
+        if (known.size >= KNOWN_MOST)
         {
-            if (known.size >= KNOWN_MOST)
-            {
-                known.clear();
-            }
-            known.set(name, found);
+            known.clear();
         }
+        const found = { id, nameAt: index.matched() };
+        known.set(name, found);
         return found;
     };
 
@@ -111,33 +129,101 @@ export function createReader({ shared, segments = [], keeper }){
     let readValue;
 
     /**
-     * Reads `name`'s body inside `read`, where it is hot here: DONE with the
-     * value in `readValue`, or why not. A hit makes no object of its own.
+     * Reads the body of the name `found`, `length` units long, inside `read`,
+     * where it is hot here: DONE with the value in `readValue`, or why not. A
+     * hit makes no object of its own.
      *
-     * @param {number} id @param {(body: Uint8Array) => any} read
-     * @returns {number} DONE, NOT_HERE_COLD, NOT_HOT or UNSEEN
+     * @param {Found} found @param {number} length @param {(body: Uint8Array) => any} read
+     * @returns {number} DONE, NOT_HERE_COLD, MOVED_NOW, NOT_HOT, UNSEEN or STALE
      */
-    const readHot = (id, read)=>{
+    const readHot = (found, length, read)=>{
+        const id = found.id;
         if (!index.enter(id))
         {
-            return index.state(id) === COLD ? NOT_HERE_COLD : NOT_HOT;
+            // The state first, then whose it is: a record taken for another
+            // name since had that name written before its state.
+            const state = index.state(id);
+            if (!index.holds(id, found.nameAt, length))
+            {
+                return STALE;
+            }
+            return state === COLD ? NOT_HERE_COLD : state === MOVING ? MOVED_NOW : NOT_HOT;
         }
         try
         {
+            if (!index.holds(id, found.nameAt, length))
+            {
+                return STALE;
+            }
+            const words = index.words;
             const base = index.at(id);
-            const view = views[index.words[base + R_SEGMENT]];
+            const view = views[words[base + R_SEGMENT]];
             if (view === undefined || view === null)
             {
                 return UNSEEN;
             }
-            const offset = index.words[base + R_OFFSET];
-            readValue = read(view.subarray(offset, offset + index.words[base + R_LENGTH]));
+            const offset = words[base + R_OFFSET];
+            readValue = read(view.subarray(offset, offset + words[base + R_LENGTH]));
             index.stamp(id);
             return DONE;
         }
         finally {
             index.leave(id);
         }
+    };
+
+    /**
+     * Where the name `found`, `length` units long, is: hot, cold (a body the
+     * keeper is moving counts as cold: there, but not read in place now), or
+     * undefined where the record says nothing of it any more.
+     *
+     * @param {Found} found @param {number} length
+     */
+    const whereIs = (found, length)=>{
+        const id = found.id;
+        const state = index.state(id);
+        if (!index.holds(id, found.nameAt, length))
+        {
+            return undefined;
+        }
+        return state === HOT ? 'hot' : state === COLD || state === MOVING ? 'cold' : undefined;
+    };
+
+    /**
+     * Whether `place` is still a reservation its writer may write into: the
+     * keeper takes back one held past `abandonAfterMs`, and its room may be
+     * another body's by now (a place granted ahead and handed over late).
+     *
+     * @param {Place} place
+     */
+    const stillReserved = place=>{
+        const word = Atomics.load(index.cover(place.id), index.at(place.id) + R_STATE);
+        return word === stateWord(WRITING, place.mark) || word === stateWord(RETIRED_WRITING, place.mark);
+    };
+
+    /**
+     * Ends the reservation `place` as `state` (HOT for a commit, GONE for an
+     * abandon): false where the keeper took it back, its writer too late. A
+     * reservation whose name was written anew meanwhile only lets its writer
+     * out: the newer write is the name's.
+     *
+     * @param {Place} place @param {number} state
+     */
+    const finish = (place, state)=>{
+        const words = index.cover(place.id);
+        const at = index.at(place.id) + R_STATE;
+        const mine = stateWord(WRITING, place.mark);
+        if (Atomics.compareExchange(words, at, mine, stateWord(state)) === mine)
+        {
+            return true;
+        }
+        const retired = stateWord(RETIRED_WRITING, place.mark);
+        if (Atomics.compareExchange(words, at, retired, stateWord(RETIRED)) === retired)
+        {
+            return true;
+        }
+        counts.late++;
+        return false;
     };
 
     const self = {
@@ -168,43 +254,73 @@ export function createReader({ shared, segments = [], keeper }){
         },
 
         /**
-         * Where `name`'s body is, without reading it.
+         * Where `name`'s body is, without reading it. A body the keeper is
+         * moving is cold here: there, but not to be read in place now.
          *
          * @param {string} name @returns {'hot' | 'cold' | null}
          */
         look(name){
-            const id = idOf(name);
-            if (id < 0)
+            checkName(name);
+            const remembered = known.get(name);
+            if (remembered !== undefined)
             {
-                return null;
+                const where = whereIs(remembered, name.length);
+                if (where !== undefined)
+                {
+                    return where;
+                }
+                known.delete(name);
             }
-            const state = index.state(id);
-            return state === HOT ? 'hot' : state === COLD ? 'cold' : null;
+            const found = lookUp(name);
+            return found === undefined ? null : whereIs(found, name.length) ?? null;
         },
 
         /**
          * Calls `read` with `name`'s body and answers what it returned; with
-         * `wait`, a cold body is brought back first. A miss answers
-         * `undefined` and, for a cold body without `wait`, asks for it to be
-         * brought back for later.
+         * `wait`, a cold body, or one the keeper is moving, is brought back or
+         * waited for first. A miss answers `undefined` and, for a cold or
+         * moving body without `wait`, asks for it to be brought back for later.
          *
          * @template T
          * @param {string} name @param {(body: Uint8Array) => T} read
          * @param {{ wait?: boolean }} [options]
          * @returns {T | undefined}
          */
-        with(name, read, { wait = false } = {}){
-            const id = idOf(name);
-            if (id < 0)
+        with(name, read, options){
+            checkName(name);
+            let found = known.get(name);
+            let got = NOT_HOT;
+            if (found !== undefined)
             {
-                counts.misses++;
-                return undefined;
+                got = readHot(found, name.length, read);
+                if (got === NOT_HOT || got === STALE)
+                {
+                    // Not the name's record any more, or a record the name
+                    // left: the index says which is its now.
+                    known.delete(name);
+                    found = undefined;
+                }
             }
-            let got = readHot(id, read);
-            if (got === NOT_HERE_COLD && wait && keeper.raise(name, { known: heard }))
+            if (found === undefined)
+            {
+                found = lookUp(name);
+                if (found === undefined)
+                {
+                    counts.misses++;
+                    return undefined;
+                }
+                got = readHot(found, name.length, read);
+            }
+            const wait = options !== undefined && options.wait;
+            // The keeper answers once whatever it was doing is done: a body it
+            // was moving is hot or cold by then, and a cold one brought back.
+            if ((got === NOT_HERE_COLD || got === MOVED_NOW) && wait
+                && keeper.raise(name, { known: heard }))
             {
                 counts.raisedWaiting++;
-                got = readHot(id, read);
+                known.delete(name);
+                found = lookUp(name);
+                got = found === undefined ? NOT_HOT : readHot(found, name.length, read);
             }
             if (got === DONE)
             {
@@ -214,9 +330,9 @@ export function createReader({ shared, segments = [], keeper }){
                 return value;
             }
             counts.misses++;
-            if (got === NOT_HERE_COLD)
+            if (got === NOT_HERE_COLD || got === MOVED_NOW)
             {
-                counts.cold++;
+                counts[got === NOT_HERE_COLD ? 'cold' : 'moving']++;
                 if (!wait)
                 {
                     keeper.raiseLater(name);
@@ -225,6 +341,10 @@ export function createReader({ shared, segments = [], keeper }){
             else if (got === UNSEEN)
             {
                 counts.unseen++;
+            }
+            else if (got === STALE)
+            {
+                known.delete(name);
             }
             return undefined;
         },
@@ -239,13 +359,14 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy }} [options]
          */
         reserve(name, length, { onlyCopy = false, disk = 'kept' } = {}){
+            checkName(name);
             // A second reserve of a name not committed yet replaces the first.
             self.abandon(name);
             const place = keeper.reserve(name, length, { onlyCopy, disk, known: heard });
             const view = place === null ? null : views[place.segment];
             if (place !== null)
             {
-                writing.set(name, place.id);
+                writing.set(name, place);
             }
             if (place === null || view === null || view === undefined)
             {
@@ -254,30 +375,33 @@ export function createReader({ shared, segments = [], keeper }){
                 counts.refused++;
                 return null;
             }
+            if (!stillReserved(place))
+            {
+                // Taken back before a byte was written: nothing to give back.
+                writing.delete(name);
+                counts.late++;
+                return null;
+            }
             counts.reserved++;
             return view.subarray(place.offset, place.offset + length);
         },
 
         /**
-         * Makes the body written into `reserve`'s view readable.
+         * Makes the body written into `reserve`'s view readable: false where
+         * it came too late, the keeper having taken the reservation back
+         * (`abandonAfterMs`), and the body is not readable.
          *
-         * @param {string} name
+         * @param {string} name @returns {boolean}
          */
         commit(name){
-            const id = writing.get(name);
-            if (id === undefined)
+            const place = writing.get(name);
+            if (place === undefined)
             {
                 throw new Error(`cache: ${name} was not reserved here`);
             }
             writing.delete(name);
-            index.stamp(id);
-            // Hot, the writer out; or, where the name was written anew meanwhile,
-            // only the writer out of a record retired under it.
-            if (Atomics.compareExchange(index.words, index.at(id) + R_STATE,
-                stateWord(WRITING, 1), stateWord(HOT)) !== stateWord(WRITING, 1))
-            {
-                index.leave(id);
-            }
+            index.stamp(place.id);
+            return finish(place, HOT);
         },
 
         /**
@@ -289,29 +413,25 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name
          */
         abandon(name){
-            const id = writing.get(name);
-            if (id === undefined)
+            const place = writing.get(name);
+            if (place === undefined)
             {
                 return;
             }
             writing.delete(name);
             counts.abandoned++;
-            // No body, the writer out; or only the writer out of a record
-            // retired under it.
-            if (Atomics.compareExchange(index.words, index.at(id) + R_STATE,
-                stateWord(WRITING, 1), stateWord(GONE)) !== stateWord(WRITING, 1))
-            {
-                index.leave(id);
-            }
+            finish(place, GONE);
         },
 
         /**
-         * `reserve`, a copy of `bytes`, `commit`: false where there was no room.
+         * `reserve`, a copy of `bytes`, `commit`: false where there was no
+         * room, or the commit came too late.
          *
          * @param {string} name @param {Uint8Array} bytes
          * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy }} [options]
          */
         put(name, bytes, options){
+            checkName(name);
             // The bytes as long as they are now, which is what is copied.
             const taken = bytesOf(bytes, 'cache');
             const into = self.reserve(name, taken.length, options);
@@ -327,12 +447,12 @@ export function createReader({ shared, segments = [], keeper }){
                 self.abandon(name);
                 throw e;
             }
-            self.commit(name);
-            return true;
+            return self.commit(name);
         },
 
         /** @param {string} name */
         drop(name){
+            checkName(name);
             keeper.drop(name);
         },
 

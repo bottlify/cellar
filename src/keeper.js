@@ -35,18 +35,19 @@ import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
-    H_COUNT, H_NAMES, H_TICK,
-    MOVING, RECORD_WORDS, RETIRED, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME, R_NAME_LENGTH,
-    R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING, growableShared,
-    growTo, sharedBuffer,
+    H_COUNT, H_NAMES, H_TICK, MAX_RECORDS,
+    MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
+    R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
+    checkName, growableShared, growTo, sharedBuffer,
     hashName, readersOf, stateOf, stateWord, viewIndex,
 } from './shared.js';
 
 const MIB = 1024 * 1024;
 
-/** Room the records and names reserve to grow into: address space only, touched as used. */
-const MAX_RECORDS = 1 << 20;
+/** Room the names reserve to grow into, as the records do: address space only, touched as used. */
 const MAX_NAME_UNITS = 1 << 25;
+/** The reservations' marks run from 1 to this, then round again (`WRITING`). */
+const MAX_MARK = 0xffffff;
 const FIRST_TABLE = 1024;
 /** Packs a run opens at most: 64 TiB of the default packs. */
 const MAX_PACKS = 1 << 20;
@@ -152,6 +153,8 @@ const REFUSED = -2;
  * @property {number} [coldAfterMs]  idle so long, a hot body goes to the disk
  * @property {number} [goneAfterMs]  idle so long, a cold body that can be made again goes
  * @property {number} [releaseAfterMs]  empty so long, a segment is let go
+ * @property {number} [abandonAfterMs]  reserved so long and not committed, a reservation is
+ *     taken back: its writer is taken for gone, its room given back, and its commit fails
  * @property {(message: { segment?: number, buffer?: SharedArrayBuffer | null,
  *     table?: SharedArrayBuffer }) => void} [announce]  sent to every thread reading:
  *     called on the keeper's thread in the middle of its work, it calls none of
@@ -166,13 +169,14 @@ export async function openKeeper(options){
     const {
         budget, segmentBytes = 16 * MIB, packBytes = 64 * MIB,
         coldAfterMs = 30_000, goneAfterMs = 7 * 24 * 3600_000, releaseAfterMs = 10_000,
-        announce = ()=>{}, now = ()=>performance.now(),
+        abandonAfterMs = 300_000, announce = ()=>{}, now = ()=>performance.now(),
     } = options;
     /** The disk, null once closed: from then on the keeper is memory's only. */
     let disk = options.disk ?? null;
     // Ages are told on a 32-bit clock that wraps (`age`): a span past half of
     // it would read as a fresh one.
-    for (const [name, ms] of Object.entries({ coldAfterMs, goneAfterMs, releaseAfterMs }))
+    for (const [name, ms] of Object.entries({ coldAfterMs, goneAfterMs, releaseAfterMs,
+        abandonAfterMs }))
     {
         if (!(ms >= 0 && ms < 2 ** 31))
         {
@@ -207,9 +211,17 @@ export async function openKeeper(options){
     let names = new Uint16Array(shared.names, 0, shared.names.byteLength / 2);
     const started = now();
 
-    /** @type {({ buffer: SharedArrayBuffer, bytes: Uint8Array, buddy: import('./buddy.js').Buddy,
-     *     emptySince: number } | null)[]} */
+    /**
+     * The segments by number, null for one let go: a number is never given
+     * twice, so a thread that has not heard a segment went still reads
+     * through its old view and never sees another body under that number.
+     *
+     * @type {({ buffer: SharedArrayBuffer, bytes: Uint8Array, buddy: import('./buddy.js').Buddy,
+     *     emptySince: number } | null)[]}
+     */
     const segments = [];
+    /** The numbers of the segments not let go, in order: what is placed in and counted. @type {number[]} */
+    const liveSegments = [];
     /**
      * The packs on the disk by number, `pack-<number>`. A number is not given
      * twice in a run, nor one either index file names: a run after a torn
@@ -263,7 +275,7 @@ export async function openKeeper(options){
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
         segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
-        reclaimedBytes: 0, evicted: 0, lostAtClose: 0,
+        reclaimedBytes: 0, evicted: 0, lostAtClose: 0, takenBack: 0, oldestListed: 0,
     };
 
     /**
@@ -324,20 +336,32 @@ export async function openKeeper(options){
     };
 
     /**
+     * Records no name leads to any more (retired, then left by their
+     * readers), kept for the next name or rewrite that needs one: a name
+     * written anew while read takes a record, and gives one back once read.
+     *
+     * @type {number[]}
+     */
+    const free = [];
+    /** Names in the table: what it is sized by (each name leads to one record). */
+    let named = 0;
+    /** The mark the next reservation takes (`WRITING`). */
+    let nextMark = 1;
+
+    /**
      * The record of `name`, made where there is none.
      *
      * @param {string} name
      */
     const recordOf = name=>{
-        const hash = hashName(name);
-        const known = index.find(name, hash);
+        const known = index.find(name);
         if (known >= 0)
         {
             return known;
         }
         const from = words[H_NAMES];
         // Room for its record first: a name written for none would be spent.
-        if (words[H_COUNT] >= MAX_RECORDS || from + name.length > MAX_NAME_UNITS)
+        if ((free.length === 0 && words[H_COUNT] >= MAX_RECORDS) || from + name.length > MAX_NAME_UNITS)
         {
             return -1;
         }
@@ -347,22 +371,21 @@ export async function openKeeper(options){
             names[from + i] = name.charCodeAt(i);
         }
         words[H_NAMES] = from + name.length;
-        const id = newRecord(hash[0], hash[1], from, name.length);
-        if (id >= 0)
-        {
-            insert(id, hash[0]);
-        }
+        const [a, b] = hashName(name);
+        const id = newRecord(a, b, from, name.length);
+        insert(id, a);
         return id;
     };
 
     /**
-     * A record of no body yet, at the end of the records, not in the table:
-     * its id, or -1 where the records are full.
+     * A record of no body yet, one given back or a new one at the end of the
+     * records, not in the table: its id, or -1 where the records are full.
      *
      * @param {number} a @param {number} b @param {number} nameAt @param {number} nameLength
      */
     const newRecord = (a, b, nameAt, nameLength)=>{
-        const id = words[H_COUNT];
+        const count = words[H_COUNT];
+        const id = free.length > 0 ? /** @type {number} */ (free.pop()) : count;
         if (id >= MAX_RECORDS)
         {
             return -1;
@@ -374,6 +397,8 @@ export async function openKeeper(options){
                 Math.max(bytesNeeded, shared.records.byteLength * 2)));
             words = new Int32Array(shared.records, 0, shared.records.byteLength / 4);
         }
+        // A record given back is gone: no one enters it while its name is
+        // written, and the state stored after says whose it is now.
         set(id, R_HASH_A, a);
         set(id, R_HASH_B, b);
         set(id, R_NAME, nameAt);
@@ -382,14 +407,17 @@ export async function openKeeper(options){
         set(id, R_PACK, -1);
         set(id, R_FLAGS, 0);
         store(id, GONE);
-        Atomics.store(words, H_COUNT, id + 1);
+        if (id === count)
+        {
+            Atomics.store(words, H_COUNT, id + 1);
+        }
         return id;
     };
 
     /**
      * The name of record `old` led to a new record from now on, its name
-     * shared; `old` retired, its readers left to finish. The new one's id, or
-     * -1 where the records are full.
+     * shared; `old` retired, its readers or its writer left to finish. The new
+     * one's id, or -1 where the records are full.
      *
      * @param {number} old
      */
@@ -412,8 +440,11 @@ export async function openKeeper(options){
         }
         for (;;)
         {
+            // A reservation keeps its mark for its writer's commit; a body read
+            // keeps its readers.
             const word = stateWordOf(old);
-            const retired = stateWord(RETIRED, readersOf(word));
+            const retired = stateOf(word) === WRITING ? stateWord(RETIRED_WRITING, readersOf(word))
+                : stateWord(RETIRED, readersOf(word));
             if (Atomics.compareExchange(words, index.at(old) + R_STATE, word, retired) === word)
             {
                 break;
@@ -426,10 +457,44 @@ export async function openKeeper(options){
         return id;
     };
 
+    /**
+     * Record `id`, retired and no one in it any more, now gone: its room
+     * given back and the record kept for another name (`free`).
+     *
+     * @param {number} id
+     */
+    const letGo = id=>{
+        if (get(id, R_SEGMENT) >= 0)
+        {
+            giveBack(id);
+        }
+        forgetDisk(id, false);
+        set(id, R_FLAGS, 0);
+        // No name leads to it: nothing of it is the saved index's.
+        changed.delete(id);
+        free.push(id);
+    };
+
+    /**
+     * Takes record `id` back where it is retired and no one is in it: true
+     * where it was, and is gone now (`letGo`).
+     *
+     * @param {number} id
+     */
+    const takeRetired = id=>{
+        const empty = stateWord(RETIRED);
+        if (Atomics.compareExchange(words, index.at(id) + R_STATE, empty, stateWord(GONE)) !== empty)
+        {
+            return false;
+        }
+        letGo(id);
+        return true;
+    };
+
     /** @param {number} id @param {number} first */
     const insert = (id, first)=>{
         let table = index.table();
-        if ((words[H_COUNT] + 1) * 2 > table.length)
+        if ((named + 1) * 2 > table.length)
         {
             const larger = sharedBuffer(table.length * 2 * 4);
             const into = new Int32Array(larger);
@@ -462,15 +527,14 @@ export async function openKeeper(options){
             slot = (slot + 1) & mask;
         }
         Atomics.store(table, slot, id + 1);
+        named++;
     };
 
     // --- segments -----------------------------------------------------------
 
-    const madeBytes = ()=>segments.reduce((sum, one)=>sum + (one ? one.bytes.length : 0), 0);
-
     /** A new segment, announced, or -1 past the budget. */
     const makeSegment = ()=>{
-        if (madeBytes() + segmentBytes > budget)
+        if ((liveSegments.length + 1) * segmentBytes > budget)
         {
             return -1;
         }
@@ -486,21 +550,29 @@ export async function openKeeper(options){
             counts.segmentFailures++;
             return -1;
         }
-        // A number is never given to a second buffer: a thread that has not
-        // heard a segment was let go still reads through its old view, and
-        // under the same number it would read another body.
         const at = segments.length;
-        segments.push(null);
-        segments[at] = { buffer, bytes: new Uint8Array(buffer), buddy: createBuddy(segmentBytes),
-            emptySince: tick() };
+        segments.push({ buffer, bytes: new Uint8Array(buffer), buddy: createBuddy(segmentBytes),
+            emptySince: tick() });
+        liveSegments.push(at);
         counts.segmentsMade++;
         tell({ segment: at, buffer });
         return at;
     };
 
+    /** @param {number} at */
+    const segmentAt = at=>/** @type {NonNullable<typeof segments[0]>} */ (segments[at]);
+
+    /**
+     * Whether a segment is made that a thread knowing the first `known` does
+     * not have.
+     *
+     * @param {number} known
+     */
+    const beyond = known=>liveSegments.length > 0 && liveSegments[liveSegments.length - 1] >= known;
+
     /** One segment no body is in, announced ahead of need, where the budget has room. */
     const keepSpare = ()=>{
-        if (!segments.some(one=>one !== null && one.buddy.empty()))
+        if (!liveSegments.some(at=>segmentAt(at).buddy.empty()))
         {
             makeSegment();
         }
@@ -512,14 +584,13 @@ export async function openKeeper(options){
      * @param {number} length @param {number} limit
      */
     const placeIn = (length, limit)=>{
-        for (let at = 0; at < Math.min(limit, segments.length); at++)
+        for (const at of liveSegments)
         {
-            const one = segments[at];
-            if (one === null)
+            if (at >= limit)
             {
-                continue;
+                break;
             }
-            const offset = one.buddy.place(length);
+            const offset = segmentAt(at).buddy.place(length);
             if (offset >= 0)
             {
                 return { segment: at, offset };
@@ -529,8 +600,114 @@ export async function openKeeper(options){
     };
 
     /**
+     * The hot bodies no one read, oldest first, as they were when listed, by
+     * key: the age's complement above, the id below (ids under 2^20, ages at
+     * most 2^31: exact in a double, and sorted as numbers). Each body's stamp
+     * then is beside it. Room is taken from the front, across reserves, and
+     * the list is made again only once used up: a full cache pays one walk
+     * over the records for many reserves, not one each. A body read since it
+     * was listed (its stamp moved) is not old any more and is passed over; one
+     * made hot since is newer than every one listed and waits for the next
+     * list.
+     */
+    let oldestKeys = new Float64Array(0);
+    let oldestTicks = new Int32Array(0);
+    let oldestCount = 0;
+    let oldestNext = 0;
+
+    const listOldest = ()=>{
+        const count = words[H_COUNT];
+        if (oldestKeys.length < count)
+        {
+            oldestKeys = new Float64Array(count);
+            oldestTicks = new Int32Array(count);
+        }
+        const at = tick();
+        let listed = 0;
+        for (let id = 0; id < count; id++)
+        {
+            const word = stateWordOf(id);
+            if (stateOf(word) === HOT && readersOf(word) === 0)
+            {
+                oldestKeys[listed++] = (2 ** 31 - age(at, get(id, R_TICK))) * MAX_RECORDS + id;
+            }
+        }
+        oldestKeys.subarray(0, listed).sort();
+        for (let i = 0; i < listed; i++)
+        {
+            oldestTicks[i] = get(oldestKeys[i] % MAX_RECORDS, R_TICK);
+        }
+        oldestCount = listed;
+        oldestNext = 0;
+        counts.oldestListed++;
+    };
+
+    /**
+     * The next listed body that may go for room below `limit`, -1 once the
+     * list is used up.
+     *
+     * @param {number} limit @param {number} spare  never this record
+     */
+    const nextOldest = (limit, spare)=>{
+        while (oldestNext < oldestCount)
+        {
+            const i = oldestNext++;
+            const id = oldestKeys[i] % MAX_RECORDS;
+            const word = stateWordOf(id);
+            if (stateOf(word) === HOT && readersOf(word) === 0 && get(id, R_TICK) === oldestTicks[i]
+                && id !== spare && get(id, R_SEGMENT) < limit)
+            {
+                return id;
+            }
+        }
+        return -1;
+    };
+
+    /**
+     * Whether the body in a block can leave it now: a reservation let go of,
+     * a record retired that no one is in, or a hot body no one reads that can
+     * go cold or away (an only copy only where it is on the disk, asked away,
+     * or the disk can take it).
+     *
+     * @param {number} id @param {number} spare  never this record
+     */
+    const canLeave = (id, spare)=>{
+        const word = stateWordOf(id);
+        const state = stateOf(word);
+        if (state === GONE || (state === RETIRED && readersOf(word) === 0))
+        {
+            return true;
+        }
+        if (state !== HOT || readersOf(word) !== 0 || id === spare)
+        {
+            return false;
+        }
+        const flags = get(id, R_FLAGS);
+        return (flags & F_ONLY_COPY) === 0 || (flags & (F_ON_DISK | F_DROP)) !== 0
+            || (disk !== null && (flags & F_NO_DISK) === 0);
+    };
+
+    /**
+     * Takes the body in a block out of it (`canLeave`): false where it stays.
+     *
+     * @param {number} id
+     */
+    const leave = id=>{
+        const state = stateOf(stateWordOf(id));
+        if (state === GONE)
+        {
+            giveBack(id);
+            return true;
+        }
+        return state === RETIRED ? takeRetired(id) : cool(id);
+    };
+
+    /**
      * Room for `length` bytes, the least recently used bodies made cold to
-     * find it.
+     * find it, but only where that forms a block for it: a body is taken out
+     * only with every other in the block of the size asked it lies in, and
+     * only where all of them can leave. A request no block can be formed for
+     * moves nothing.
      *
      * @param {number} length @param {number} limit  segments a writer has
      * @param {number} [spare]  the record the room is for, never cooled for it
@@ -550,35 +727,68 @@ export async function openKeeper(options){
                 return found;
             }
         }
-        for (const id of oldestHot(limit))
+        const block = blockOf(length);
+        /** Blocks found holding a body that cannot leave, by segment and offset: each looked at once. */
+        /** @type {Set<number> | null} */
+        let held = null;
+        for (let listed = false; ;)
         {
-            if (id === spare)
+            const id = nextOldest(limit, spare);
+            if (id < 0)
             {
+                if (listed)
+                {
+                    return null;
+                }
+                listOldest();
+                listed = true;
                 continue;
             }
-            cool(id);
+            if (blockOf(get(id, R_LENGTH)) >= block)
+            {
+                // Its own block holds the body.
+                if (!cool(id))
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                const segment = get(id, R_SEGMENT);
+                const from = get(id, R_OFFSET) & -block;
+                const key = segment * (segmentBytes / block) + from / block;
+                if (held?.has(key))
+                {
+                    continue;
+                }
+                const inside = segmentAt(segment).buddy.ownersWithin(from, block);
+                if (!inside.every(other=>canLeave(other, spare)))
+                {
+                    (held ??= new Set()).add(key);
+                    continue;
+                }
+                if (!inside.every(leave))
+                {
+                    continue;
+                }
+            }
             found = placeIn(length, limit);
             if (found !== null)
             {
                 return found;
             }
         }
-        return null;
     };
 
-    /** @param {number} limit  @returns {number[]} hot ids no one reads, oldest first */
-    const oldestHot = limit=>{
-        const ids = [];
-        for (let id = 0; id < words[H_COUNT]; id++)
-        {
-            const word = stateWordOf(id);
-            if (stateOf(word) === HOT && readersOf(word) === 0 && get(id, R_SEGMENT) < limit)
-            {
-                ids.push(id);
-            }
-        }
-        const at = tick();
-        return ids.sort((a, b)=>age(at, get(b, R_TICK)) - age(at, get(a, R_TICK)));
+    /**
+     * Record `id`'s body is at `found` from now on.
+     *
+     * @param {number} id @param {{ segment: number, offset: number }} found
+     */
+    const placeBody = (id, found)=>{
+        set(id, R_SEGMENT, found.segment);
+        set(id, R_OFFSET, found.offset);
+        segmentAt(found.segment).buddy.own(found.offset, id);
     };
 
     /** @param {number} segment @param {number} offset @param {number} length */
@@ -924,10 +1134,21 @@ export async function openKeeper(options){
         return true;
     };
 
-    /** @param {number} id */
+    /**
+     * Takes record `id`'s body away: false where it is read or written now,
+     * and is marked to go once committed and no one reads it (`F_DROP`).
+     *
+     * @param {number} id
+     */
     const drop = id=>{
         const word = stateWordOf(id);
         const state = stateOf(word);
+        if (state === WRITING)
+        {
+            // The body being written was made from what the drop says is old.
+            set(id, R_FLAGS, get(id, R_FLAGS) | F_DROP);
+            return false;
+        }
         if (state === HOT)
         {
             if (Atomics.compareExchange(words, index.at(id) + R_STATE, stateWord(HOT),
@@ -981,10 +1202,10 @@ export async function openKeeper(options){
         if (found === null)
         {
             store(id, COLD);
-            counts[segments.length > known ? 'refusedUnseen' : 'raiseFailed']++;
+            counts[beyond(known) ? 'refusedUnseen' : 'raiseFailed']++;
             return false;
         }
-        const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[found.segment]);
+        const one = segmentAt(found.segment);
         /** Bytes read, -1 where the disk threw. */
         let read = -1;
         try
@@ -1014,8 +1235,7 @@ export async function openKeeper(options){
             store(id, COLD);
             return false;
         }
-        set(id, R_SEGMENT, found.segment);
-        set(id, R_OFFSET, found.offset);
+        placeBody(id, found);
         set(id, R_TICK, Atomics.load(words, H_TICK));
         store(id, HOT);
         counts.raised++;
@@ -1377,18 +1597,21 @@ export async function openKeeper(options){
 
     const keeper = {
         shared,
-        /** Segments by index, for a thread joining later. */
+        /** Segments by number, null for one let go, for a thread joining later. */
         segmentBuffers: ()=>segments.map(one=>(one === null ? null : one.buffer)),
 
         /**
          * Room for `name`'s body of `length` bytes, in a segment below
-         * `known`: the record and where to write, or null with why counted.
-         * The writer stores the record hot (`commit`) once it has written.
+         * `known`: the record, where to write and the reservation's mark, or
+         * null with why counted. The writer stores the record hot (`commit`)
+         * once it has written.
          *
          * @param {string} name @param {number} length
          * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, known?: number }} [options]
+         * @returns {import('./reader.js').Place | null}
          */
         reserve(name, length, { onlyCopy = false, disk: policy = 'kept', known = Infinity } = {}){
+            checkName(name);
             const policyFlags = POLICY_FLAGS[policy];
             if (policyFlags === undefined)
             {
@@ -1437,7 +1660,7 @@ export async function openKeeper(options){
                 {
                     store(id, HOT);
                 }
-                counts[segments.length > known ? 'refusedUnseen' : 'refusedRoom']++;
+                counts[beyond(known) ? 'refusedUnseen' : 'refusedRoom']++;
                 return null;
             }
             if (held)
@@ -1463,15 +1686,15 @@ export async function openKeeper(options){
             forgetDisk(id);
             set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags);
             store(id, MOVING);
-            set(id, R_SEGMENT, found.segment);
-            set(id, R_OFFSET, found.offset);
+            placeBody(id, found);
             set(id, R_LENGTH, length);
             set(id, R_TICK, Atomics.load(words, H_TICK));
-            // The writer counts as one inside until it commits.
-            Atomics.store(words, index.at(id) + R_STATE, stateWord(WRITING, 1));
+            const mark = nextMark;
+            nextMark = nextMark === MAX_MARK ? 1 : nextMark + 1;
+            Atomics.store(words, index.at(id) + R_STATE, stateWord(WRITING, mark));
             counts.reserved++;
             keepSpare();
-            return { id, segment: found.segment, offset: found.offset };
+            return { id, segment: found.segment, offset: found.offset, mark };
         },
 
         /**
@@ -1481,6 +1704,7 @@ export async function openKeeper(options){
          * @param {string} name @param {{ known?: number }} [options]
          */
         raise(name, { known = Infinity } = {}){
+            checkName(name);
             const id = index.find(name);
             if (id < 0)
             {
@@ -1494,16 +1718,23 @@ export async function openKeeper(options){
             return raiseRecord(id, known);
         },
 
-        /** @param {string} name */
+        /**
+         * Takes `name`'s body away: true where it is gone now, false where it
+         * is read or written, and goes once committed and no one reads it.
+         *
+         * @param {string} name
+         */
         drop(name){
+            checkName(name);
             const id = index.find(name);
             return id < 0 || drop(id);
         },
 
         /**
          * The clock moves; idle bodies go cold, long idle cold ones go, bodies
-         * asked away go once no one reads them, segments empty long enough are
-         * let go but one.
+         * asked away go once no one reads them, records retired and left go
+         * back for other names, reservations held past `abandonAfterMs` are
+         * taken back, segments empty long enough are let go but one.
          */
         sweep(){
             const at = tick();
@@ -1512,16 +1743,30 @@ export async function openKeeper(options){
             {
                 const word = stateWordOf(id);
                 const state = stateOf(word);
-                if (state === RETIRED && readersOf(word) === 0
-                    && Atomics.compareExchange(words, index.at(id) + R_STATE, word,
-                        stateWord(MOVING)) === word)
+                if (state === RETIRED)
                 {
-                    if (get(id, R_SEGMENT) >= 0)
+                    takeRetired(id);
+                    continue;
+                }
+                if ((state === WRITING || state === RETIRED_WRITING)
+                    && age(at, get(id, R_TICK)) >= abandonAfterMs)
+                {
+                    // Its writer is taken for gone: what it would commit now
+                    // fails, the mark being no reservation's any more.
+                    const taken = stateWord(state === WRITING ? GONE : RETIRED);
+                    if (Atomics.compareExchange(words, index.at(id) + R_STATE, word, taken) === word)
                     {
-                        giveBack(id);
+                        counts.takenBack++;
+                        if (state === WRITING)
+                        {
+                            giveBack(id);
+                            set(id, R_FLAGS, 0);
+                        }
+                        else
+                        {
+                            takeRetired(id);
+                        }
                     }
-                    forgetDisk(id, false);
-                    store(id, GONE);
                     continue;
                 }
                 if (state === GONE && get(id, R_SEGMENT) >= 0)
@@ -1550,26 +1795,28 @@ export async function openKeeper(options){
                 }
             }
             let spare = false;
-            for (let s = 0; s < segments.length; s++)
+            let kept = 0;
+            for (const s of liveSegments)
             {
-                const one = segments[s];
-                if (one === null || !one.buddy.empty())
+                const one = segmentAt(s);
+                if (one.buddy.empty())
                 {
-                    continue;
+                    if (!spare)
+                    {
+                        spare = true;
+                    }
+                    else if (age(at, one.emptySince) >= releaseAfterMs)
+                    {
+                        segments[s] = null;
+                        counts.segmentsLetGo++;
+                        counts.letGoBytes += segmentBytes;
+                        tell({ segment: s, buffer: null });
+                        continue;
+                    }
                 }
-                if (!spare)
-                {
-                    spare = true;
-                    continue;
-                }
-                if (age(at, one.emptySince) >= releaseAfterMs)
-                {
-                    segments[s] = null;
-                    counts.segmentsLetGo++;
-                    counts.letGoBytes += segmentBytes;
-                    tell({ segment: s, buffer: null });
-                }
+                liveSegments[kept++] = s;
             }
+            liveSegments.length = kept;
             for (const number of [...packs.keys()])
             {
                 flushPack(number);
@@ -1807,7 +2054,7 @@ export async function openKeeper(options){
             for (let id = 0; id < words[H_COUNT]; id++)
             {
                 const state = stateOf(stateWordOf(id));
-                if (state === HOT || state === WRITING || state === RETIRED)
+                if (state === HOT || state === WRITING || state === RETIRED || state === RETIRED_WRITING)
                 {
                     hot++;
                     hotBytes += get(id, R_LENGTH);
@@ -1818,9 +2065,10 @@ export async function openKeeper(options){
                     coldBytes += get(id, R_LENGTH);
                 }
             }
-            const made = segments.filter(one=>one !== null);
+            const made = liveSegments.map(segmentAt);
             return {
-                records: words[H_COUNT], hot, hotBytes, cold, coldBytes,
+                records: words[H_COUNT], names: named, freeRecords: free.length, hot, hotBytes, cold,
+                coldBytes,
                 segments: made.length, segmentBytes: made.length * segmentBytes,
                 placedBytes: made.reduce((sum, one)=>sum + one.buddy.used(), 0),
                 roundingBytes: made.reduce((sum, one)=>sum + one.buddy.wasted(), 0),

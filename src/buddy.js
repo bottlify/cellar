@@ -12,6 +12,8 @@
  * block of the next power of two (`wasted` counts it).
  *
  * Only the keeper places and frees; nothing here is shared between threads.
+ * Each block handed out says whose body it holds, so the keeper can tell what
+ * would have to leave for a larger block to form (`ownersWithin`).
  */
 
 /** The smallest block: one page. */
@@ -54,8 +56,11 @@ export function createBuddy(bytes){
     /** Free blocks by order (block = UNIT << order), as offsets. @type {Set<number>[]} */
     const free = Array.from({ length: top + 1 }, ()=>new Set());
     free[top].add(0);
-    /** The order of each block handed out, by offset. @type {Map<number, number>} */
-    const given = new Map();
+    /** By the unit a block handed out starts at: its order, -1 where none starts. */
+    const orders = new Int8Array(bytes / UNIT).fill(-1);
+    /** By the unit a block handed out starts at: whose it is (`own`). */
+    const owners = new Int32Array(bytes / UNIT);
+    let given = 0;
     let used = 0;
     let asked = 0;
 
@@ -95,7 +100,9 @@ export function createBuddy(bytes){
                 at--;
                 free[at].add(offset + (UNIT << at));
             }
-            given.set(offset, order);
+            orders[offset / UNIT] = order;
+            owners[offset / UNIT] = -1;
+            given++;
             used += UNIT << order;
             asked += length;
             return offset;
@@ -106,12 +113,13 @@ export function createBuddy(bytes){
          * @param {number} offset @param {number} length
          */
         give(offset, length){
-            let order = given.get(offset);
-            if (order === undefined)
+            let order = orders[offset / UNIT];
+            if (!(order >= 0))
             {
                 throw new Error(`cache: no block at ${offset} to give back`);
             }
-            given.delete(offset);
+            orders[offset / UNIT] = -1;
+            given--;
             used -= UNIT << order;
             asked -= length;
             let at = offset;
@@ -127,8 +135,45 @@ export function createBuddy(bytes){
             }
             free[order].add(at);
         },
+        /**
+         * Says whose body the block at `offset` holds, for `ownersWithin`.
+         *
+         * @param {number} offset @param {number} owner
+         */
+        own(offset, owner){
+            owners[offset / UNIT] = owner;
+        },
+        /**
+         * The owners of the blocks handed out within `span` bytes from
+         * `from`, a span of a block's size and place that holds a block handed
+         * out: so every block it meets lies inside it.
+         *
+         * @param {number} from @param {number} span @returns {number[]}
+         */
+        ownersWithin(from, span){
+            /** @type {number[]} */
+            const found = [];
+            for (let at = from; at < from + span;)
+            {
+                const order = orders[at / UNIT];
+                if (order >= 0)
+                {
+                    found.push(owners[at / UNIT]);
+                    at += UNIT << order;
+                    continue;
+                }
+                // A free block starts here, of the one order it is free at.
+                let freeOrder = 0;
+                while (!free[freeOrder].has(at))
+                {
+                    freeOrder++;
+                }
+                at += UNIT << freeOrder;
+            }
+            return found;
+        },
         /** No block handed out: the segment can be let go whole. */
-        empty: ()=>given.size === 0,
+        empty: ()=>given === 0,
         /** Bytes in blocks handed out. */
         used: ()=>used,
         /** Bytes of those blocks the bodies do not fill. */
