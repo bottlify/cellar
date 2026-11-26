@@ -1,0 +1,3 @@
+# One line ending on every machine: a package packed from a Windows clone
+# carries the same bytes as one packed by CI.
+* text=auto eol=lf
