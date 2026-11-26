@@ -50,4 +50,17 @@ Do not retain the scratch view beyond the callback. The next read reuses it; a n
 
 The guarantee depends on the barriers emitted by JavaScript engines for these atomic pairs on x86 and ARM64. It is not a formal guarantee derived solely from the ECMAScript memory model for racing plain accesses. This limitation matters when targeting a new engine or architecture. Do not treat Journal as lossless storage or claim universal formal memory-model safety.
 
+Measured on ARM64, 2026-11-26: Apple M4 Pro (8 performance and 4 efficiency cores), macOS 27.2.1, on AC power, with Node 24.10.0 (V8 13.6) and Chrome 158.0.8127.38. The test was a seqlock litmus of the bracket alone: one writer and two readers over a block of 16 words, 8 s an arm. A copy counts as torn when the reader kept it after reading the same even sequence on both sides, yet the copy mixes two writes.
+
+| Arm | Node torn / kept | Chrome torn / kept |
+| --- | --- | --- |
+| No atomics at all (control) | 69,678,850 / 352,641,024 | 132,765,770 / 478,683,136 |
+| Atomic sequence, no bracket | 227 / 895,560 | 4 / 1,027,622 |
+| Bracket on the writer only | 0 / 725,107 | 0 / 4,924,137 |
+| Bracket on the reader only | 0 / 167,675 | 0 / 3,557,425 |
+| Bracket on both sides (the contract) | 0 / 131,673 | 0 / 1,041,778 |
+| Every word atomic | 0 / 14,026 | 0 / 132,190 |
+
+Without the bracket, plain copies tear on this processor; with it, none did. At the unbracketed arm's rate, about 33 torn copies would be expected on Node and about 4 on Chrome. Either side alone also gave 0 in this run, which does not show that one side suffices. On x86 every arm gave 0, so x86 cannot tell the arms apart.
+
 See the source comments in [`src/journal.js`](../src/journal.js) and the [benchmark notes](benchmarks.md#journal).
