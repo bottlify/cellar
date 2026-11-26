@@ -12,7 +12,7 @@ import { createReader } from './reader.js';
 import { crashDisk, memoryDisk } from './disk.fixture.js';
 import { BASE, chunkWriter, readIndexFile } from './index-file.js';
 import { COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
-    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, viewIndex } from './shared.js';
+    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, hashName, viewIndex } from './shared.js';
 
 const KIB = 1024;
 
@@ -2032,4 +2032,187 @@ test('a pack compacted that reads short keeps its only copy cold and counts the 
     assert.equal(keeper.figures().diskFailures, failures + 1);
     short = false;
     assert.deepEqual(reader.with('only', body=>[...body], { wait: true }), [...bodyOf(5 * KIB, 2)]);
+});
+
+/**
+ * A body that says whose it is: the name's hash, its version and length, the
+ * rest bytes of both.
+ *
+ * @param {string} name @param {number} version @param {number} length
+ */
+function taggedBody(name, version, length){
+    const [hash] = hashName(name);
+    const body = new Uint8Array(length);
+    const view = new DataView(body.buffer);
+    view.setInt32(0, hash, true);
+    view.setUint32(4, version, true);
+    view.setUint32(8, length, true);
+    for (let at = 12; at < length; at++)
+    {
+        body[at] = (hash ^ version ^ at) & 255;
+    }
+    return body;
+}
+
+/**
+ * The version a body of `name` says it is, or null where it is not one of its.
+ *
+ * @param {string} name @param {Uint8Array} body
+ */
+function versionOf(name, body){
+    if (body.length < 12)
+    {
+        return null;
+    }
+    const version = new DataView(body.buffer, body.byteOffset, body.length).getUint32(4, true);
+    const expected = taggedBody(name, version, body.length);
+    return body.every((byte, at)=>byte === expected[at]) ? version : null;
+}
+
+test('seeded runs crashed at random points, each change a flush had not reached kept or not, index'
+    + ' and pack flushes refused: the next run reads only bodies given under each name, and every only'
+    + ' copy the last whole save held', { timeout: 600_000 }, async()=>{
+    const options = { packBytes: 48 * KIB, budget: 192 * KIB, goneAfterMs: 1e9 };
+    let crashes = 0;
+    let promisesKept = 0;
+    for (let seed = 1; seed <= 40; seed++)
+    {
+        const next = random(seed * 7919);
+        let disk = crashDisk();
+        let cache = await cacheOf({ disk, ...options });
+        /** The body each name has in this run. @type {Map<string, { version: number, onlyCopy: boolean }>} */
+        const has = new Map();
+        /** Only copies the last save that answered true held, each its version. @type {Map<string, number>} */
+        let promised = new Map();
+        let version = 0;
+        for (let step = 0; step < 400; step++)
+        {
+            const name = `n${Math.floor(next() * 24)}`;
+            const roll = next();
+            if (roll < 0.45)
+            {
+                const onlyCopy = next() < 0.35;
+                const policy = next() < 0.12 ? 'run' : 'kept';
+                const body = taggedBody(name, ++version, 16 + Math.floor(next() * 9 * KIB));
+                if (cache.reader.put(name, body, { onlyCopy, disk: policy }))
+                {
+                    has.set(name, { version, onlyCopy: onlyCopy && policy === 'kept' });
+                }
+            }
+            else if (roll < 0.52)
+            {
+                cache.reader.drop(name);
+                has.delete(name);
+            }
+            else if (roll < 0.62)
+            {
+                cache.reader.with(name, ()=>{}, { wait: true });
+            }
+            else if (roll < 0.8)
+            {
+                // Now and then a flush of the packs fails, losing what they took since the last.
+                const losing = next() < 0.1;
+                if (losing)
+                {
+                    packsOf(disk.current()).files.forEach(file=>disk.failing.losing.add(file));
+                }
+                cache.step(Math.floor(next() * 160));
+                disk.failing.losing.clear();
+            }
+            else if (roll < 0.92)
+            {
+                const refused = next();
+                if (refused < 0.3)
+                {
+                    disk.failing.flush.add(next() < 0.5 ? 'index-a' : 'index-b');
+                }
+                else if (refused < 0.4)
+                {
+                    packsOf(disk.current()).files.forEach(file=>disk.failing.losing.add(file));
+                }
+                if (cache.keeper.save())
+                {
+                    promised = new Map([...has].filter(([, body])=>body.onlyCopy)
+                        .map(([body, { version: saved }])=>[body, saved]));
+                }
+                disk.failing.flush.clear();
+                disk.failing.losing.clear();
+            }
+            else if (roll < 0.97)
+            {
+                await settle();
+            }
+            else
+            {
+                crashes++;
+                const files = disk.crash(()=>next() < 0.5);
+                const run = await cacheOf({ disk: crashDisk(files), ...options });
+                const where = `seed ${seed}, step ${step}`;
+                for (let i = 0; i < 24; i++)
+                {
+                    const body = run.reader.with(`n${i}`, read=>read.slice(), { wait: true });
+                    assert.ok(body === undefined || versionOf(`n${i}`, body) !== null,
+                        `${where}: n${i} read another's bytes`);
+                }
+                for (const [body, saved] of promised)
+                {
+                    if (has.get(body)?.version === saved)
+                    {
+                        assert.equal(run.reader.with(body, read=>versionOf(body, read), { wait: true }),
+                            saved, `${where}: the only copy ${body} the last whole save held`);
+                        promisesKept++;
+                    }
+                }
+                const { skippedEntries, lostOnDisk } = run.keeper.figures();
+                assert.deepEqual({ skippedEntries, lostOnDisk }, { skippedEntries: 0, lostOnDisk: 0 },
+                    `${where}: the index named bytes the disk did not keep`);
+                run.keeper.close();
+                // The work goes on from the disk the crash left, as the next run would.
+                cache.keeper.close();
+                await settle();
+                disk = crashDisk(files);
+                cache = await cacheOf({ disk, ...options });
+                for (const [body] of [...has])
+                {
+                    const read = cache.reader.with(body, bytes=>versionOf(body, bytes), { wait: true });
+                    if (read === undefined || read === null)
+                    {
+                        has.delete(body);
+                    }
+                    else
+                    {
+                        has.set(body, { version: read, onlyCopy: false });
+                    }
+                }
+                promised = new Map();
+            }
+            if (step % 20 === 0)
+            {
+                await settle();
+            }
+        }
+        cache.keeper.close();
+        await settle();
+    }
+    assert.ok(crashes > 30 && promisesKept > 20, `${crashes} crashes, ${promisesKept} only copies checked`);
+});
+
+test('a pack flush that fails may lose what the pack took since the flush before: a body there that'
+    + ' can be made again goes, never read back as the bytes written after it', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper, step } = await cacheOf({ disk });
+    reader.put('kept', bodyOf(3000, 1));
+    step(150);
+    reader.put('block', bodyOf(3000, 2));
+    disk.failing.losing.add('pack-0');
+    step(150);
+    disk.failing.losing.clear();
+    assert.equal(reader.look('block'), null, 'its bytes may be gone with the flush');
+    assert.equal(keeper.figures().lostOnDisk, 1);
+    reader.put('later', bodyOf(6000, 3));
+    step(150);
+    assert.equal(reader.with('block', body=>[...body], { wait: true }), undefined);
+    assert.equal(keeper.save(), true);
+    assert.deepEqual(await nextRunReads(disk.crash(), ['kept', 'block', 'later']),
+        [[...bodyOf(3000, 1)], null, [...bodyOf(6000, 3)]]);
 });

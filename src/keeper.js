@@ -667,6 +667,57 @@ export async function openKeeper(options){
     };
 
     /**
+     * Bytes at the start of each pack its last flush covered: what the disk
+     * holds of it for certain.
+     *
+     * @type {Map<number, number>}
+     */
+    const durable = new Map();
+
+    /**
+     * Flushes pack `number`: false where the disk failed, counted. A flush
+     * that failed may have lost what the pack took since the one before, so
+     * no body written there since is trusted to the disk: a hot one forgets
+     * its copy (memory holds it, written again when it goes cold or is
+     * saved), a cold one goes (it can be made again: a cold only copy was
+     * flushed before it left memory, and lies below).
+     *
+     * @param {number} number
+     */
+    const flushPack = number=>{
+        try
+        {
+            /** @type {DiskFile} */ (packs.get(number)).flush();
+            durable.set(number, filled.get(number) ?? 0);
+            return true;
+        }
+        catch {
+            counts.diskFailures++;
+        }
+        const certain = durable.get(number) ?? 0;
+        for (let id = 0; id < words[H_COUNT]; id++)
+        {
+            const flags = get(id, R_FLAGS);
+            if (get(id, R_PACK) !== number || (flags & F_ON_DISK) === 0
+                || get(id, R_PACK_OFFSET) + get(id, R_LENGTH) <= certain)
+            {
+                continue;
+            }
+            const state = stateOf(stateWordOf(id));
+            if (state !== COLD)
+            {
+                forgetDisk(id, state !== RETIRED);
+            }
+            else if ((flags & F_ONLY_COPY) === 0)
+            {
+                drop(id);
+                counts.lostOnDisk++;
+            }
+        }
+        return false;
+    };
+
+    /**
      * Appends `bytes` to the pack bodies go to, flushed where asked: where it
      * wrote them (in `pack`), or `NOT_YET` where the next pack is not open
      * yet, or `REFUSED` where the disk failed, counted.
@@ -687,6 +738,7 @@ export async function openKeeper(options){
             pack = readyPack.number;
             packs.set(pack, readyPack.file);
             filled.set(pack, 0);
+            durable.set(pack, 0);
             live.set(pack, 0);
             packTop = 0;
             readyPack = null;
@@ -703,10 +755,6 @@ export async function openKeeper(options){
                 refused = true;
                 return REFUSED;
             }
-            if (flush)
-            {
-                file.flush();
-            }
         }
         catch {
             counts.diskFailures++;
@@ -716,6 +764,11 @@ export async function openKeeper(options){
         const at = packTop;
         packTop += length;
         filled.set(pack, Math.max(packTop, filled.get(pack) ?? 0));
+        if (flush && !flushPack(pack))
+        {
+            refused = true;
+            return REFUSED;
+        }
         return at;
     };
 
@@ -784,6 +837,7 @@ export async function openKeeper(options){
         live.delete(number);
         counts.reclaimedBytes += filled.get(number) ?? 0;
         filled.delete(number);
+        durable.delete(number);
         if (number === pack)
         {
             pack = -1;
@@ -1243,6 +1297,7 @@ export async function openKeeper(options){
             const file = await disk.open(packFile(number));
             packs.set(number, file);
             filled.set(number, file.getSize());
+            durable.set(number, file.getSize());
             live.set(number, 0);
             if (number > pack)
             {
@@ -1284,19 +1339,6 @@ export async function openKeeper(options){
             {
                 removePack(number);
             }
-        }
-    };
-
-    /** Flushes a file the keeper wrote: false where the disk failed, counted. @param {DiskFile} file */
-    const flushed = file=>{
-        try
-        {
-            file.flush();
-            return true;
-        }
-        catch {
-            counts.diskFailures++;
-            return false;
         }
     };
 
@@ -1513,9 +1555,9 @@ export async function openKeeper(options){
                     tell({ segment: s, buffer: null });
                 }
             }
-            for (const file of packs.values())
+            for (const number of [...packs.keys()])
             {
-                flushed(file);
+                flushPack(number);
             }
             if (refused)
             {
@@ -1538,8 +1580,6 @@ export async function openKeeper(options){
                 return false;
             }
             let whole = true;
-            /** @type {number[]} */
-            const written = [];
             for (let id = 0; id < words[H_COUNT]; id++)
             {
                 // A body for this run only, or never on the disk, is no next
@@ -1550,29 +1590,20 @@ export async function openKeeper(options){
                     // Only no one may write it meanwhile: the keeper's thread
                     // is the one placing, and a reader does not write. Each
                     // pack is flushed once below, not once a body.
-                    if (writeOut(id, false))
-                    {
-                        written.push(id);
-                    }
-                    else
-                    {
-                        whole = false;
-                    }
+                    whole = writeOut(id, false) && whole;
                 }
             }
-            for (const file of packs.values())
+            // Every pack, past one that fails too: each failure distrusts the
+            // bodies of its own pack, and only those.
+            let flushedAll = true;
+            for (const number of [...packs.keys()])
             {
-                // An index naming bodies the disk may not hold is not written,
-                // and a body written here unflushed is not the disk's: an only
-                // copy trusting it would leave memory going cold.
-                if (!flushed(file))
-                {
-                    for (const id of written)
-                    {
-                        forgetDisk(id);
-                    }
-                    return false;
-                }
+                flushedAll = flushPack(number) && flushedAll;
+            }
+            if (!flushedAll)
+            {
+                // An index naming bodies the disk may not hold is not written.
+                return false;
             }
             const asBase = basesOwed > 0 || current < 0 || deltaBytes > baseBytes;
             if (!asBase && changed.size === 0 && !packsChanged)

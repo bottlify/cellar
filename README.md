@@ -138,7 +138,9 @@ A `reserve` the keeper refuses leaves the name's body as it was; one it grants t
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
 the name has no body then, and the room goes back. A thread joining later is handed
 `keeper.shared` and `keeper.segmentBuffers()` as they are then. A write the disk takes in part
-counts as not written. A body the disk reads back short is gone where it can be made again
+counts as not written, and a flush the disk fails may have lost what the pack took since the one
+before: no body written there since is trusted to the disk (a hot one is written again, a cold one
+that can be made again goes, counted in `lostOnDisk`). A body the disk reads back short is gone where it can be made again
 (`lostOnDisk`); an only copy stays cold and the read counts as a failure (`diskFailures`): the
 keeper never lets an only copy go on its own judgement, and a run reading the pack afresh skips it
 there if the pack is short (`skippedEntries`). `save()` writes the hot bodies the disk lacks, then an index of exactly the
