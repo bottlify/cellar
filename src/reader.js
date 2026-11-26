@@ -96,10 +96,10 @@ export function createReader({ shared, segments = [], keeper }){
 
     /**
      * Names this reader found (`Found`). Asked first, it spares a hit the
-     * hash and the walk over the shared index. A record no name leads to goes back to the keeper for
-     * another name, so what is remembered is checked once inside (`holds`): a
-     * record that is not the name's, or not hot nor cold any more, sends the
-     * name to the index again.
+     * hash and the walk over the shared index. A record no name leads to goes
+     * back to the keeper for another name, so what is remembered is checked
+     * once inside (`holds`): a record that is not the name's, or one the name
+     * left (neither hot, cold nor moving), sends the name to the index again.
      *
      * @type {Map<string, Found>}
      */
