@@ -35,7 +35,7 @@ import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
-    H_COUNT, H_NAMES, H_TICK, MAX_RECORDS,
+    CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_NAMES, H_TICK, MAX_RECORDS,
     MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
     checkName, growableShared, growTo, sharedBuffer,
@@ -156,9 +156,10 @@ const REFUSED = -2;
  * @property {number} [abandonAfterMs]  reserved so long and not committed, a reservation is
  *     taken back: its writer is taken for gone, its room given back, and its commit fails
  * @property {(message: { segment?: number, buffer?: SharedArrayBuffer | null,
- *     table?: SharedArrayBuffer }) => void} [announce]  sent to every thread reading:
+ *     table?: SharedArrayBuffer }) => unknown} [announce]  sent to every thread reading:
  *     called on the keeper's thread in the middle of its work, it calls none of
- *     the keeper's methods; one that throws is counted (`announceFailures`)
+ *     the keeper's methods; one that throws, or answers a promise that rejects,
+ *     is counted (`announceFailures`)
  * @property {() => number} [now]
  */
 
@@ -200,6 +201,7 @@ export async function openKeeper(options){
         names: growableShared(64 * 1024, MAX_NAME_UNITS * 2),
         table: sharedBuffer(FIRST_TABLE * 4),
     };
+    new Int32Array(shared.records, 0, HEADER_WORDS)[H_LAYOUT] = CACHE_LAYOUT;
     const index = viewIndex(shared);
     /**
      * The keeper's own views of the records and the names, of the length the
@@ -270,7 +272,7 @@ export async function openKeeper(options){
     let closed = false;
 
     const counts = {
-        reserved: 0, refusedBusy: 0, refusedRoom: 0, refusedLarge: 0, refusedUnseen: 0,
+        reserved: 0, refusedRoom: 0, refusedLarge: 0, refusedUnseen: 0,
         replaced: 0, raised: 0, raiseFailed: 0, cooled: 0, written: 0, writtenBytes: 0, gone: 0,
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
@@ -289,7 +291,15 @@ export async function openKeeper(options){
     const tell = message=>{
         try
         {
-            announce(message);
+            const answer = /** @type {unknown} */ (announce(message));
+            // One that answers a promise fails later: counted then, never an
+            // unhandled rejection of the keeper's.
+            if (typeof (/** @type {any} */ (answer)?.then) === 'function')
+            {
+                /** @type {PromiseLike<unknown>} */ (answer).then(undefined, ()=>{
+                    counts.announceFailures++;
+                });
+            }
         }
         catch {
             counts.announceFailures++;
@@ -1639,6 +1649,7 @@ export async function openKeeper(options){
             if (state === GONE && get(id, R_SEGMENT) >= 0)
             {
                 giveBack(id);
+                counts.abandoned++;
             }
             // A hot body no one is in is held while room is found, so that a
             // reservation refused leaves the name's body as it was.
@@ -1773,6 +1784,7 @@ export async function openKeeper(options){
                 {
                     // A reservation let go of without a body.
                     giveBack(id);
+                    counts.abandoned++;
                     continue;
                 }
                 if (state !== HOT && state !== COLD)

@@ -150,7 +150,8 @@ it. A thread terminated inside `with` stays counted, as a bell's wait terminated
 body stays hot and its room held for the run. The count is one word of the record, no thread's in
 particular; only the host knows a thread died, and a count taken back by time would take a body
 from a reader that was only slow. A thread joining later is handed `keeper.shared` and
-`keeper.segmentBuffers()` as they are then. A write the disk takes in part counts as not written,
+`keeper.segmentBuffers()` as they are then. Memory that is not a cache of this layout is refused when a
+reader is made over it (`createReader` throws). A write the disk takes in part counts as not written,
 and a flush the disk fails may have lost what the pack took since the one before: no body written
 there since is trusted to the disk (a hot one is written again, a cold one that can be made again
 goes, counted in `lostOnDisk`). A body the disk reads back short is gone where it can be made again
@@ -179,8 +180,8 @@ packs let go of come back. When the disk refuses a write, the next sweep makes r
 used longest ago of those holding no only copy (one could not move while the disk refuses, and what
 went beside it would free nothing): what can be made again there goes, so newer bodies take its
 place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they
-call none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the
-keeper goes on: a thread not told of a segment is never placed in it. After `close()` the files are
+call none of its methods. One that throws (an `announce` also one whose promise rejects) is counted
+(`announceFailures`, `diskFailures`) and the keeper goes on: a thread not told of a segment is never placed in it. After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
 good), a cold one is the next run's, on the disk, and no body of this run any more. A cold only copy
 no whole save names where it lies (the save failed, or it is a body for this run) is brought back

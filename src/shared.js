@@ -43,6 +43,10 @@ export const H_COUNT = 0;
 export const H_TICK = 1;
 /** Units of `names` in use. */
 export const H_NAMES = 2;
+/** What the words mean (`CACHE_LAYOUT`), so that memory of another layout, or none, is refused. */
+export const H_LAYOUT = 3;
+/** The layout these words are in: changed with any word's meaning. */
+export const CACHE_LAYOUT = 0x43430c01;
 
 /** One record, in 32-bit words. */
 export const RECORD_WORDS = 12;
@@ -234,6 +238,12 @@ export const growTo = (buffer, bytes)=>{
  * @param {SharedIndex} shared
  */
 export function viewIndex(shared){
+    // Shared memory or, where none can be shared, a buffer of one thread's.
+    if (!(shared?.records?.byteLength >= HEADER_WORDS * 4)
+        || new Int32Array(shared.records, 0, HEADER_WORDS)[H_LAYOUT] !== CACHE_LAYOUT)
+    {
+        throw new Error('cache: the memory is not a cache of this layout');
+    }
     // Views of the length the buffers have now, made again when a record or a
     // name lies past them: a view that follows a growable buffer's length is
     // read several times slower (V8). The buffers only grow.

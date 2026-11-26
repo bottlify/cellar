@@ -449,3 +449,56 @@ test('a reader made before the index grew finds, reads and writes names past its
         assert.equal(early.put('written late', bodyOf(16, 7)), true);
         assert.deepEqual(reader.with('written late', body=>[...body]), [...bodyOf(16, 7)]);
     });
+
+test('a reader is refused over memory that is not a cache of this layout', async()=>{
+    const { keeper } = await cacheOf();
+    const keeperCalls = { reserve: ()=>null, raise: ()=>false, raiseLater: ()=>{}, drop: ()=>{} };
+    // Zeroed words would read as an empty cache whose every lookup misses.
+    const zeroed = /** @type {any} */ ({ records: new SharedArrayBuffer(keeper.shared.records.byteLength),
+        names: keeper.shared.names, table: keeper.shared.table });
+    assert.throws(()=>createReader({ shared: zeroed, keeper: keeperCalls }), /not a cache of this layout/);
+    assert.throws(()=>createReader({ shared: /** @type {any} */ ({}), keeper: keeperCalls }),
+        /not a cache of this layout/);
+    assert.doesNotThrow(()=>createReader({ shared: keeper.shared, keeper: keeperCalls }));
+});
+
+test('an announce whose promise rejects is counted, not left an unhandled rejection', async()=>{
+    /** @type {unknown[]} */
+    const unhandled = [];
+    /** @param {unknown} reason */
+    const onUnhandled = reason=>unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try
+    {
+        const { keeper, reader } = await cacheOf({
+            budget: 256 * KIB, segmentBytes: 64 * KIB,
+            announce: ()=>Promise.reject(new Error('the thread is gone')),
+        });
+        // More than a segment's bodies: the keeper makes segments and tells of them.
+        for (let i = 0; i < 6; i++)
+        {
+            reader.put(`blocks/${i}`, bodyOf(32 * KIB, i));
+        }
+        await new Promise(resolve=>setTimeout(resolve, 0));
+        assert.ok(keeper.figures().announceFailures > 0);
+        assert.deepEqual(unhandled, []);
+    }
+    finally
+    {
+        process.off('unhandledRejection', onUnhandled);
+    }
+});
+
+test('a reservation let go of without a body is counted as its room goes back', async()=>{
+    const { keeper, reader } = await cacheOf();
+    assert.ok(reader.reserve('blocks/1', 1000));
+    reader.abandon('blocks/1');
+    assert.equal(keeper.figures().abandoned, 0);
+    keeper.sweep();
+    assert.equal(keeper.figures().abandoned, 1);
+    // Let go of again by a reserve of the name: given back there.
+    assert.ok(reader.reserve('blocks/2', 1000));
+    reader.abandon('blocks/2');
+    assert.ok(reader.reserve('blocks/2', 1000));
+    assert.equal(keeper.figures().abandoned, 2);
+});
