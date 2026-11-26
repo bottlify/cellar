@@ -391,6 +391,35 @@ test('a full cache walks its records once for many reserves, and a body read sin
         `${keeper.figures().oldestListed - listed} walks for 100 reserves of 16 bodies`);
 });
 
+test('a reservation made long after the last sweep counts its age from when it was made', async()=>{
+    // The keeper's last sweep was long ago: a reservation made now is not
+    // taken back by the next sweep, its room is no one else's, its commit
+    // publishes what its writer wrote.
+    const { keeper, reader, step, wait } = await cacheOf({ budget: UNIT, segmentBytes: UNIT,
+        abandonAfterMs: 10 });
+    wait(100);
+    const a = reader.reserve('a', UNIT);
+    assert.ok(a);
+    a[0] = 11;
+    step(0);
+    assert.equal(keeper.figures().takenBack, 0, 'held 0 ms of its 10');
+    assert.equal(reader.reserve('b', UNIT), null, 'its room is still its own');
+    a[0] = 99;
+    assert.equal(reader.commit('a'), true);
+    assert.equal(reader.with('a', body=>body[0]), 99);
+    // Past its age it is taken back, from when it was made, and a late
+    // commit publishes nothing.
+    const later = await cacheOf({ budget: 2 * UNIT, segmentBytes: UNIT, abandonAfterMs: 10 });
+    later.wait(100);
+    assert.ok(later.reader.reserve('c', 16));
+    later.step(9);
+    assert.equal(later.keeper.figures().takenBack, 0, 'held 9 ms of its 10');
+    later.step(1);
+    assert.equal(later.keeper.figures().takenBack, 1, 'held its 10');
+    assert.equal(later.reader.commit('c'), false);
+    assert.equal(later.reader.look('c'), null);
+});
+
 test('a body put to stay when idle stays hot past coldAfterMs, and leaves for room as any other', async()=>{
     // A body read again only long after it was written (a translator's
     // function, at a relink): the keeper's idle rule would take exactly

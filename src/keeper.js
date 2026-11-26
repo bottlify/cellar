@@ -1283,7 +1283,8 @@ export async function openKeeper(options){
             return false;
         }
         placeBody(id, found);
-        set(id, R_TICK, Atomics.load(words, H_TICK));
+        // Brought back now: not taken for idle since the last sweep.
+        set(id, R_TICK, tick());
         store(id, HOT);
         counts.raised++;
         keepSpare();
@@ -1743,7 +1744,9 @@ export async function openKeeper(options){
             store(id, MOVING);
             placeBody(id, found);
             set(id, R_LENGTH, length);
-            set(id, R_TICK, Atomics.load(words, H_TICK));
+            // Now, not the last sweep's tick: a reservation's age, which
+            // `abandonAfterMs` takes it back by, counts from when it was made.
+            set(id, R_TICK, tick());
             const mark = nextMark;
             nextMark = nextMark === MAX_MARK ? 1 : nextMark + 1;
             Atomics.store(words, index.at(id) + R_STATE, stateWord(WRITING, mark));

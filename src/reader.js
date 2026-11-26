@@ -404,8 +404,14 @@ export function createReader({ shared, segments = [], keeper }){
                 throw new Error(`cache: ${name} was not reserved here`);
             }
             writing.delete(name);
-            index.stamp(place.id);
-            return finish(place, HOT);
+            // Stamped once published: a commit that came too late, its
+            // record taken back and perhaps another name's now, stamps nothing.
+            const published = finish(place, HOT);
+            if (published)
+            {
+                index.stamp(place.id);
+            }
+            return published;
         },
 
         /**

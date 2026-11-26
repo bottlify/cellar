@@ -52,6 +52,10 @@ export async function cacheOf(options = {}){
             clock += ms;
             keeper.sweep();
         },
+        /** The clock moves and no sweep runs: a keeper whose last sweep was long ago. @param {number} ms */
+        wait(ms){
+            clock += ms;
+        },
     };
 }
 
