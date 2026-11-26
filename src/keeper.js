@@ -1006,14 +1006,17 @@ export async function openKeeper(options){
 
     /**
      * One pack bodies fill less than `COMPACT_LIVE` of, the emptiest, taken
-     * out of (`empty`): its dead bytes are given back at the next save.
+     * out of (`empty`): its dead bytes are given back at the next save. A
+     * pack with none left has nothing to move: it waits for a save to let it
+     * go, or for the index files to stop naming an only copy there, and
+     * taken it would be taken every time, the next emptiest never.
      */
     const compact = ()=>{
         let emptiest = -1;
         for (const [number, bytes] of filled)
         {
             const share = /** @type {number} */ (live.get(number)) / bytes;
-            if (number !== pack && bytes > 0 && share < COMPACT_LIVE
+            if (number !== pack && bytes > 0 && share > 0 && share < COMPACT_LIVE
                 && (emptiest < 0 || share < /** @type {number} */ (live.get(emptiest))
                     / /** @type {number} */ (filled.get(emptiest))))
             {

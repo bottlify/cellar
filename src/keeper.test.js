@@ -1738,3 +1738,57 @@ test('a full disk makes room from the oldest pack it can empty: not one an only 
         keeper.close();
     }
 });
+
+test('compaction passes over a pack it has emptied that an index still names an only copy in, and'
+    + ' goes on to the packs mostly dead', async()=>{
+    /** @type {number[]} */
+    const compacted = [];
+    for (const onlyCopy of [true, false])
+    {
+        const disk = memoryDisk();
+        const { reader, keeper, step } = await cacheOf({ disk, packBytes: 32 * KIB, budget: 512 * KIB,
+            goneAfterMs: 1e9 });
+        reader.put('only', bodyOf(30 * KIB, 1), { onlyCopy });
+        step(150);
+        await settle();
+        for (let p = 0; p < 4; p++)
+        {
+            for (let i = 0; i < 5; i++)
+            {
+                reader.put(`p${p}_${i}`, bodyOf(6 * KIB, p * 5 + i));
+            }
+            step(150);
+            await settle();
+        }
+        keeper.save();
+        keeper.save();
+        await settle();
+        reader.drop('only');
+        for (let p = 0; p < 4; p++)
+        {
+            for (let i = 1; i < 5; i++)
+            {
+                reader.drop(`p${p}_${i}`);
+            }
+        }
+        step(1);
+        keeper.save();
+        await settle();
+        assert.equal('pack-0' in packFiles(disk.files), onlyCopy,
+            'kept while both files name the only copy there');
+        for (let s = 0; s < 8; s++)
+        {
+            step(1);
+            await settle();
+        }
+        compacted.push(keeper.figures().compactedBytes);
+        for (let p = 0; p < 4; p++)
+        {
+            assert.deepEqual(reader.with(`p${p}_0`, body=>[...body], { wait: true }),
+                [...bodyOf(6 * KIB, p * 5)]);
+        }
+        keeper.close();
+    }
+    assert.ok(compacted[1] >= 3 * 6 * KIB, `${compacted[1]} bytes moved`);
+    assert.equal(compacted[0], compacted[1], 'as much moved with the emptied pack still named');
+});
