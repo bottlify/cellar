@@ -1240,9 +1240,8 @@ export async function openKeeper(options){
         }
         for (const [name, { pack: from, offset, length, flags }] of saved.entries)
         {
-            // Within a pack this run opened, and within that pack's file.
-            if (!packs.has(from) || offset < 0 || !(length > 0)
-                || offset + length > /** @type {number} */ (filled.get(from)))
+            // Within its pack's file: the index file checked the rest.
+            if (!(offset + length <= (filled.get(from) ?? 0)))
             {
                 counts.skippedEntries++;
                 continue;

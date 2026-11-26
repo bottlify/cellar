@@ -94,7 +94,7 @@ test('a file is its base and every delta after it of the next generation, up to 
     ()=>{
     const base = chunk(BASE, 5, [['a', 0, 0, 10, ONLY], ['b', 0, 10, 10, 0]]);
     const first = chunk(DELTA, 6, [['b', -1, 0, 0, 0], ['c', 1, 0, 20, 0]],
-        { nextPack: 5, packs: [1, 4] });
+        { nextPack: 5, packs: [0, 1, 4] });
     const second = chunk(DELTA, 7, [['a', 4, 0, 10, ONLY]], { nextPack: 5, packs: [1, 4] });
     const whole = readIndexFile(joined([base, first, second]), MAX, ONLY);
     assert.ok(whole !== null);
@@ -139,4 +139,21 @@ test('an index of Cellar 0.9.0 is read as a base, its entries that do not say a 
         'torn');
     assert.equal(readIndexFile(new TextEncoder().encode(JSON.stringify({ version: 1, generation: 1,
         packs: MAX + 1, records: [] })), MAX, ONLY), null, 'more packs than a run opens');
+});
+
+test('a chunk listing a pack twice is not read, and an entry that does not say a body is skipped and'
+    + ' counted, of either layout', ()=>{
+    assert.equal(readChunk(chunk(BASE, 1, [], { nextPack: 4, packs: [0, 3, 0] }), 0, MAX), null);
+    assert.equal(readIndexFile(chunk(BASE, 1, [], { nextPack: 4, packs: [1, 1] }), MAX, ONLY), null);
+    const read = readIndexFile(chunk(BASE, 2, [['kept', 0, 0, 10, ONLY], ['unlisted', 2, 0, 10, 0],
+        ['empty', 1, 0, 0, 0], ['past', 1, 2 ** 31 - 4, 8, 0], ['end', 1, 2 ** 31 - 8, 8, 0]],
+    { nextPack: 4, packs: [0, 1, 3] }), MAX, ONLY);
+    assert.deepEqual([...(read?.entries.keys() ?? [])], ['kept', 'end']);
+    assert.equal(read?.skipped, 3);
+    const json = JSON.stringify({ version: 1, generation: 4, packs: 2, records: [
+        ['a', 0, 0, 10, 0], ['negative', 0, -1, 10, 0], ['empty', 1, 5, 0, 0], ['past', 1, 2 ** 40, 10, 0],
+    ] });
+    const old = readIndexFile(new TextEncoder().encode(json), MAX, ONLY);
+    assert.deepEqual([...(old?.entries.keys() ?? [])], ['a']);
+    assert.equal(old?.skipped, 3);
 });

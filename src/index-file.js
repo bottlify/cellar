@@ -35,6 +35,8 @@
 const MAGIC = 0x32584943;
 export const BASE = 1;
 export const DELTA = 2;
+/** A pack holds under 2 GiB (the keeper's `packBytes`): no body ends past it. */
+const PACK_END = 2 ** 31;
 /** Bytes of a chunk before its packs, and its checksum. */
 const HEAD_BYTES = 28;
 /** The top bit of an entry's unit count: its name is one byte a unit. */
@@ -189,13 +191,16 @@ export function readChunk(bytes, at, maxPacks){
     let top = at + HEAD_BYTES;
     /** @type {number[]} */
     const packs = [];
+    const seen = new Set();
     for (let i = 0; i < packCount; i++, top += 4)
     {
         const pack = view.getUint32(top, true);
-        if (pack >= nextPack)
+        // A pack listed twice would be opened twice: no keeper writes it.
+        if (pack >= nextPack || seen.has(pack))
         {
             return null;
         }
+        seen.add(pack);
         packs.push(pack);
     }
     const count = view.getUint32(top, true);
@@ -244,12 +249,34 @@ export function readChunk(bytes, at, maxPacks){
  * @typedef {Object} IndexFileState
  * @property {number} generation  the last whole chunk's
  * @property {number} nextPack @property {number[]} packs  as the last whole chunk says
- * @property {Map<string, Entry>} entries  every name with a body, the chain applied
+ * @property {Map<string, Entry>} entries  every name with a body, the chain applied: each in a
+ *     pack the file lists, of a length, within what a pack holds
  * @property {Set<number>} onlyCopies  packs an entry of only copy named at any point of the
  *     chain: what the file could lead a run to, so long as it is the index read
  * @property {number} end  where the last whole chunk ends
- * @property {number} skipped  entries of version 1 that did not say a body
+ * @property {number} skipped  entries that did not say a body
  */
+
+/**
+ * Takes out of `state` the entries that do not say a body: in a pack the
+ * file does not list, of no bytes, or past what a pack holds. Counted, the
+ * rest of the index still the disk's.
+ *
+ * @param {IndexFileState} state
+ * @returns {IndexFileState}
+ */
+function bodiesOnly(state){
+    const listed = new Set(state.packs);
+    for (const [name, { pack, offset, length }] of state.entries)
+    {
+        if (!listed.has(pack) || !(offset >= 0) || !(length > 0) || !(offset + length <= PACK_END))
+        {
+            state.entries.delete(name);
+            state.skipped++;
+        }
+    }
+    return state;
+}
 
 /**
  * What one index file says: its base and every delta after it that is whole
@@ -298,7 +325,7 @@ export function readIndexFile(bytes, maxPacks, onlyCopy){
         state.packs = chunk.packs;
         state.end = chunk.end;
     }
-    return state;
+    return bodiesOnly(state);
 }
 
 /**
@@ -344,5 +371,5 @@ function readVersion1(bytes, maxPacks, onlyCopy){
             state.onlyCopies.add(pack);
         }
     }
-    return state;
+    return bodiesOnly(state);
 }

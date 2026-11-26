@@ -127,7 +127,8 @@ A body is read only inside `with`: the keeper never takes a body a reader is in.
 be made again goes away when there is no room and no disk; one marked `onlyCopy` never does.
 `readSaved([indexA, indexB])` reads what a keeper's disk holds without a keeper and without
 writing: the bytes of `INDEX_FILES` in, each body's pack (`packFile(n)`), offset and length out,
-as the last whole save names them (a page asking how much of a cache is there).
+as the last whole save names them (a page asking how much of a cache is there), an entry that says
+no body (in a pack the index does not list, of no bytes) left out as a keeper opening it leaves it.
 `disk` says where a body may go on the disk: `'kept'` (the default) there and in the saved index
 for the next run; `'run'` there while cold, never named in the index, for a body that means
 nothing to the next run (texels a GPU was handed); `'never'` not at all, so an idle body that can

@@ -1955,3 +1955,11 @@ test('pack numbers are given from past the highest either index file names, not 
     again.keeper.close();
     assert.equal(left.current().get('pack-0')?.length, 4000);
 });
+
+test('readSaved trusts no more than a keeper opening the index: an entry of 0.9.0 at a negative offset'
+    + ' or of no bytes is not a body, and a chunk listing a pack twice is no index', ()=>{
+    const json = new TextEncoder().encode(JSON.stringify({ version: 1, generation: 3, packs: 1,
+        records: [['a', 0, 0, 10, 0], ['b', 0, -5, 10, 0], ['c', 0, 10, 0, 0]] }));
+    assert.deepEqual([...(readSaved([json, null])?.bodies.keys() ?? [])], ['a']);
+    assert.equal(readSaved([baseOf(1, 4, [2, 2], []), null]), null);
+});
