@@ -263,6 +263,25 @@ test('a reservation never committed is taken back after abandonAfterMs, and its 
         assert.equal(keeper.figures().placedBytes, UNIT + 4 * UNIT + UNIT, 'kept, frame, the next late');
     });
 
+test('a place granted ahead and handed to the writer after it was taken back is refused, not'
+    + ' written into', async()=>{
+    const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,
+        goneAfterMs: 1e6 });
+    // Room asked for ahead (a reader's link keeps the answer for its next reserve).
+    const granted = keeper.reserve('texels', 9000);
+    assert.ok(granted);
+    step(1000);
+    assert.equal(keeper.figures().takenBack, 1);
+    // The room goes to another body meanwhile.
+    assert.equal(reader.put('other', bodyOf(9000, 5)), true);
+    const late = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers(), keeper: {
+        reserve: ()=>granted, raise: ()=>false, raiseLater: ()=>{}, drop: ()=>{},
+    } });
+    assert.equal(late.reserve('texels', 9000), null, 'no view into room another body may have');
+    assert.equal(late.figures().late, 1);
+    assert.deepEqual(reader.with('other', body=>[...body]), [...bodyOf(9000, 5)]);
+});
+
 test('a reservation written anew before its commit, its writer gone, gives its room and record back',
     async()=>{
         const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,

@@ -142,7 +142,8 @@ A `reserve` the keeper refuses leaves the name's body as it was; one it grants t
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
 the name has no body then, and the room goes back. A reservation neither committed nor abandoned
 within `abandonAfterMs` (five minutes by default) is taken back by the sweep after: its writer is
-taken for gone, its room goes back, and a `commit` after it answers false, as `put` then does. A
+taken for gone, its room goes back, and a `commit` after it answers false, as `put` then does; a
+reader handed such a place later (room asked for ahead) refuses it, `reserve` answering null. A
 writer still writing past that writes into room another body may be given, so one that can take
 longer raises it. A thread terminated inside `with` stays counted, as a bell's wait terminated
 asleep does: its body stays hot and its room held for the run. The count is one word of the

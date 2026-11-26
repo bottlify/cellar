@@ -190,6 +190,18 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
+     * Whether `place` is still a reservation its writer may write into: the
+     * keeper takes back one held past `abandonAfterMs`, and its room may be
+     * another body's by now (a place granted ahead and handed over late).
+     *
+     * @param {Place} place
+     */
+    const stillReserved = place=>{
+        const word = Atomics.load(index.cover(place.id), index.at(place.id) + R_STATE);
+        return word === stateWord(WRITING, place.mark) || word === stateWord(RETIRED_WRITING, place.mark);
+    };
+
+    /**
      * Ends the reservation `place` as `state` (HOT for a commit, GONE for an
      * abandon): false where the keeper took it back, its writer too late. A
      * reservation whose name was written anew meanwhile only lets its writer
@@ -361,6 +373,13 @@ export function createReader({ shared, segments = [], keeper }){
                 // Placed where this reader cannot write: given back.
                 self.abandon(name);
                 counts.refused++;
+                return null;
+            }
+            if (!stillReserved(place))
+            {
+                // Taken back before a byte was written: nothing to give back.
+                writing.delete(name);
+                counts.late++;
                 return null;
             }
             counts.reserved++;
