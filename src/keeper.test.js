@@ -1506,3 +1506,43 @@ test('a save with nothing changed writes nothing, and one after a change writes 
     assert.equal(keeper.figures().wholeSaves, 2, 'a delta');
     assert.ok(delta < 200, `${delta} bytes for one body, the base ${savedBytes / 2}`);
 });
+
+test('what a saved index names is read without a keeper as a keeper opening it reads it, a torn '
+    + 'newest one leaving the one before', async()=>{
+    const { INDEX_FILES, packFile, readSaved } = await import('./keeper.js');
+    const disk = memoryDisk();
+    const { reader, keeper, step } = await cacheOf({ disk });
+    for (let i = 0; i < 6; i++)
+    {
+        reader.put(`n${i}`, bodyOf(20 * KIB, i));
+    }
+    reader.put('only', bodyOf(5000, 9), { onlyCopy: true });
+    reader.put('run', bodyOf(5000, 10), { onlyCopy: true, disk: 'run' });
+    step(100);
+    assert.equal(keeper.save(), true);
+    const bytes = ()=>INDEX_FILES.map(name=>disk.files.get(name)?.slice() ?? null);
+    const saved = readSaved(bytes());
+    assert.ok(saved);
+    assert.deepEqual([...saved.bodies.keys()].sort(), ['n0', 'n1', 'n2', 'n3', 'n4', 'n5', 'only'],
+        'every body the next run reads, and not one of this run only');
+    for (const [name, body] of saved.bodies)
+    {
+        const pack = /** @type {Uint8Array} */ (disk.files.get(packFile(body.pack)));
+        const expected = name === 'only' ? bodyOf(5000, 9) : bodyOf(20 * KIB, Number(name.slice(1)));
+        assert.deepEqual(pack.subarray(body.offset, body.offset + body.length), expected, name);
+    }
+    // The next save: a body more, then its delta cut short.
+    reader.put('n6', bodyOf(20 * KIB, 6));
+    step(100);
+    const before = bytes();
+    assert.equal(keeper.save(), true);
+    const after = bytes();
+    const grown = after.findIndex((file, at)=>(file?.length ?? 0) !== (before[at]?.length ?? 0));
+    assert.ok(grown >= 0, 'the save wrote one of the files');
+    assert.ok(readSaved(after)?.bodies.has('n6'));
+    after[grown] = /** @type {Uint8Array} */ (after[grown]).subarray(0,
+        /** @type {Uint8Array} */ (after[grown]).length - 1);
+    assert.equal(readSaved(after)?.bodies.has('n6'), false, 'torn: the index before it');
+    assert.equal(readSaved([null, null]), null);
+    keeper.close();
+});

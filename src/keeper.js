@@ -50,6 +50,49 @@ const MAX_NAME_UNITS = 1 << 25;
 const FIRST_TABLE = 1024;
 /** Packs a run opens at most: 64 TiB of the default packs. */
 const MAX_PACKS = 1 << 20;
+/** The keeper's two index files: a save goes to the one not holding the last whole base. */
+export const INDEX_FILES = /** @type {const} */ (['index-a', 'index-b']);
+
+/** A pack's file on the disk. @param {number} number */
+export const packFile = number=>`pack-${number}`;
+
+/**
+ * Which of the two index files is the index: the whole one of the later
+ * generation, -1 for neither.
+ *
+ * @param {(import('./index-file.js').IndexFileState | null)[]} read
+ */
+const newerIndex = read=>(read[1] !== null && (read[0] === null
+    || read[1].generation > read[0].generation) ? 1 : read[0] !== null ? 0 : -1);
+
+/**
+ * The bodies a keeper's disk holds as its last saved index says, read without
+ * a keeper and without writing anything: a page asking how much of a cache is
+ * there, or putting a whole file together from its bodies. Each body by name,
+ * in pack `packFile(pack)` at `offset`, `length` bytes; null where neither
+ * file is an index. A body past its pack's end is the reader's to check: the
+ * index is true of the disk only as of its save.
+ *
+ * @param {(Uint8Array | null)[]} files  the bytes of `INDEX_FILES`, in order; null for one
+ *     the disk does not have
+ * @returns {{ packs: number[], bodies: Map<string, { pack: number, offset: number,
+ *     length: number }> } | null}
+ */
+export function readSaved(files){
+    const read = INDEX_FILES.map((_, at)=>{
+        const bytes = files[at];
+        return bytes ? readIndexFile(bytes, MAX_PACKS, F_ONLY_COPY) : null;
+    });
+    const chosen = newerIndex(read);
+    const saved = chosen < 0 ? null : read[chosen];
+    if (!saved)
+    {
+        return null;
+    }
+    return { packs: [...saved.packs], bodies: new Map([...saved.entries].map(([name, entry])=>
+        [name, { pack: entry.pack, offset: entry.offset, length: entry.length }])) };
+}
+
 /**
  * Where a body may go on the disk: `kept` there and named in the saved index
  * for the next run (the default), there for this `run` only (a cold body that
@@ -561,7 +604,7 @@ export async function openKeeper(options){
             const opening = disk;
             // A disk that throws at once fails the same way as one whose
             // promise does: counted, and the body that wanted it stays.
-            nextPack = Promise.resolve().then(()=>opening.open(`pack-${number}`))
+            nextPack = Promise.resolve().then(()=>opening.open(packFile(number)))
                 .then(file=>{
                     nextPack = null;
                     // Opened after the keeper closed: let go of here, once, and
@@ -569,7 +612,7 @@ export async function openKeeper(options){
                     if (closed)
                     {
                         closeFile(file);
-                        Promise.resolve().then(()=>opening.remove?.(`pack-${number}`))
+                        Promise.resolve().then(()=>opening.remove?.(packFile(number)))
                             .catch(()=>{
                                 counts.diskFailures++;
                             });
@@ -729,7 +772,7 @@ export async function openKeeper(options){
         }
         // A handle open on a file keeps it on OPFS: closed first.
         closeFile(file);
-        Promise.resolve().then(()=>opening.remove?.(`pack-${number}`)).catch(()=>{
+        Promise.resolve().then(()=>opening.remove?.(packFile(number))).catch(()=>{
             counts.diskFailures++;
         });
     };
@@ -956,7 +999,6 @@ export async function openKeeper(options){
      * @type {{ file: DiskFile, end: number, onlyCopies: Set<number> }[]}
      */
     const slots = [];
-    const INDEX_FILES = ['index-a', 'index-b'];
     /** The file the last whole save wrote, its deltas after it; -1 for none. */
     let current = -1;
     let generation = 0;
@@ -1013,8 +1055,7 @@ export async function openKeeper(options){
         read.forEach((state, at)=>{
             slots[at].onlyCopies = state?.onlyCopies ?? new Set();
         });
-        const chosen = read[1] !== null && (read[0] === null || read[1].generation > read[0].generation)
-            ? 1 : read[0] !== null ? 0 : -1;
+        const chosen = newerIndex(read);
         const saved = read[chosen];
         if (saved === null || saved === undefined)
         {
@@ -1027,7 +1068,7 @@ export async function openKeeper(options){
         counts.skippedEntries += saved.skipped;
         for (const number of saved.packs)
         {
-            const file = await disk.open(`pack-${number}`);
+            const file = await disk.open(packFile(number));
             packs.set(number, file);
             filled.set(number, file.getSize());
             live.set(number, 0);

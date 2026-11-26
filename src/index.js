@@ -12,7 +12,7 @@
  * name, under one budget, idle ones on the disk (OPFS).
  */
 
-export { openKeeper } from './keeper.js';
+export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
 export { createReader } from './reader.js';
 export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } from './channel.js';
 export { SPIN_MS, createDoorbell, createSpin, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
