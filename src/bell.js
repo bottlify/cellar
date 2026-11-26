@@ -114,7 +114,9 @@ export const learnt = (spin, looks, slept)=>slept
  * How a wait ended: the word moved before it counted itself asleep (`moved`)
  * or after (`woke`: a mover may have seen the count and notified it, whether
  * or not the sleep itself began), the deadline passed (`timed-out`), or the
- * closed word was set first (`closed`). `woke` is what a mover's notifies are
+ * closed word was set with the word not moved (`closed`): a word moved
+ * before the close is what the wait was for, and the close after it takes
+ * nothing from it (an answer written, then the channel closed). `woke` is what a mover's notifies are
  * held to, not a count of the times the thread slept: a wait that counted
  * itself asleep and found its word moved at its last look never slept.
  *
@@ -197,6 +199,10 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
         {
             if (closed >= 0 && Atomics.load(words, closed) !== 0)
             {
+                if (Atomics.load(words, index) !== seen)
+                {
+                    break;
+                }
                 return 'closed';
             }
             if (looks >= most || (timed && clock.now() >= deadline))
@@ -229,6 +235,10 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
     {
         if (closed >= 0 && Atomics.load(words, closed) !== 0)
         {
+            if (Atomics.load(words, index) !== seen)
+            {
+                break;
+            }
             return 'closed';
         }
         const left = deadline === Infinity ? Infinity : deadline - clock.now();
@@ -277,6 +287,10 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
     {
         if (closed >= 0 && Atomics.load(words, closed) !== 0)
         {
+            if (Atomics.load(words, index) !== seen)
+            {
+                break;
+            }
             return 'closed';
         }
         const left = deadline - clock.now();

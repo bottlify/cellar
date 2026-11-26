@@ -216,6 +216,10 @@ worker started again) makes a new channel. Answers come back in order, as many r
 once as there are slots; a call waiting for room goes out as soon as one answer frees a slot. A
 blocking ask makes no garbage, answered at once or after its handler worked a while: the request
 and answer are read where they lie, and a wait reads the clock only when it has a deadline.
+Either side closes the channel when it goes: every wait on it ends with `ChannelClosed`, and every
+call and ask after it, but what came before the close still arrives - a request sent before it is
+served, an answer written before it is the asker's. Memory that is not a channel of this layout
+(made by `createChannel`) is refused when an end opens over it.
 
 A handler that throws, or answers more than a slot holds, answers its request with the failure:
 the call or ask fails with `ChannelFailed`, saying what the handler threw (as much as a slot
@@ -317,7 +321,8 @@ again). Either side closes a ring when it goes or knows the other went: a writer
 room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
 reading what was written before: it looks at `closed()` before its drain, as the loop above does,
 and goes once a drain followed a close (one that looked after the drain would leave a record
-written just before the close unread). A `take` may not drain its own ring (it holds the record being
+written just before the close unread). Memory that is not a ring of this layout is refused when a
+side opens over it. A `take` may not drain its own ring (it holds the record being
 taken), and `release` frees only a record `peek` returned: either throws rather than free a
 record not read. A record is bytes, as a channel's request and answer and a body the cache is
 handed are: a `Uint8Array` (or another view of one-byte elements) or an array of integers from 0
@@ -326,8 +331,9 @@ wider typed array, a `DataView`, a buffer, a string, an object with only a lengt
 byte.
 
 `waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
-`Int32Array`, for a protocol of its own; `deadlineOf(timeoutMs)` is a deadline on the clock they
-read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
+`Int32Array`, for a protocol of its own (a wait given a closed word ends `'closed'` once it is set,
+unless its word moved before: then that move is what it answers); `deadlineOf(timeoutMs)` is a
+deadline on the clock they read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
 time: a wait with no deadline never reads the clock). A doorbell's, a ring writer's and a channel
 end's waits learn how long to look (`createSpin`, also a `spinMs` of `waitFor`): a wait that went
 to sleep all the same makes the next look an eighth less, down to a few hundred looks, one that
