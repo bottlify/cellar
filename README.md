@@ -123,8 +123,13 @@ self.onmessage = ({ data })=>{
 };
 ```
 
-A body is read only inside `with`: the keeper never takes a body a reader is in. A body that can
-be made again goes away when there is no room and no disk; one marked `onlyCopy` never does.
+A body is read only inside `with`: the keeper never takes a body a reader is in. A body the keeper
+is moving (to the disk, back from it, or held while room for the name's next body is found) is
+there: `look` says `'cold'`, `with` misses it and asks for it back, and `with` given `{ wait: true }`
+reads it once the move is over. A name is a string; anything else is refused (`TypeError`). A body
+that can be made again goes away when there is no room and no disk; one marked `onlyCopy` never
+does. Room is made only where it forms a block for the body asked: a body leaves only with the
+others in that block, and a request no block can be formed for moves nothing.
 `readSaved([indexA, indexB])` reads what a keeper's disk holds without a keeper and without
 writing: the bytes of `INDEX_FILES` in, each body's pack (`packFile(n)`), offset and length out,
 as the last whole save names them (a page asking how much of a cache is there).
@@ -135,7 +140,14 @@ be made again goes away and an only copy stays in memory.
 
 A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
-the name has no body then, and the room goes back. A thread joining later is handed
+the name has no body then, and the room goes back. A reservation neither committed nor abandoned
+within `abandonAfterMs` (five minutes by default) is taken back by the sweep after: its writer is
+taken for gone, its room goes back, and a `commit` after it answers false, as `put` then does. A
+writer still writing past that writes into room another body may be given, so one that can take
+longer raises it. A thread terminated inside `with` stays counted, as a bell's wait terminated
+asleep does: its body stays hot and its room held for the run. The count is one word of the
+record, no thread's in particular; only the host knows a thread died, and a count taken back by
+time would take a body from a reader that was only slow. A thread joining later is handed
 `keeper.shared` and `keeper.segmentBuffers()` as they are then. A write the disk takes in part
 counts as not written. `save()` writes the hot bodies the disk lacks, then an index of exactly the
 bodies the disk holds, after the packs are flushed: the index is always true, and `false` says some
@@ -155,11 +167,14 @@ goes on: a thread not told of a segment is never placed in it. After `close()` t
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
 good), a cold one is the next run's, on the disk, and no body of this run any more.
 `budget` is a finite number of bytes; `segmentBytes` a power of two from 4 KiB to 1 GiB;
-`packBytes` under 2 GiB; a body's length a whole number of bytes. The idle spans (`coldAfterMs`,
-`goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's
-clock is a 32-bit word. Records and names are not reused within a run: a run holds 2^20 records
-and 2^25 UTF-16 units of names, past which a new name is refused. The `raise` a reader is given
+`packBytes` under 2 GiB; a body's length a whole number of bytes. The spans (`coldAfterMs`,
+`goneAfterMs`, `releaseAfterMs`, `abandonAfterMs`) are under 24.8 days: the keeper's
+clock is a 32-bit word. Names are not reused within a run: a run holds 2^20 names and 2^25 UTF-16
+units of them, past which a new name is refused; a record a name was written anew under while it
+was read goes back for another name once its readers are out. The `raise` a reader is given
 takes `{ known }`, the segments that reader has: a body is brought back only where it can read it.
+What the `reserve` it is given answers is handed to it whole: `{ id, segment, offset, mark }`, the
+mark naming the reservation its `commit` ends.
 
 ## Channel
 
