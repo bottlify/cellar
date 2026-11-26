@@ -1,6 +1,6 @@
 {
   "name": "@bottlify/cellar",
-  "version": "0.14.2",
+  "version": "1.0.0",
   "type": "module",
   "license": "MPL-2.0",
   "description": "Shared-memory primitives for multithreaded JavaScript: thread synchronization, byte rings, channels between threads and a cache of bodies read in place",
