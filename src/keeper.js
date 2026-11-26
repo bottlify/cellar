@@ -664,7 +664,8 @@ export async function openKeeper(options){
      * nothing is remembered past the tick it was learnt in.
      * `fruitlessAt`: the tick a fresh list held no candidate at all - no body
      * hot and unread - which no request of any size, segments known or record
-     * spared can be placed by. `fruitless`: the requests of `fruitlessTick` a
+     * spared can be placed by; a list made while a reserve held its own name's
+     * body proves that only for its own request. `fruitless`: the requests of `fruitlessTick` a
      * list with candidates gave no room for, by block, segments known and
      * record spared: the refusal of a large block says nothing of a small one.
      */
@@ -870,7 +871,9 @@ export async function openKeeper(options){
                 const asked = `${block}:${limit}:${spare}`;
                 if (listed)
                 {
-                    if (oldestCount === 0)
+                    // A list made while the record spared was held for its
+                    // own reserve says nothing of that body for any other.
+                    if (oldestCount === 0 && (spare < 0 || stateOf(stateWordOf(spare)) !== MOVING))
                     {
                         fruitlessAt = now;
                     }

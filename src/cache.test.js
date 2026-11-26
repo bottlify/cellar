@@ -502,6 +502,28 @@ test('a commit\'s stamp lands on its own body, not on the reservation its record
     }
 });
 
+test('a reserve refused in a tick does not refuse one of more segments known, or one its own '
+    + 'body could make room for', async()=>{
+    // Segments known: an only copy fills the one a writer has; a body that
+    // can leave lies in the one it has not heard of yet.
+    const known = await cacheOf({ budget: 2 * UNIT, segmentBytes: UNIT });
+    assert.equal(known.reader.put('pin', bodyOf(UNIT, 1), { onlyCopy: true, disk: 'never' }), true);
+    assert.equal(known.reader.put('free', bodyOf(UNIT, 2), { disk: 'never', idle: 'stay' }), true);
+    assert.equal(known.keeper.reserve('x', UNIT, { onlyCopy: false, disk: 'kept', idle: 'go', known: 1 }),
+        null, 'no room in the first segment');
+    assert.ok(known.reader.reserve('y', UNIT), 'a writer of both makes it from the second');
+
+    // The record spared: a name's own body is not cooled for its own
+    // reserve, and is held while room is looked for; for another name's it
+    // is the body that can leave.
+    const spared = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT });
+    assert.equal(spared.reader.put('a', bodyOf(UNIT, 3), { disk: 'never', idle: 'stay' }), true);
+    assert.equal(spared.reader.reserve('a', 2 * UNIT), null, 'its own body is not cooled for it');
+    assert.equal(spared.reader.look('a'), 'hot', 'and stays as it was');
+    assert.ok(spared.reader.reserve('b', 2 * UNIT), 'another name\'s takes its room');
+    assert.equal(spared.reader.look('a'), null);
+});
+
 test('a large reserve refused in a tick does not refuse a small one the same tick could place', async()=>{
     // The refusal of a block of 8 KiB, whose other half holds an only copy,
     // says nothing of a block of 4 KiB: a body that can leave makes it.
