@@ -401,7 +401,8 @@ test('a cold body is raised only into a segment the asking thread has', async()=
     assert.equal(late.with('a', body=>body[1], { wait: true }), (31 + 1) & 255);
 });
 
-test('a body the disk holds less of than the index says is gone, not answered with other bytes',
+test('a body the disk holds less of than the index says is gone, or an only copy stays cold, not'
+    + ' answered with other bytes',
     async()=>{
         // The pack gone before the run: its entries are skipped as the index is read.
         const disk = memoryDisk();
@@ -428,14 +429,22 @@ test('a body the disk holds less of than the index says is gone, not answered wi
         };
         const third = await cacheOf({ disk: cut });
         third.reader.put('doc', bodyOf(8000, 6), { onlyCopy: true });
+        third.reader.put('block', bodyOf(8000, 7));
         third.step(150);
-        assert.equal(third.reader.look('doc'), 'cold');
+        assert.deepEqual([third.reader.look('doc'), third.reader.look('block')], ['cold', 'cold']);
         third.reader.put('other', bodyOf(8000, 99));
         third.keeper.drop('other');
         short = true;
-        assert.equal(third.reader.with('doc', body=>body.slice(), { wait: true }), undefined);
-        assert.equal(third.reader.look('doc'), null);
+        assert.equal(third.reader.with('block', body=>body.slice(), { wait: true }), undefined);
+        assert.equal(third.reader.look('block'), null, 'one that can be made again is gone');
         assert.equal(third.keeper.figures().lostOnDisk, 1);
+        const failures = third.keeper.figures().diskFailures;
+        assert.equal(third.reader.with('doc', body=>body.slice(), { wait: true }), undefined);
+        assert.equal(third.reader.look('doc'), 'cold', 'an only copy is not let go on a read');
+        assert.equal(third.keeper.figures().lostOnDisk, 1);
+        assert.equal(third.keeper.figures().diskFailures, failures + 1, 'the read a failure, counted');
+        short = false;
+        assert.deepEqual(third.reader.with('doc', body=>[...body], { wait: true }), [...bodyOf(8000, 6)]);
     });
 
 test('a body saved by a run of larger segments is not raised, and moves nothing', async()=>{
@@ -1987,4 +1996,40 @@ test('a save flushes each pack once, not once a body; where that flush fails, no
     assert.equal(keeper.save(), true);
     assert.deepEqual(await nextRunReads(disk.crash(), ['lost', 'only0'], { budget: 1024 * KIB }),
         [[...bodyOf(3000, 7)], [...bodyOf(64, 0)]]);
+});
+
+test('a pack compacted that reads short keeps its only copy cold and counts the failure; a body that'
+    + ' can be made again there is gone', async()=>{
+    const base = crashDisk();
+    let short = false;
+    const disk = { remove: base.remove, async open(/** @type {string} */ name){
+        const file = await base.open(name);
+        return { ...file, read: (/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where)=>
+            (short && name === 'pack-0' ? file.read(view.subarray(0, view.length >> 1), where)
+                : file.read(view, where)) };
+    } };
+    const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
+    reader.put('block', bodyOf(5 * KIB, 1));
+    reader.put('only', bodyOf(5 * KIB, 2), { onlyCopy: true });
+    for (let i = 0; i < 5; i++)
+    {
+        reader.put(`a${i}`, bodyOf(10 * KIB, 3 + i));
+    }
+    step(150);
+    await settle();
+    reader.put('b', bodyOf(10 * KIB, 9));
+    step(150);
+    for (let i = 0; i < 5; i++)
+    {
+        reader.drop(`a${i}`);
+    }
+    short = true;
+    const failures = keeper.figures().diskFailures;
+    step(1);
+    assert.equal(reader.look('block'), null);
+    assert.equal(keeper.figures().lostOnDisk, 1);
+    assert.equal(reader.look('only'), 'cold');
+    assert.equal(keeper.figures().diskFailures, failures + 1);
+    short = false;
+    assert.deepEqual(reader.with('only', body=>[...body], { wait: true }), [...bodyOf(5 * KIB, 2)]);
 });

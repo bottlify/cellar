@@ -120,8 +120,12 @@ const REFUSED = -2;
  * A file on the disk as the keeper uses it: the shape of a
  * `FileSystemSyncAccessHandle`. Its methods are called on the keeper's thread
  * in the middle of its work and call none of the keeper's methods; one that
- * throws, or reads or writes less than asked, is a failure of the disk,
- * counted (`diskFailures`), and the body stays where it was.
+ * throws, or writes less than asked, is a failure of the disk, counted
+ * (`diskFailures`), and the body stays where it was. A body read back short
+ * says its pack holds less than the index: one that can be made again is
+ * gone (`lostOnDisk`); an only copy stays cold, the read counted a failure,
+ * for the keeper never lets an only copy go on its own judgement, and a run
+ * reading its pack afresh skips it there if the pack is short (counted).
  *
  * @typedef {Object} DiskFile
  * @property {(view: Uint8Array, options: { at: number }) => number} read
@@ -912,29 +916,33 @@ export async function openKeeper(options){
             return false;
         }
         const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[found.segment]);
-        let read = 0;
+        /** Bytes read, -1 where the disk threw. */
+        let read = -1;
         try
         {
             read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(found.offset,
                 found.offset + length), { at: get(id, R_PACK_OFFSET) });
         }
-        catch {
-            giveRoom(found.segment, found.offset, length);
-            counts.diskFailures++;
-            store(id, COLD);
-            counts.raiseFailed++;
-            return false;
+        catch
+        {
+            // A disk that threw: counted below.
         }
         if (read !== length)
         {
-            // The pack holds less than the index says (cut, or removed in
-            // the origin): the body is not on the disk any more.
             giveRoom(found.segment, found.offset, length);
-            forgetDisk(id);
-            set(id, R_FLAGS, 0);
-            store(id, GONE);
-            counts.lostOnDisk++;
             counts.raiseFailed++;
+            if (read >= 0 && (get(id, R_FLAGS) & F_ONLY_COPY) === 0)
+            {
+                // The pack holds less than the index says (cut, or removed in
+                // the origin): the body is not on the disk any more.
+                forgetDisk(id);
+                set(id, R_FLAGS, 0);
+                store(id, GONE);
+                counts.lostOnDisk++;
+                return false;
+            }
+            counts.diskFailures++;
+            store(id, COLD);
             return false;
         }
         set(id, R_SEGMENT, found.segment);
@@ -1006,16 +1014,17 @@ export async function openKeeper(options){
                     carry = new Uint8Array(length);
                 }
                 bytes = carry.subarray(0, length);
-                let read = 0;
+                /** Bytes read, -1 where the disk threw. */
+                let read = -1;
                 try
                 {
                     read = from.read(bytes, { at: get(id, R_PACK_OFFSET) });
                 }
-                catch {
-                    counts.diskFailures++;
-                    return;
+                catch
+                {
+                    // A disk that threw: counted below.
                 }
-                if (read !== length)
+                if (read >= 0 && read !== length && (flags & F_ONLY_COPY) === 0)
                 {
                     // The pack holds less than the index says: the body is gone.
                     forgetDisk(id);
@@ -1023,6 +1032,11 @@ export async function openKeeper(options){
                     store(id, GONE);
                     counts.lostOnDisk++;
                     continue;
+                }
+                if (read !== length)
+                {
+                    counts.diskFailures++;
+                    return;
                 }
             }
             const at = append(bytes, (flags & F_ONLY_COPY) !== 0);
