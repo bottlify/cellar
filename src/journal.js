@@ -20,17 +20,25 @@
  * a copy of the reader's own, made and checked before `take` sees it: only a
  * whole record is ever handed on.
  *
- * Why copies, on both sides: the writer writes over the bytes of records a
+ * Why the check is honest: the writer writes over the bytes of records a
  * reader may be reading that moment, and the reader can tell only by a count
  * the writer moves before it writes a byte, which the reader checks after it
- * read the last one. That order holds between atomic accesses alone. A plain
- * store may be seen before an atomic store made ahead of it, and a plain load
- * may be satisfied after an atomic load made behind it: the JavaScript memory
- * model allows both, and arm64 does both (V8's `Atomics` are bare stlr and
- * ldar there, no barrier between them and plain accesses). So every word of
- * a record goes into the journal by `Atomics.store`, after the count moved,
- * and comes out by `Atomics.load`, before the check; the code of neither side
- * touches the journal's bytes itself.
+ * read the last one. The bytes themselves go in and come out by plain stores
+ * and loads, and those are not held in order by an atomic access alone: a
+ * plain store may be seen before a store-release made ahead of it, and a
+ * plain load satisfied after a load-acquire made behind it (arm64 does both;
+ * V8's `Atomics` are bare stlr and ldar there). What holds them is a
+ * sequentially consistent store followed by a sequentially consistent load:
+ * those two may not change places, and every engine keeps them in place with
+ * something that holds the plain accesses around them too - a locked
+ * instruction or mfence on x86; on arm64 a store-release then a load-acquire,
+ * which arm64 never reorders and which order what is before the one and after
+ * the other, or a dmb. So the writer moves the count and loads it again
+ * before it writes a byte, and a reader, its copy made, stores a word of its
+ * own and then loads the count. This rests on how engines compile `Atomics`,
+ * not on the JavaScript memory model, which orders racing plain accesses by
+ * nothing; it costs two atomic accesses a record on each side, where an
+ * atomic access a word cost three to four times a record's plain writing.
  *
  * Each record is whole in the buffer (one that would run past the end starts
  * the buffer again), behind a header of its length and sequence, and the
@@ -196,6 +204,14 @@ class Journal {
     #draft = NONE;
     #draftWords = new Int32Array(0);
     /**
+     * A word of this opening's own that a reader stores to between its copy
+     * and its check; null over memory of one thread, where nothing races and
+     * neither side pairs its accesses.
+     *
+     * @type {Int32Array | null}
+     */
+    #ownWord;
+    /**
      * A reader's copies, one a depth of reads inside one another's `take`,
      * each a view and the same bytes as words.
      *
@@ -218,6 +234,8 @@ class Journal {
             throw new Error('journal: the memory is not a journal of this layout');
         }
         this.#words = words;
+        this.#ownWord = typeof SharedArrayBuffer === 'function' && buffer instanceof SharedArrayBuffer
+            ? new Int32Array(new SharedArrayBuffer(4)) : null;
         /** Records a reader can still find by sequence. */
         this.records = words[RECORDS];
         /** Bytes of records the journal holds. */
@@ -299,17 +317,25 @@ class Journal {
         const words = this.#words;
         // Moved before a word is written over: a reader checks its copy
         // against it after, and the check is honest only if it covers them.
+        // Loaded again before the first of them: the pair holds the plain
+        // stores after it (see above).
         Atomics.store(words, HEAD, this.#head | 0);
+        if (this.#ownWord !== null)
+        {
+            Atomics.load(words, HEAD);
+        }
         const sequence = (this.#firstSequence + this.#count) >>> 0;
         const place = this.#base + ((start & this.#mask) >> 2);
-        Atomics.store(words, place, length);
-        Atomics.store(words, place + 1, sequence | 0);
+        words[place] = length;
+        words[place + 1] = sequence | 0;
         const draft = this.#draftWords;
         for (let n = 0, end = (length + 3) >> 2; n < end; n++)
         {
-            Atomics.store(words, place + 2 + n, draft[n]);
+            words[place + 2 + n] = draft[n];
         }
-        Atomics.store(words, CONTROL_WORDS + (sequence & this.#indexMask), start | 0);
+        words[CONTROL_WORDS + (sequence & this.#indexMask)] = start | 0;
+        // Stored after every word, by a store-release at least: a reader that
+        // loads it and finds the record finds its words.
         this.#count = (this.#count + 1) >>> 0;
         Atomics.store(words, WRITTEN, this.#count | 0);
         // After the count: a reader that finds the word set and reads the
@@ -378,14 +404,17 @@ class Journal {
         {
             return -1;
         }
+        // Plain loads from here to the check: a word the writer wrote over
+        // since the count of records was loaded is caught by the check, and
+        // the bounds below keep any word read from leading the copy astray.
         const words = this.#words;
-        const start = Atomics.load(words, CONTROL_WORDS + (sequence & this.#indexMask)) >>> 0;
+        const start = words[CONTROL_WORDS + (sequence & this.#indexMask)] >>> 0;
         const at = start & this.#mask;
         const place = this.#base + (at >> 2);
-        const length = Atomics.load(words, place) >>> 0;
+        const length = words[place] >>> 0;
         // Another record's header, or words being written: refused before a
         // word is copied, so no copy runs past the room a record could have.
-        if ((Atomics.load(words, place + 1) >>> 0) !== sequence
+        if ((words[place + 1] >>> 0) !== sequence
             || length > this.capacity - HEADER - at)
         {
             return -1;
@@ -400,10 +429,16 @@ class Journal {
         const into = this.#copyWords[depth];
         for (let n = 0, end = (length + 3) >> 2; n < end; n++)
         {
-            into[n] = Atomics.load(words, place + 2 + n);
+            into[n] = words[place + 2 + n];
         }
-        // After the last load: the writer moves this count before it writes
-        // over a word, so a copy that took one of them sees it moved.
+        // After the last load, behind a store of this opening's own: the
+        // pair holds the copy's loads before it (see above). The writer moves
+        // this count before it writes over a word, so a copy that took one of
+        // them sees it moved.
+        if (this.#ownWord !== null)
+        {
+            Atomics.store(this.#ownWord, 0, 0);
+        }
         return ((Atomics.load(words, HEAD) - start) >>> 0) <= this.capacity ? length : -1;
     }
 

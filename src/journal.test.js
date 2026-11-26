@@ -188,31 +188,37 @@ test('a writer lapping a record between any two loads of its read: the read answ
     }
 });
 
-test('every word of a record goes into the journal by Atomics.store after the count of bytes, '
-    + 'and comes out by Atomics.load before the check of it', ()=>{
+test('the writer moves the count of bytes and loads it again before a word of a record changes, '
+    + 'and the count of records after the last; a reader, its copy whole, stores a word of its own '
+    + 'and then loads the count of bytes', ()=>{
     // What makes the check honest on a processor that reorders plain accesses
-    // (arm64): an x86 machine cannot show the reordering, so the order the
-    // journal relies on is what this pins.
+    // around atomic ones (arm64): an x86 machine cannot show the reordering,
+    // so the pairs the journal relies on are what this pins.
     const memory = createJournalMemory({ records: 16, bytes: 256 });
     const words = new Int32Array(memory.buffer);
     const journal = openJournal(memory);
     const reader = openJournal(memory);
     const load = Atomics.load;
     const store = Atomics.store;
-    /** @type {{ op: string, index: number }[]} */
+    /** @type {{ op: string, journal: boolean, index: number, changed: number[] }[]} */
     const log = [];
+    /** @type {Int32Array} */
+    let before = words.slice();
+    /** Run once at the reader's store of its own word: a writer's word landing then. */
+    let atOwnStore = ()=>{};
+    const changed = ()=>[...words.keys()].filter(index=>index >= 8 + 16 && words[index] !== before[index]);
     /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ index)=>{
-        if (array.buffer === memory.buffer)
-        {
-            log.push({ op: 'load', index: index + array.byteOffset / 4 });
-        }
+        const journalWord = array.buffer === memory.buffer;
+        log.push({ op: 'load', journal: journalWord, index: index + array.byteOffset / 4, changed: changed() });
         return load(array, index);
     };
     /** @type {any} */ (Atomics).store = (/** @type {any} */ array, /** @type {number} */ index,
         /** @type {number} */ value)=>{
-        if (array.buffer === memory.buffer)
+        const journalWord = array.buffer === memory.buffer;
+        log.push({ op: 'store', journal: journalWord, index: index + array.byteOffset / 4, changed: changed() });
+        if (!journalWord)
         {
-            log.push({ op: 'store', index: index + array.byteOffset / 4 });
+            atOwnStore();
         }
         return store(array, index, value);
     };
@@ -221,10 +227,10 @@ test('every word of a record goes into the journal by Atomics.store after the co
         for (let n = 0; n < 60; n++)
         {
             const length = 1 + (n * 13) % 40;
-            // Records poisoned with words no commit writes: a store the
-            // journal made plainly shows as a word changed and not logged.
+            // Records poisoned with words no commit writes, so a word the
+            // commit wrote shows as changed.
             words.fill(0x7f7f7f7f, 8 + 16);
-            const before = words.slice();
+            before = words.slice();
             log.length = 0;
             const view = journal.draft(length);
             assert.notEqual(view.buffer, memory.buffer, 'drafted in the writer\'s own memory');
@@ -234,39 +240,33 @@ test('every word of a record goes into the journal by Atomics.store after the co
                 view.setUint8(at, (n * 7 + at + 1) & 0xff ^ 0x5a);
             }
             const sequence = journal.commit();
-            const stores = log.filter(entry=>entry.op === 'store').map(entry=>entry.index);
-            const changed = [...words.keys()].filter(index=>words[index] !== before[index]);
-            assert.deepEqual(changed.filter(index=>!stores.includes(index)), [],
-                `commit ${n}: every word it changed was stored atomically`);
-            const head = stores.indexOf(HEAD_WORD);
-            const recordWords = stores.filter(index=>index >= 8 + 16);
-            assert.ok(head >= 0 && recordWords.length >= 2 + Math.ceil(length / 4),
-                `commit ${n}: the header and every word of the record stored`);
-            assert.ok(recordWords.every(index=>stores.indexOf(index) > head),
-                `commit ${n}: the count of bytes moved before any word of a record`);
-            const written = stores.indexOf(WRITTEN_WORD);
-            assert.ok(written > Math.max(...recordWords.map(index=>stores.indexOf(index))),
-                `commit ${n}: the count of records moved after every word`);
-            // The read: every word of the record, header included, loaded
-            // atomically, and all of them before the last load of the count of bytes.
+            const ops = log.filter(entry=>entry.journal);
+            assert.deepEqual([ops[0].op, ops[0].index], ['store', HEAD_WORD], `commit ${n}: the count of bytes first`);
+            assert.deepEqual([ops[1].op, ops[1].index], ['load', HEAD_WORD], `commit ${n}: loaded again at once`);
+            assert.deepEqual(ops[1].changed, [], `commit ${n}: no word of a record changed before the pair`);
+            const written = ops.findIndex(entry=>entry.op === 'store' && entry.index === WRITTEN_WORD);
+            assert.ok(written > 1, `commit ${n}: the count of records stored`);
+            assert.deepEqual(ops[written].changed, changed(),
+                `commit ${n}: every word of the record written before the count of records`);
+            assert.ok(changed().length >= 2 + Math.ceil(length / 4), `commit ${n}: the header and the record written`);
+
+            // The read: its copy whole when its own word is stored, the check after.
+            const whole = words.slice();
+            before = words.slice();
+            atOwnStore = ()=>words.fill(0x11111111, 8 + 16);
             log.length = 0;
-            /** @type {number[]} */
-            let handed = [];
             const got = reader.read(sequence, (record, got)=>{
                 assert.notEqual(record.buffer, memory.buffer, 'take reads a copy of its own');
-                handed = log.filter(entry=>entry.op === 'load').map(entry=>entry.index);
-                return got;
+                return copy(record, got);
             });
-            assert.equal(got, length);
-            const lastHead = handed.lastIndexOf(HEAD_WORD);
-            const place = recordWords[0];
-            for (let index = place; index < place + 2 + Math.ceil(length / 4); index++)
-            {
-                const loaded = handed.indexOf(index);
-                assert.ok(loaded >= 0 && loaded < lastHead,
-                    `read ${n}: word ${index - place} of the record loaded atomically before the check`);
-            }
-            assert.equal(lastHead, handed.length - 1, `read ${n}: the check is the last load`);
+            atOwnStore = ()=>{};
+            words.set(whole);
+            assert.equal(got?.length, length, `read ${n}: answered`);
+            const expected = Uint8Array.from({ length }, (_, at)=>(n * 7 + at + 1) & 0xff ^ 0x5a);
+            assert.deepEqual(got, expected, `read ${n}: copied whole before its own word was stored`);
+            const last = log.slice(-2).map(entry=>[entry.op, entry.journal, entry.journal ? entry.index : -1]);
+            assert.deepEqual(last, [['store', false, -1], ['load', true, HEAD_WORD]],
+                `read ${n}: its own word stored, then the count of bytes loaded, last`);
         }
     }
     finally

@@ -457,9 +457,13 @@ it to `take` as a `DataView` and its length, answering what `take` returns; or u
 record was not there: not written yet, or written over before the copy was whole (the writer
 moves its count of bytes before it writes a word, and the read checks it after its last). `take`
 is handed only a whole record, and keeps nothing of the view: the next read copies over it (a read
-inside `take` copies into a view of its own). Both copies go word by word through `Atomics`, which
-is what keeps the check honest on a processor that reorders plain loads and stores, arm64 among
-them; a plain access to the journal's memory, by either side, would not be ordered against it.
+inside `take` copies into a view of its own). Both copies are plain; what keeps the check honest
+on a processor that reorders plain loads and stores around atomic ones, arm64 among them, is a
+sequentially consistent store and load in a row on each side, which no engine lets pass the plain
+accesses around them: the writer stores its count and loads it again before it writes a word, the
+reader stores a word of its own and then loads the count after its copy. That rests on how engines
+compile `Atomics` (a locked instruction or mfence on x86; a store-release then a load-acquire, or a
+dmb, on arm64), not on the JavaScript memory model, which orders racing plain accesses by nothing.
 A view the journal handed out stays its own until a longer record than any before needs a larger
 one; one kept past that fails where it is used. `oldest()` and `written()` bound what can be
 asked for; `first` in the memory's options starts the count where a journal it takes over from
