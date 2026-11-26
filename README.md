@@ -235,6 +235,10 @@ worker started again) makes a new channel. Answers come back in order, as many r
 once as there are slots; a call waiting for room goes out as soon as one answer frees a slot. A
 blocking ask makes no garbage, answered at once or after its handler worked a while: the request
 and answer are read where they lie, and a wait reads the clock only when it has a deadline.
+Either side closes the channel when it goes: every wait on it ends with `ChannelClosed`, and every
+call and ask after it, but what came before the close still arrives - a request sent before it is
+served, an answer written before it is the asker's. Memory that is not a channel of this layout
+(made by `createChannel`) is refused when an end opens over it.
 
 A handler that throws, or answers more than a slot holds, answers its request with the failure:
 the call or ask fails with `ChannelFailed`, saying what the handler threw (as much as a slot
@@ -292,13 +296,18 @@ import { openDoorbell, openRing } from '@bottlify/cellar';
 self.onmessage = ({ data })=>{
     const ring = openRing(data.memory);
     const doorbell = openDoorbell(data.memory.bell);
-    while (!ring.closed())
+    for (;;)
     {
         const seen = doorbell.seen();                // before the look: nothing written after it is missed
+        const closed = ring.closed();                // before the drain: what came before the close is drained
         ring.drain(record=>{                         // each record a view, valid inside the call
             const fields = new DataView(record.buffer, record.byteOffset, record.length);
             move(fields.getInt32(0, true), fields.getInt32(4, true));
         });
+        if (closed)
+        {
+            break;
+        }
         doorbell.wait(seen);                         // blocks; waitAsync keeps the event loop
     }
 };
@@ -329,14 +338,21 @@ takes at most `most` records, so one ring written without a pause does not starv
 thread reads (a reader that took `most` drains again before it waits: what is left will not ring
 again). Either side closes a ring when it goes or knows the other went: a writer waiting for
 room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
-reading what was written before. A `take` may not drain its own ring (it holds the record being
+reading what was written before: it looks at `closed()` before its drain, as the loop above does,
+and goes once a drain followed a close (one that looked after the drain would leave a record
+written just before the close unread). Memory that is not a ring of this layout is refused when a
+side opens over it. A `take` may not drain its own ring (it holds the record being
 taken), and `release` frees only a record `peek` returned: either throws rather than free a
-record not read. A record is bytes: a `Uint8Array` or an array of numbers; a wider typed array, a
-`DataView` or a buffer is refused.
+record not read. A record is bytes, as a channel's request and answer and a body the cache is
+handed are: a `Uint8Array` (or another view of one-byte elements) or an array of integers from 0
+to 255. Anything else is refused with a `TypeError` rather than written as something it is not: a
+wider typed array, a `DataView`, a buffer, a string, an object with only a length, a number past a
+byte.
 
 `waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
-`Int32Array`, for a protocol of its own; `deadlineOf(timeoutMs)` is a deadline on the clock they
-read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
+`Int32Array`, for a protocol of its own (a wait given a closed word ends `'closed'` once it is set,
+unless its word moved before: then that move is what it answers); `deadlineOf(timeoutMs)` is a
+deadline on the clock they read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
 time: a wait with no deadline never reads the clock). A doorbell's, a ring writer's and a channel
 end's waits learn how long to look (`createSpin`, also a `spinMs` of `waitFor`): a wait that went
 to sleep all the same makes the next look an eighth less, down to a few hundred looks, one that
@@ -383,18 +399,17 @@ never makes its writer wait. Any number of threads read it, each by sequence, an
 falls behind finds the records the writer lapped gone, never torn.
 
 ```js
-// engine.worker.js - the writer: a record built where it will be read.
+// engine.worker.js - the writer: a record drafted, then copied in.
 import { createJournalMemory, openJournal } from '@bottlify/cellar';
 
 const memory = createJournalMemory({ records: 4096, bytes: 1 << 20 });
 postMessage({ journal: memory });                     // to whoever reads it
 const journal = openJournal(memory);
-const words = new DataView(journal.bytes.buffer);
 function note(level, value){
-    const at = journal.reserve(16);                   // eight-aligned, whole in the buffer
-    words.setUint32(at, level, true);
-    words.setFloat64(at + 8, value, true);
-    return journal.commit();                          // its sequence
+    const record = journal.draft(16);                 // a DataView of the writer's own memory
+    record.setUint32(0, level, true);
+    record.setFloat64(8, value, true);
+    return journal.commit();                          // copied into the journal; its sequence
 }
 ```
 
@@ -402,29 +417,44 @@ function note(level, value){
 // page.js - a reader, as late as it likes.
 import { openJournal } from '@bottlify/cellar';
 
+/** What a reader keeps of a record: handed a copy of its own, whole, and the length. */
+const valueOf = (record, _length)=>record.getFloat64(8, true);
+
 worker.onmessage = ({ data })=>{
     const journal = openJournal(data.journal);
-    const words = new DataView(journal.bytes.buffer);
     let next = journal.oldest();
     setInterval(()=>{
         for (const end = journal.written(); next !== end; next = (next + 1) >>> 0)
         {
-            // In place, inside the call: undefined if the writer reached it first.
-            const value = journal.read(next, (_bytes, at)=>words.getFloat64(at + 8, true));
+            const value = journal.read(next, valueOf);    // undefined if the writer reached it first
             if (value !== undefined) show(value);
         }
     }, 250);
 };
 ```
 
-`read(sequence, take)` hands `take` the buffer, the record's offset and length, and answers what
-`take` returns, or undefined when the record was not there: not written yet, lapped before the
-read, or reached by the writer while `take` read it (the writer moves its count of bytes before
-it writes one, and the read checks it after). So `take` decodes or copies what it keeps and keeps
-nothing of the view. `oldest()` and `written()` bound what can be asked for; `first` in the
-memory's options starts the count where a journal it takes over from ended. Counts wrap at 2^32
-and are compared by their difference. Over an `ArrayBuffer` (`shared: false`) the readers are on
-the writer's own thread. Writing a record and reading it back make nothing on the heap.
+`draft(length)` gives the writer a view of a record of its own memory, the first `length` bytes
+of which it fills; `commit()` copies them into the journal and answers the record's sequence.
+`read(sequence, take)` copies the record into the reader's own memory, checks the copy, and hands
+it to `take` as a `DataView` and its length, answering what `take` returns; or undefined when the
+record was not there: not written yet, or written over before the copy was whole (the writer
+moves its count of bytes before it writes a word, and the read checks it after its last). `take`
+is handed only a whole record, and keeps nothing of the view: the next read copies over it (a read
+inside `take` copies into a view of its own). Both copies go word by word through `Atomics`, which
+is what keeps the check honest on a processor that reorders plain loads and stores, arm64 among
+them; a plain access to the journal's memory, by either side, would not be ordered against it.
+A view the journal handed out stays its own until a longer record than any before needs a larger
+one; one kept past that fails where it is used. `oldest()` and `written()` bound what can be
+asked for; `first` in the memory's options starts the count where a journal it takes over from
+ended. Counts wrap at 2^32 and are compared by their difference, past 2^32 records too. Over an
+`ArrayBuffer` (`shared: false`) the readers are on the writer's own thread. Writing a record and
+reading it back make nothing on the heap, but for a record longer than any before (its view grows,
+once).
+
+The copies are what a record costs: V8 runs each `Atomics` load or store as a call of its own
+(about 9 and 12 ns, x86), and a record takes one a word besides a few for the counts. A record of 16
+bytes takes about 125 ns to write and 95 ns to read, one of 8 bytes about 100 ns either way (node
+22 and node 26 alike, a 4-core x86 VM, 11 runs alternated, medians).
 
 ## Requirements
 

@@ -7,8 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { BELLS, COUNTS, ChannelClosed, ChannelFailed, createChannel, openClient, openServer }
-    from './channel.js';
+import { BELLS, CLOSED_WORD, COUNTS, ChannelClosed, ChannelFailed, createChannel, openClient,
+    openServer } from './channel.js';
 
 /** A handler answering each request with its bytes reversed. @param {Uint8Array} request */
 const reversed = request=>request.slice().reverse();
@@ -350,12 +350,25 @@ test('a call waiting for room goes out as soon as one answer frees a slot', { ti
         assert.ok(answered < 4, `the fifth went out with ${answered} answered`);
     });
 
-test('a request that is not bytes is refused', ()=>{
-    const memory = createChannel({ slots: 2, slotBytes: 8 });
-    const client = openClient(memory);
-    assert.throws(()=>client.ask(/** @type {any} */ (new DataView(new ArrayBuffer(4)))), TypeError);
-    assert.equal(openServer(memory).waiting(), 0);
-});
+test('a request that is not bytes is refused, and an answer that is not bytes fails its request',
+    async()=>{
+        const memory = createChannel({ slots: 2, slotBytes: 128 });
+        const client = openClient(memory);
+        const server = openServer(memory);
+        for (const request of [new DataView(new ArrayBuffer(4)), 'hello', { length: 3 }, [256]])
+        {
+            assert.throws(()=>client.ask(/** @type {any} */ (request)), TypeError);
+            await assert.rejects(client.call(/** @type {any} */ (request)), TypeError);
+        }
+        assert.equal(server.waiting(), 0);
+        // A handler answering a string (JSON.stringify without the encoder) was answered zeros.
+        const stringAnswer = client.call([1]);
+        const wideAnswer = client.call([2]);
+        server.serve(request=>/** @type {any} */ (request[0] === 1 ? JSON.stringify({ ok: 1 }) : [300]),
+            { timeoutMs: 0 });
+        await assert.rejects(stringAnswer, (e)=>e instanceof ChannelFailed && /bytes are/.test(e.message));
+        await assert.rejects(wideAnswer, ChannelFailed);
+    });
 
 test('a channel past 1 GiB is refused, its slots found by 32-bit arithmetic', ()=>{
     assert.throws(()=>createChannel({ slots: 1 << 16, slotBytes: 1 << 16 }), RangeError);
@@ -477,4 +490,101 @@ test('an asking side\'s blocking waits learn their spin from answers that come o
     assert.equal(client.spin?.waits, 3, 'each wait for an answer took the learning spin');
     assert.equal(client.spin?.looks, 3351, 'an eighth less for each of three waits that slept');
     assert.equal(openClient(memory, { spinMs: 0 }).spin, null, 'a spin of its own learns nothing');
+});
+
+/**
+ * Runs `work` with `run` called once, at the first look at the closed word
+ * of `memory` made while `when()` holds, before that look takes its value:
+ * as the other side would run between a wait's look at its count and its
+ * look at the closed word.
+ *
+ * @template T
+ * @param {SharedArrayBuffer} memory @param {() => boolean} when @param {() => void} run
+ * @param {() => T} work
+ * @returns {T}
+ */
+function beforeClosedLook(memory, when, run, work){
+    const load = Atomics.load;
+    let armed = true;
+    /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ at)=>{
+        if (armed && array.buffer === memory && at === CLOSED_WORD && when())
+        {
+            armed = false;
+            run();
+        }
+        return load(array, at);
+    };
+    try
+    {
+        return work();
+    }
+    finally
+    {
+        Atomics.load = load;
+    }
+}
+
+test('an answer written before the close is the ask\'s, and a request sent before the close is '
+    + 'served', async()=>{
+    const [ASKED, , ANSWERED] = COUNTS;
+    const memory = createChannel({ slots: 4, slotBytes: 16 });
+    const words = new Int32Array(memory);
+    const client = openClient(memory);
+    const server = openServer(memory);
+    // The serving side answers, then goes (closes), while the ask waits for the answer.
+    const answer = beforeClosedLook(memory,
+        ()=>Atomics.load(words, ASKED) !== Atomics.load(words, ANSWERED),
+        ()=>{
+            server.serve(request=>[request[0] + 1], { timeoutMs: 0 });
+            server.close();
+        }, ()=>client.ask([41]));
+    assert.deepEqual([...answer], [42], 'the last answer delivered, not ChannelClosed');
+
+    // The asking side sends, then goes, while the serving side waits for a request.
+    const second = createChannel({ slots: 4, slotBytes: 16 });
+    const asking = openClient(second);
+    const serving = openServer(second);
+    /** @type {Promise<Uint8Array> | undefined} */
+    let call;
+    const served = beforeClosedLook(second, ()=>true, ()=>{
+        call = asking.call([7]);
+        asking.close();
+    }, ()=>serving.serve(request=>[request[0] * 2]));
+    assert.equal(served, 1, 'the request sent before the close served, not ChannelClosed');
+    assert.deepEqual([...await /** @type {Promise<Uint8Array>} */ (call)], [14]);
+});
+
+test('an ask after one a close ended, its slots full with an answer the serving side wrote after '
+    + 'the close, says closed: every request out has a taker', async()=>{
+    const [ASKED, , ANSWERED] = COUNTS;
+    const memory = createChannel({ slots: 1, slotBytes: 16 });
+    const words = new Int32Array(memory);
+    const client = openClient(memory);
+    const server = openServer(memory);
+    // The serving side closes after the request is out and before it answers (it is going).
+    assert.throws(()=>beforeClosedLook(memory,
+        ()=>Atomics.load(words, ASKED) !== Atomics.load(words, ANSWERED),
+        ()=>server.close(), ()=>client.ask([1])), ChannelClosed);
+    assert.equal(server.serve(request=>[request[0]], { timeoutMs: 0 }), 1,
+        'what was asked before the close is still answered');
+    assert.equal(client.out(), 1, 'the request out, its answer for nobody');
+    assert.throws(()=>client.ask([2]), ChannelClosed);
+    await assert.rejects(client.call([3]), ChannelClosed);
+    assert.equal(client.out(), 0, 'the answer taken by nobody\'s reader, nothing sent after the close');
+});
+
+test('memory that is not a channel of this layout is refused at open, not read as no slots', ()=>{
+    for (const memory of [new SharedArrayBuffer(4096), new SharedArrayBuffer(16)])
+    {
+        assert.throws(()=>openClient(memory), /not a channel/);
+        assert.throws(()=>openServer(memory), /not a channel/);
+    }
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const words = new Int32Array(memory);
+    words[7] = 3;
+    assert.throws(()=>openClient(memory), /not a channel/, 'slots not a power of two');
+    words[7] = 1 << 20;
+    assert.throws(()=>openServer(memory), /not a channel/, 'slots past the memory\'s end');
+    words[7] = 4;
+    assert.equal(openClient(memory).out(), 0);
 });

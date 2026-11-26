@@ -13,25 +13,36 @@
  * sets this apart from a ring (`ring.js`), whose one reader is handed every
  * record and whose writer waits for it when full.
  *
- * A record is built where it is read: `reserve(length)` gives its offset in
- * the journal's buffer, the writer fills it with views of its own, `commit()`
- * publishes it and answers its sequence. Each record is whole in the buffer
- * (one that would run past the end starts the buffer again), behind a header
- * of its length and sequence, at an offset a multiple of eight, so a
- * `Float64Array` or a `DataView` reads it in place.
+ * A record is drafted in the writer's own memory: `draft(length)` gives a
+ * view of it, the writer fills its first `length` bytes, and `commit()`
+ * copies them into the journal and answers the record's sequence. A reader
+ * asks for a record by sequence (`read(sequence, take)`) and `take` is handed
+ * a copy of the reader's own, made and checked before `take` sees it: only a
+ * whole record is ever handed on.
  *
- * A reader asks for a record by sequence and is handed its bytes in place,
- * inside a call (`read(sequence, take)`): what `take` returns is the answer,
- * unless the writer reached those bytes while `take` read them, which the
- * check after it tells -- then the record is gone, as if read too late. So
- * `take` copies or decodes what it keeps, and keeps nothing of the view. A
- * reader on a hot path does the same in two steps of its own, with no call
- * between (`find`, then `intact`).
+ * Why copies, on both sides: the writer writes over the bytes of records a
+ * reader may be reading that moment, and the reader can tell only by a count
+ * the writer moves before it writes a byte, which the reader checks after it
+ * read the last one. That order holds between atomic accesses alone. A plain
+ * store may be seen before an atomic store made ahead of it, and a plain load
+ * may be satisfied after an atomic load made behind it: the JavaScript memory
+ * model allows both, and arm64 does both (V8's `Atomics` are bare stlr and
+ * ldar there, no barrier between them and plain accesses). So every word of
+ * a record goes into the journal by `Atomics.store`, after the count moved,
+ * and comes out by `Atomics.load`, before the check; the code of neither side
+ * touches the journal's bytes itself.
  *
- * Counts are of bytes ever reserved and records ever committed, in 32-bit
+ * Each record is whole in the buffer (one that would run past the end starts
+ * the buffer again), behind a header of its length and sequence, and the
+ * index keeps where each of the newest records starts, by the low bits of its
+ * sequence.
+ *
+ * Counts are of bytes ever written and records ever committed, in 32-bit
  * words that wrap, compared by their unsigned difference: exact as long as no
- * reader falls 2^31 records behind. The buffer's size is a power of two, so a
- * count of bytes maps to the same place on either side of a wrap.
+ * reader falls 2^31 records behind, and no read lasts while the writer writes
+ * 4 GiB. The buffer's size is a power of two, so a count of bytes maps to the
+ * same place on either side of a wrap; so is the index's length, for the
+ * count of records.
  *
  * Over a `SharedArrayBuffer` the readers are on other threads; over an
  * `ArrayBuffer` (`shared: false`) they are on the writer's, and nothing else
@@ -43,21 +54,28 @@ const VERSION = 0;
 const RECORDS = 1;
 const BYTES = 2;
 const FIRST = 3;
-/** Bytes ever reserved: moved before the bytes are written, so a reader sees a lap. */
+/** Bytes ever written: moved before the bytes are, so a reader sees a lap. */
 const HEAD = 4;
 /** Records ever committed: moved after, so a reader that sees a record sees its bytes. */
 const WRITTEN = 5;
+/**
+ * Not zero once `RECORDS` records were committed: the index holds that many
+ * from then on, though the count of records wraps back to small numbers.
+ */
+const FULL = 6;
 const CONTROL_WORDS = 8;
 const CONTROL_BYTES = CONTROL_WORDS * 4;
-/** The word of bytes ever reserved, for a test that starts a journal near a wrap of it. */
+/** The word of bytes ever written, for a test that starts a journal near a wrap of it. */
 export const HEAD_WORD = HEAD;
+/** The word of records ever committed, for a test that starts a journal near a wrap of it. */
+export const WRITTEN_WORD = WRITTEN;
 
-const LAYOUT = 1;
+const LAYOUT = 2;
 
-/** A record's header: its length, then its sequence; its bytes after, eight-aligned. */
+/** A record's header: its length, then its sequence; its bytes after. */
 const HEADER = 8;
 
-/** Why a record was not reserved: kept out of `reserve` so it stays small enough to inline. @param {number} length @param {number} most */
+/** Why a record was not drafted: kept out of `draft` so it stays small enough to inline. @param {number} length @param {number} most */
 const refuse = (length, most)=>{
     throw new RangeError(`journal: a record of ${length} bytes, at most ${most}`);
 };
@@ -70,6 +88,43 @@ const misuse = why=>{
 /** @param {number} n @param {number} to */
 const alignUp = (n, to)=>Math.ceil(n / to) * to;
 
+/** @param {number} n @returns {number} the least power of two not under `n` */
+const powerOfTwo = n=>{
+    let size = 1;
+    while (size < n)
+    {
+        size *= 2;
+    }
+    return size;
+};
+
+/** A draft or a copy before the first record: no room at all. */
+const NONE = new DataView(new ArrayBuffer(0));
+
+/**
+ * A view of a buffer of its own for a record of `length` bytes, in place of
+ * `view`, whose buffer is detached: a view of it someone kept against the
+ * contract fails where it is used, rather than write a record nobody sees or
+ * read one that is not there any more.
+ *
+ * @param {DataView} view @param {number} length
+ */
+function grown(view, length){
+    if (view !== NONE)
+    {
+        const old = /** @type {any} */ (view.buffer);
+        if (typeof old.transfer === 'function')
+        {
+            old.transfer(0);
+        }
+        else
+        {
+            structuredClone(old, { transfer: [old] });
+        }
+    }
+    return new DataView(new ArrayBuffer(Math.max(64, powerOfTwo(length))));
+}
+
 /**
  * Where a journal lies: one buffer, handed over whole.
  *
@@ -81,7 +136,7 @@ const alignUp = (n, to)=>Math.ceil(n / to) * to;
  *
  * @param {Object} [options]
  * @param {number} [options.records]  records a reader can still find by sequence
- *     (4096 by default): the index's length
+ *     (4096 by default)
  * @param {number} [options.bytes]  bytes of records, rounded up to a power of two of at
  *     least 64 (1 MiB by default); a record takes its length and 8, rounded up to 8
  * @param {number} [options.first]  the sequence of the first record (0 by default):
@@ -104,12 +159,8 @@ export function createJournalMemory({ records = 4096, bytes = 1 << 20, first = 0
     {
         throw new RangeError(`journal: a first sequence of ${first}`);
     }
-    let size = 64;
-    while (size < bytes)
-    {
-        size *= 2;
-    }
-    const total = CONTROL_BYTES + alignUp(records * 4, 8) + size;
+    const size = Math.max(64, powerOfTwo(bytes));
+    const total = CONTROL_BYTES + alignUp(powerOfTwo(records) * 4, 8) + size;
     const buffer = shared ? new SharedArrayBuffer(total) : new ArrayBuffer(total);
     const control = new Int32Array(buffer, 0, CONTROL_WORDS);
     control[VERSION] = LAYOUT;
@@ -122,54 +173,88 @@ export function createJournalMemory({ records = 4096, bytes = 1 << 20, first = 0
 /**
  * One side of a journal, opened from its memory in any thread: the writer's
  * methods belong to one thread, the reader's to any. A class: its methods are
- * called on it (`journal.reserve(n)`), which is what lets an engine inline
+ * called on it (`journal.draft(n)`), which is what lets an engine inline
  * them into a caller's hot path.
  */
 class Journal {
+    /** The journal's words: control, index and records, all read and written through `Atomics`. */
+    #words;
+    #firstSequence;
+    /** The index's length less one: a mask of the low bits of a sequence. */
+    #indexMask;
+    /** Where the records begin, in words. */
+    #base;
+    /** The buffer's size less one: a mask of a count of bytes. */
+    #mask;
+    /** The writer's own counts; the control words publish them. */
+    #head;
+    #count;
+    #full;
+    /** The length of the record drafted and not committed, or -1. */
+    #drafted = -1;
+    /** The writer's draft, and the same bytes as words to copy. */
+    #draft = NONE;
+    #draftWords = new Int32Array(0);
+    /**
+     * A reader's copies, one a depth of reads inside one another's `take`,
+     * each a view and the same bytes as words.
+     *
+     * @type {DataView[]}
+     */
+    #copies = [];
+    /** @type {Int32Array[]} */
+    #copyWords = [];
+    /** Reads inside the `take` of another on this opening. */
+    #depth = 0;
+    /** The count of records `#held` read last. */
+    #seen = 0;
+
     /** @param {JournalMemory} memory */
     constructor(memory){
         const { buffer } = memory;
-        const control = new Int32Array(buffer, 0, CONTROL_WORDS);
-        if (control[VERSION] !== LAYOUT)
+        const words = new Int32Array(buffer, 0, Math.floor(buffer.byteLength / 4));
+        if (words.length < CONTROL_WORDS || words[VERSION] !== LAYOUT)
         {
             throw new Error('journal: the memory is not a journal of this layout');
         }
-        this.control = control;
+        this.#words = words;
         /** Records a reader can still find by sequence. */
-        this.records = control[RECORDS];
-        this.capacity = control[BYTES];
-        this.firstSequence = control[FIRST] >>> 0;
-        this.index = new Int32Array(buffer, CONTROL_BYTES, this.records);
-        /** Where the records begin in the buffer. */
-        this.base = CONTROL_BYTES + alignUp(this.records * 4, 8);
-        this.mask = this.capacity - 1;
-        this.words = new DataView(buffer);
-        /** The whole buffer: a record's bytes are at the offsets `reserve` and `find` give. */
-        this.bytes = new Uint8Array(buffer);
+        this.records = words[RECORDS];
+        /** Bytes of records the journal holds. */
+        this.capacity = words[BYTES];
         /** The longest record: one that fits wherever the journal is. */
         this.maxRecord = this.capacity - HEADER;
-        // The writer's own counts; the control words publish them.
-        this.head = Atomics.load(control, HEAD) >>> 0;
-        this.count = Atomics.load(control, WRITTEN) >>> 0;
-        /** Where the record reserved and not committed starts, or -1. */
-        this.reserved = -1;
-        /** Where the record `find` answered last starts, in bytes ever reserved. */
-        this.found = 0;
+        this.#firstSequence = words[FIRST] >>> 0;
+        const indexLength = powerOfTwo(this.records);
+        this.#indexMask = indexLength - 1;
+        this.#base = alignUp(CONTROL_WORDS + indexLength, 2);
+        this.#mask = this.capacity - 1;
+        if (!(this.records >= 1) || !(this.capacity >= 64) || (this.capacity & this.#mask) !== 0
+            || words.length < this.#base + this.capacity / 4)
+        {
+            throw new Error('journal: the memory is not a journal of this layout');
+        }
+        this.#head = Atomics.load(words, HEAD) >>> 0;
+        this.#count = Atomics.load(words, WRITTEN) >>> 0;
+        this.#full = Atomics.load(words, FULL) !== 0;
     }
 
     /**
-     * The writer's: room for a record of `length` bytes, at the offset in
-     * `bytes` it answers, eight-aligned. Records written before it may be
-     * written over now. Throws where `length` is more than `maxRecord`, or
-     * where a record reserved is not yet committed.
+     * The writer's: the draft of a record of `length` bytes, a view of the
+     * writer's own memory whose first `length` bytes the writer fills before
+     * `commit`. Nothing of the journal is touched before the commit. The
+     * view stays the draft's until a longer record than any before is
+     * drafted; a view kept past that fails where it is used. Throws where
+     * `length` is more than `maxRecord`, or where a record drafted is not yet
+     * committed.
      *
      * @param {number} length
-     * @returns {number}
+     * @returns {DataView}
      */
-    reserve(length){
-        if (this.reserved >= 0)
+    draft(length){
+        if (this.#drafted >= 0)
         {
-            misuse('reserved again before a commit');
+            misuse('drafted again before a commit');
         }
         // An integer from 0 to the longest, NaN and fractions included:
         // `| 0` leaves only those unchanged.
@@ -177,133 +262,180 @@ class Journal {
         {
             refuse(length, this.maxRecord);
         }
+        if (length > this.#draft.byteLength)
+        {
+            this.#draft = grown(this.#draft, length);
+            this.#draftWords = new Int32Array(this.#draft.buffer);
+        }
+        this.#drafted = length;
+        return this.#draft;
+    }
+
+    /**
+     * The writer's: copies the record drafted into the journal, publishes it,
+     * and answers its sequence. Records written before it may be written
+     * over now. Throws where none is drafted.
+     *
+     * @returns {number}
+     */
+    commit(){
+        const length = this.#drafted;
+        if (length < 0)
+        {
+            misuse('commit with nothing drafted');
+        }
+        this.#drafted = -1;
         const capacity = this.capacity;
         const need = HEADER + ((length + 7) & ~7);
-        let start = this.head;
-        const at = start & this.mask;
+        let start = this.#head;
+        const at = start & this.#mask;
         if (at + need > capacity)
         {
             // Whole in the buffer: the tail is skipped, and the index says
             // where each record starts, so no reader looks for a marker.
             start = (start + (capacity - at)) >>> 0;
         }
-        this.head = (start + need) >>> 0;
-        // Moved before the bytes are written over: a reader checks its read
+        this.#head = (start + need) >>> 0;
+        const words = this.#words;
+        // Moved before a word is written over: a reader checks its copy
         // against it after, and the check is honest only if it covers them.
-        Atomics.store(this.control, HEAD, this.head | 0);
-        const place = this.base + (start & this.mask);
-        this.words.setUint32(place, length, true);
-        this.words.setUint32(place + 4, (this.firstSequence + this.count) >>> 0, true);
-        this.reserved = start;
-        return place + HEADER;
-    }
-
-    /**
-     * The writer's: publishes the record `reserve` gave room for, and
-     * answers its sequence. Throws where none is reserved.
-     *
-     * @returns {number}
-     */
-    commit(){
-        if (this.reserved < 0)
+        Atomics.store(words, HEAD, this.#head | 0);
+        const sequence = (this.#firstSequence + this.#count) >>> 0;
+        const place = this.#base + ((start & this.#mask) >> 2);
+        Atomics.store(words, place, length);
+        Atomics.store(words, place + 1, sequence | 0);
+        const draft = this.#draftWords;
+        for (let n = 0, end = (length + 3) >> 2; n < end; n++)
         {
-            misuse('commit with nothing reserved');
+            Atomics.store(words, place + 2 + n, draft[n]);
         }
-        const sequence = (this.firstSequence + this.count) >>> 0;
-        this.index[sequence % this.records] = this.reserved | 0;
-        this.reserved = -1;
-        this.count = (this.count + 1) >>> 0;
-        Atomics.store(this.control, WRITTEN, this.count | 0);
+        Atomics.store(words, CONTROL_WORDS + (sequence & this.#indexMask), start | 0);
+        this.#count = (this.#count + 1) >>> 0;
+        Atomics.store(words, WRITTEN, this.#count | 0);
+        // After the count: a reader that finds the word set and reads the
+        // count again finds it past `records` too, unless it wrapped.
+        if (!this.#full && this.#count >= this.records)
+        {
+            this.#full = true;
+            Atomics.store(words, FULL, 1);
+        }
         return sequence;
     }
 
     /** The sequence the next record gets: every record before it was committed. */
     written(){
-        return (this.firstSequence + (Atomics.load(this.control, WRITTEN) >>> 0)) >>> 0;
+        return (this.#firstSequence + (Atomics.load(this.#words, WRITTEN) >>> 0)) >>> 0;
     }
 
     /** The sequence of the first record this journal held. */
     first(){
-        return this.firstSequence;
+        return this.#firstSequence;
+    }
+
+    /**
+     * Records ever committed, as the count word says, into `#seen`, and
+     * answers how many of the newest the index holds: `records`, or fewer
+     * before that many were committed. The count read again where the full
+     * word is set though the count read first was short of `records`: the
+     * index is full, and either the count wrapped or it passed `records`
+     * since, which the second reading sees (the word is set after the count).
+     */
+    #held(){
+        const words = this.#words;
+        this.#seen = Atomics.load(words, WRITTEN) >>> 0;
+        if (this.#seen >= this.records)
+        {
+            return this.records;
+        }
+        if (Atomics.load(words, FULL) === 0)
+        {
+            return this.#seen;
+        }
+        this.#seen = Atomics.load(words, WRITTEN) >>> 0;
+        return this.records;
     }
 
     /** The oldest sequence a reader may still find. */
     oldest(){
-        const next = this.written();
-        const held = Math.min((next - this.firstSequence) >>> 0, this.records);
-        return (next - held) >>> 0;
+        const held = this.#held();
+        return (this.#firstSequence + this.#seen - held) >>> 0;
     }
 
     /**
-     * A reader's, in two steps with `intact`: where record `sequence`'s
-     * bytes are in `bytes`, its length at `lengthAt` of it, or -1 where the
-     * record is not there -- not committed, or another record in its place.
-     * The reader decodes it in place, then asks `intact()`: whatever it
-     * decoded is good only if that answers true, and the bytes may be
-     * another record's until then (a decoder bounds what it reads by the
-     * length). One record found at a time for each opening of the journal.
+     * Record `sequence` copied into this opening's copy at `depth`: its
+     * length, or -1 where it is not there - not committed, another record in
+     * its place, or written over before the copy was whole.
      *
-     * @param {number} sequence
+     * @param {number} sequence @param {number} depth
      * @returns {number}
      */
-    find(sequence){
-        const next = this.written();
-        // Committed, and since the first: an index slot a later record took
-        // is told by the header's sequence below.
-        const behind = (next - (sequence >>> 0)) >>> 0;
-        if (behind === 0 || behind > ((next - this.firstSequence) >>> 0))
+    #copy(sequence, depth){
+        const held = this.#held();
+        // Committed, and among the newest the index holds: by the records
+        // alone, which stay exact across the count's wrap at 2^32.
+        const behind = (this.#firstSequence + this.#seen - sequence) >>> 0;
+        if (behind === 0 || behind > held)
         {
             return -1;
         }
-        const start = this.index[sequence % this.records] >>> 0;
-        const place = this.base + (start & this.mask);
-        // Not another record in its place. One written over already may still
-        // look like it: `intact` says so after, and `read` before it hands the
-        // bytes on.
-        if (this.words.getUint32(place + 4, true) !== (sequence >>> 0)
-            || this.words.getUint32(place, true) > this.maxRecord)
+        const words = this.#words;
+        const start = Atomics.load(words, CONTROL_WORDS + (sequence & this.#indexMask)) >>> 0;
+        const at = start & this.#mask;
+        const place = this.#base + (at >> 2);
+        const length = Atomics.load(words, place) >>> 0;
+        // Another record's header, or words being written: refused before a
+        // word is copied, so no copy runs past the room a record could have.
+        if ((Atomics.load(words, place + 1) >>> 0) !== sequence
+            || length > this.capacity - HEADER - at)
         {
             return -1;
         }
-        this.found = start;
-        return place + HEADER;
-    }
-
-    /** The length of the record whose bytes `find` answered are at `at`. @param {number} at */
-    lengthAt(at){
-        return this.words.getUint32(at - HEADER, true);
+        let copy = this.#copies[depth];
+        if (copy === undefined || length > copy.byteLength)
+        {
+            copy = grown(copy ?? NONE, length);
+            this.#copies[depth] = copy;
+            this.#copyWords[depth] = new Int32Array(copy.buffer);
+        }
+        const into = this.#copyWords[depth];
+        for (let n = 0, end = (length + 3) >> 2; n < end; n++)
+        {
+            into[n] = Atomics.load(words, place + 2 + n);
+        }
+        // After the last load: the writer moves this count before it writes
+        // over a word, so a copy that took one of them sees it moved.
+        return ((Atomics.load(words, HEAD) - start) >>> 0) <= this.capacity ? length : -1;
     }
 
     /**
-     * Whether the record `find` answered last is still whole: the writer
-     * reached none of its bytes since. It moves its count before it writes a
-     * byte, the header included.
-     */
-    intact(){
-        return ((Atomics.load(this.control, HEAD) - this.found) >>> 0) <= this.capacity;
-    }
-
-    /**
-     * A reader's: record `sequence` handed to `take` in place, as the buffer,
-     * its offset and its length, and what `take` returns; or undefined where
-     * the record is not there -- not written yet, or written over before or
-     * while `take` read it. `take` keeps nothing of the view: once it
-     * returns, the writer may write over the bytes.
+     * A reader's: record `sequence` handed to `take` as a copy of this
+     * opening's own, whole, as a view and its length, and what `take`
+     * returns; or undefined where the record is not there - not written yet,
+     * or written over before it was copied. `take` keeps nothing of the
+     * view: the next read copies over it. A read inside `take` copies into a
+     * view of its own.
      *
      * @template T
      * @param {number} sequence
-     * @param {(bytes: Uint8Array, at: number, length: number) => T} take
+     * @param {(record: DataView, length: number) => T} take
      * @returns {T | undefined}
      */
     read(sequence, take){
-        const at = this.find(sequence);
-        // `take` is handed only a record still whole.
-        if (at < 0 || !this.intact())
+        const depth = this.#depth;
+        const length = this.#copy(sequence >>> 0, depth);
+        if (length < 0)
         {
             return undefined;
         }
-        const answer = take(this.bytes, at, this.lengthAt(at));
-        return this.intact() ? answer : undefined;
+        this.#depth = depth + 1;
+        try
+        {
+            return take(this.#copies[depth], length);
+        }
+        finally
+        {
+            this.#depth = depth;
+        }
     }
 }
 

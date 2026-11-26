@@ -62,10 +62,16 @@ const SLOT_BYTES = 8;
  */
 const SERVER_BELL = 9;
 const CLIENT_BELL = 10;
+/** The layout, checked by both ends at open. */
+const LAYOUT = 11;
+/** A word no zeroed or foreign memory holds: "CHN" and the layout's version. */
+const CHANNEL_LAYOUT = 0x43484e01;
 /** The four counts, for a test that starts them near their wrap. */
 export const COUNTS = Object.freeze([ASKED, TAKEN, ANSWERED, READ]);
 /** The two bells, for a test of the close. */
 export const BELLS = Object.freeze([SERVER_BELL, CLIENT_BELL]);
+/** The closed word, for a test of what a close leaves. */
+export const CLOSED_WORD = CLOSED;
 /** @param {number} counter the bell of the side that waits for it */
 const bellOf = counter=>(counter === ASKED ? SERVER_BELL : CLIENT_BELL);
 
@@ -101,6 +107,7 @@ export function createChannel({ slots = 16, slotBytes = 4096 } = {}){
     }
     const memory = new SharedArrayBuffer(bytes);
     const words = new Int32Array(memory);
+    words[LAYOUT] = CHANNEL_LAYOUT;
     words[SLOTS] = slots;
     words[SLOT_BYTES] = slotBytes;
     return memory;
@@ -149,12 +156,20 @@ export class ChannelFailed extends Error {
  */
 function endOver(memory, { spinMs }){
     const words = new Int32Array(memory);
-    /** The spin of this end's waits: `spinMs` where asked, else one that learns. */
-    const spin = spinMs ?? createSpin();
-    const bytes = new Uint8Array(memory);
     const slots = words[SLOTS];
     const slotBytes = words[SLOT_BYTES];
     const stride = slotStride(slotBytes);
+    // Memory that is no channel would be read as one of no slots, whose
+    // every call waits for room for ever, or slots past its end.
+    if (words.length < HEADER_WORDS || words[LAYOUT] !== CHANNEL_LAYOUT || !(slots >= 1)
+        || (slots & (slots - 1)) !== 0 || !(slotBytes >= 0)
+        || memory.byteLength < HEADER_WORDS * 4 + 2 * slots * stride)
+    {
+        throw new Error('channel: the memory is not a channel of this layout');
+    }
+    /** The spin of this end's waits: `spinMs` where asked, else one that learns. */
+    const spin = spinMs ?? createSpin();
+    const bytes = new Uint8Array(memory);
     const requests = HEADER_WORDS * 4;
     const answers = requests + slots * stride;
 
@@ -462,13 +477,12 @@ export function openClient(memory, options = {}){
                 }
             }
             catch (e){
-                // Out of time, or a wait this thread may not make (a page's
-                // own): the request is out, and its answer, when it comes,
-                // goes to nobody.
-                if (!(e instanceof ChannelClosed))
-                {
-                    waiting.push(DROPPED);
-                }
+                // Out of time, closed, or a wait this thread may not make (a
+                // page's own): the request is out, and its answer, if the
+                // serving side writes one (it answers what was asked before a
+                // close), goes to nobody. Every request out has a taker: one
+                // without would leave the next answer taken by nobody's reader.
+                waiting.push(DROPPED);
                 throw e;
             }
             return readNext(readAnswer);

@@ -275,3 +275,56 @@ test('a doorbell\'s waits learn their spin, unless a wait names its own', { time
     assert.equal(bell.spin.waits, 3, 'is not the learning one');
     assert.throws(()=>bell.wait(bell.seen(), undefined, NaN), RangeError);
 });
+
+/**
+ * Runs `work` with `run` called once, at the first `Atomics.load` of the
+ * word `index` of `words`, before that load takes its value: as the other
+ * side would run between a wait's look at its word and its look at the
+ * closed word.
+ *
+ * @param {Int32Array} words @param {number} index @param {() => void} run
+ * @param {() => any} work
+ */
+function beforeLoadOf(words, index, run, work){
+    const load = Atomics.load;
+    let armed = true;
+    /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ at)=>{
+        if (armed && array.buffer === words.buffer && at === index)
+        {
+            armed = false;
+            run();
+        }
+        return load(array, at);
+    };
+    try
+    {
+        return work();
+    }
+    finally
+    {
+        Atomics.load = load;
+    }
+}
+
+test('a word moved before the close is moved, not closed: the wait was for it, spinning, asleep or'
+    + ' on the event loop', async()=>{
+    /** @param {Int32Array} words */
+    const moveThenClose = words=>()=>{
+        Atomics.store(words, WORD, 1);
+        Atomics.store(words, CLOSED, 1);
+    };
+    for (const spinMs of [0.05, 0])
+    {
+        const words = new Int32Array(new SharedArrayBuffer(12));
+        assert.equal(beforeLoadOf(words, CLOSED, moveThenClose(words),
+            ()=>waitFor(words, WORD, 0, SLEEPS, Infinity, spinMs, CLOSED)), 'moved', `spin ${spinMs}`);
+        assert.equal(Atomics.load(words, SLEEPS), 0);
+    }
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    assert.equal(await beforeLoadOf(words, CLOSED, moveThenClose(words),
+        ()=>waitForAsync(words, WORD, 0, SLEEPS, Infinity, CLOSED)), 'moved', 'on the event loop');
+    // Closed with the word where it was: closed, as before.
+    const still = new Int32Array(new SharedArrayBuffer(12));
+    assert.equal(beforeLoadOf(still, CLOSED, ()=>Atomics.store(still, CLOSED, 1),
+        ()=>waitFor(still, WORD, 0, SLEEPS, Infinity, 0.05, CLOSED)), 'closed');
+});

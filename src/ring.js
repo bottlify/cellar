@@ -42,16 +42,21 @@ import { bytesOf } from './bytes.js';
 /**
  * Words of the control block: bytes ever written and the writer's waits
  * asleep on `ROOM`; bytes ever read and a count the reader moves when it frees
- * room; not zero once either side closed the ring. On one cache line: the two
- * sides' words on lines of their own streamed 20 M records of 8 bytes no
- * faster (3.00 against 3.01 M a second, 8 runs each, x86).
+ * room; not zero once either side closed the ring; the layout and the
+ * capacity, checked by every opening. On one cache line: the two sides' words
+ * on lines of their own streamed 20 M records of 8 bytes no faster (3.00
+ * against 3.01 M a second, 8 runs each, x86).
  */
 const WRITTEN = 0;
 const ROOM_SLEEPS = 1;
 const READ = 2;
 const ROOM = 3;
 const CLOSED = 4;
-const CONTROL_WORDS = 5;
+const LAYOUT = 5;
+const CAPACITY = 6;
+const CONTROL_WORDS = 7;
+/** A word no zeroed or foreign memory holds: "RNG" and the layout's version. */
+const RING_LAYOUT = 0x524e4701;
 /** The word a writer waiting for room sleeps on, for a test of the close. */
 export const ROOM_WORD = ROOM;
 
@@ -102,8 +107,11 @@ export function createRingMemory(capacity, bell = createDoorbell()){
     {
         throw new RangeError('ring: a ring holds at most 1 GiB');
     }
-    return { control: new SharedArrayBuffer(CONTROL_WORDS * 4), data: new SharedArrayBuffer(size),
-        bell };
+    const control = new SharedArrayBuffer(CONTROL_WORDS * 4);
+    const words = new Int32Array(control);
+    words[LAYOUT] = RING_LAYOUT;
+    words[CAPACITY] = size;
+    return { control, data: new SharedArrayBuffer(size), bell };
 }
 
 /**
@@ -117,6 +125,13 @@ export function openRing(memory){
     const bytes = new Uint8Array(memory.data);
     const words = new DataView(memory.data);
     const capacity = bytes.length;
+    // A control block of another ring, or memory that is none, would be read
+    // as counts: a ring that holds nothing, or a wait for room that never ends.
+    if (control.length < CONTROL_WORDS || control[LAYOUT] !== RING_LAYOUT
+        || control[CAPACITY] !== capacity || capacity < 64 || (capacity & (capacity - 1)) !== 0)
+    {
+        throw new Error('ring: the memory is not a ring of this layout');
+    }
     const mask = capacity - 1;
     const bell = openDoorbell(memory.bell);
     /** The longest record: one that fits however the ring is positioned. */
@@ -242,7 +257,8 @@ export function openRing(memory){
 
         /**
          * The writer's, where it may block: `reserve`, waiting up to
-         * `timeoutMs` in all for the reader to make room. -1 when it timed out.
+         * `timeoutMs` in all for the reader to make room. -1 when there was
+         * still no room once its time ran out.
          *
          * @param {number} length
          * @param {number} [timeoutMs]
@@ -265,7 +281,8 @@ export function openRing(memory){
                 }
                 if (end === 'timed-out')
                 {
-                    return -1;
+                    // A last look: room made while the wait slept is room.
+                    return self.reserve(length);
                 }
             }
         },
@@ -295,7 +312,7 @@ export function openRing(memory){
                 }
                 if (end === 'timed-out')
                 {
-                    return -1;
+                    return self.reserve(length);
                 }
             }
         },
@@ -378,8 +395,12 @@ export function openRing(memory){
             let length = words.getUint32(at, true);
             if (length === WRAP)
             {
+                // The tail skipped is room, as much as a record released: a
+                // writer waiting for it is told the same way.
                 read = (read + (capacity - at)) >>> 0;
                 Atomics.store(control, READ, read | 0);
+                Atomics.add(control, ROOM, 1);
+                wake(control, ROOM, ROOM_SLEEPS);
                 at = 0;
                 length = words.getUint32(0, true);
             }

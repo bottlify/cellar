@@ -47,15 +47,14 @@ test('writing a record and reading it back make no garbage', { timeout: 300_000 
     // A view made for each record would be ~100 bytes on the heap a record:
     // tens of megabytes over the gate, a collection every few thousand.
     const journal = openJournal(createJournalMemory({ records: 1024, bytes: 1 << 16 }));
-    const view = new DataView(journal.bytes.buffer);
     let sum = 0;
     /** What a reader does with a record: its words added up, as an integer. */
-    const take = (/** @type {Uint8Array} */ _bytes, /** @type {number} */ at)=>
-        (view.getUint32(at, true) + view.getUint32(at + 8, true)) | 0;
+    const take = (/** @type {DataView} */ record)=>
+        (record.getUint32(0, true) + record.getUint32(8, true)) | 0;
     const written = await collectionsOf(n=>{
-        const at = journal.reserve(16);
-        view.setUint32(at, n, true);
-        view.setFloat64(at + 8, n * 0.5, true);
+        const view = journal.draft(16);
+        view.setUint32(0, n, true);
+        view.setFloat64(8, n * 0.5, true);
         journal.commit();
     });
     assert.ok(written <= 2, `${written} collections in ${RECORDS} records written`);

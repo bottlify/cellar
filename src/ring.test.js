@@ -335,16 +335,23 @@ test('a take that drains its own ring, or a release with no record peeked, throw
     assert.equal(ring.held(), 0);
 });
 
-test('a record that is not bytes is refused, not cut or written as nothing', ()=>{
+test('a record that is not bytes is refused, not cut or written as zeros', async()=>{
     const ring = openRing(createRingMemory(256));
     for (const record of [Uint32Array.of(0x12345678), new Float64Array(1),
-        new DataView(new ArrayBuffer(4)), new ArrayBuffer(4), null])
+        new DataView(new ArrayBuffer(4)), new ArrayBuffer(4), null, 'hello', { length: 3 },
+        [300], [-1], [1.5]])
     {
         assert.throws(()=>ring.write(/** @type {any} */ (record)), TypeError);
+        assert.throws(()=>ring.writeWaiting(/** @type {any} */ (record), 0), TypeError);
+        await assert.rejects(ring.writeWaitingAsync(/** @type {any} */ (record), 0), TypeError);
     }
     assert.equal(ring.held(), 0);
-    assert.equal(ring.write([1, 2, 3]), true);
+    assert.equal(ring.write([1, 2, 255]), true);
     assert.equal(ring.write(Uint8Array.of(4)), true);
+    /** @type {number[][]} */
+    const records = [];
+    ring.drain(record=>void records.push([...record]));
+    assert.deepEqual(records, [[1, 2, 255], [4]]);
 });
 
 test('a ring\'s methods work taken off it', async()=>{
@@ -407,21 +414,6 @@ test('a record that grows while it is written is written as long as it was', ()=
     const records = [];
     assert.equal(ring.drain(record=>void records.push([...record])), 2);
     assert.deepEqual(records, [[0, 0, 0, 0, 0, 0, 0, 0], [7]]);
-});
-
-test('bytes over a buffer that cannot grow are copied as they are, nothing made for them', async()=>{
-    const { bytesOf } = await import('./bytes.js');
-    const plain = new Uint8Array(8);
-    const shared = new Uint8Array(new SharedArrayBuffer(8));
-    const numbers = [1, 2, 3];
-    assert.equal(bytesOf(plain, 'test'), plain);
-    assert.equal(bytesOf(shared, 'test'), shared);
-    assert.equal(bytesOf(numbers, 'test'), numbers);
-    // Only a view another thread can grow is cut to a view of its own.
-    const growing = new Uint8Array(new /** @type {any} */ (SharedArrayBuffer)(8, { maxByteLength: 64 }));
-    const taken = bytesOf(growing, 'test');
-    assert.notEqual(taken, growing);
-    assert.equal(taken.length, 8);
 });
 
 test('records built in the ring come out in order, whole and as long as committed, across every'
@@ -604,4 +596,204 @@ test('a writer\'s waits for room learn their spin: a reader that frees room only
     await reader.terminate();
     assert.equal(ring.roomSpin.waits, 3, 'each wait for room took the learning spin');
     assert.equal(ring.roomSpin.looks, 3351, 'an eighth less for each of three waits that slept');
+});
+
+/**
+ * The README's reader loop: the doorbell's count, then the closed word, then
+ * the drain, and out once a drain followed a close. `between` runs at the
+ * point named: as the writer would on another thread.
+ *
+ * @param {Ring} ring @param {import('./bell.js').Doorbell} doorbell
+ * @param {(record: Uint8Array) => void} take
+ * @param {string} [at] @param {() => void} [between]
+ */
+function readUntilClosed(ring, doorbell, take, at, between){
+    for (let rounds = 0; rounds < 100; rounds++)
+    {
+        if (at === 'before the count') between?.();
+        const seen = doorbell.seen();
+        if (at === 'before the closed word') between?.();
+        const closed = ring.closed();
+        if (at === 'before the drain') between?.();
+        ring.drain(take);
+        if (closed)
+        {
+            return;
+        }
+        if (at === 'before the wait') between?.();
+        // A wait the writer's last ring was lost to would sleep for good:
+        // its time here only lets the test say so.
+        assert.notEqual(doorbell.wait(seen, 10_000), 'timed-out', `lost the last ring (${at})`);
+    }
+    assert.fail('the loop did not end');
+}
+
+/** @typedef {import('./ring.js').Ring} Ring */
+
+test('the close gate: a reader looping as the README says reads every record written before the'
+    + ' close, wherever the writer\'s last record and close fall in its loop', ()=>{
+    for (const at of ['before the count', 'before the closed word', 'before the drain',
+        'before the wait'])
+    {
+        const memory = createRingMemory(256);
+        const reader = openRing(memory);
+        const writer = openRing(memory);
+        const doorbell = openDoorbell(memory.bell);
+        writer.write(Uint8Array.of(1));
+        /** @type {number[]} */
+        const got = [];
+        let once = false;
+        readUntilClosed(reader, doorbell, record=>void got.push(record[0]), at, ()=>{
+            if (!once)
+            {
+                once = true;
+                writer.write(Uint8Array.of(2));
+                writer.close();
+            }
+        });
+        assert.deepEqual(got, [1, 2], `the last record read (${at})`);
+        assert.equal(reader.held(), 0);
+    }
+});
+
+test('the close gate across threads: every trial\'s reader reads every record written before the'
+    + ' close', { timeout: 120_000 }, async t=>{
+    // The reader in a worker loops over the rings in turn as the README says;
+    // this thread writes each ring's records, the last after a pause in which
+    // the reader drained and went to wait, then closes it.
+    const TRIALS = 100;
+    const RECORDS = 4;
+    const memories = Array.from({ length: TRIALS }, ()=>createRingMemory(256));
+    const reader = new Worker(`
+        const { parentPort, workerData } = require('node:worker_threads');
+        Promise.all([import(workerData.ring), import(workerData.bell)]).then(([{ openRing }, { openDoorbell }])=>{
+            for (const memory of workerData.memories)
+            {
+                const ring = openRing(memory);
+                const doorbell = openDoorbell(memory.bell);
+                let got = 0;
+                for (;;)
+                {
+                    const seen = doorbell.seen();
+                    const closed = ring.closed();
+                    ring.drain(()=>{ got++; });
+                    if (closed) break;
+                    doorbell.wait(seen);
+                }
+                parentPort.postMessage(got);
+            }
+        });`, { eval: true, workerData: { ring: new URL('./ring.js', import.meta.url).href,
+        bell: new URL('./bell.js', import.meta.url).href, memories } });
+    // A reader a lost ring left asleep for good must not hold the test's process.
+    reader.unref();
+    t.after(()=>reader.terminate());
+    /** @type {((count: number) => void)[]} */
+    const takers = [];
+    reader.on('message', count=>takers.shift()?.(count));
+    /** @type {Error[]} */
+    const failed = [];
+    reader.once('error', error=>failed.push(error));
+    let lost = 0;
+    for (const memory of memories)
+    {
+        const writer = openRing(memory);
+        const read = new Promise(resolve=>takers.push(resolve));
+        for (let n = 0; n < RECORDS; n++)
+        {
+            if (n === RECORDS - 1)
+            {
+                await new Promise(resolve=>setTimeout(resolve, 1));
+            }
+            writer.write(Uint8Array.of(n));
+        }
+        writer.close();
+        if (await read !== RECORDS)
+        {
+            lost++;
+        }
+    }
+    assert.deepEqual(failed, []);
+    assert.equal(lost, 0, 'trials that lost a record written before the close');
+});
+
+test('a reader skipping the tail a wrap left frees that room, and a writer asleep for it is woken',
+    { timeout: 60_000 }, async t=>{
+    const memory = createRingMemory(64);
+    const ring = openRing(memory);
+    const r24 = new Uint8Array(24);
+    ring.write(r24);
+    ring.write(r24);                                 // at 0 and 28: 56 written
+    ring.drain(()=>{}, 1);                           // 28 read
+    ring.write(r24);                                 // the tail from 56 skipped, at 0: 92 written
+    ring.drain(()=>{}, 1);                           // 56 read: 28 free, 32 wanted below
+    // The writer asleep for room for 28 bytes, which only the tail gives:
+    // with no deadline, a wake lost leaves it asleep for good.
+    const writer = inWorker(`
+        const w = ring.openRing(memory);
+        return w.reserveWaiting(28);`, { memory });
+    writer.unref();
+    t.after(()=>writer.terminate());
+    const result = new Promise((resolve, reject)=>{
+        writer.once('message', resolve);
+        writer.once('error', reject);
+    });
+    const control = new Int32Array(memory.control);
+    while (Atomics.load(control, 1) === 0)
+    {
+        // The writer's waits asleep for room, counted beside it.
+        await new Promise(resolve=>setTimeout(resolve, 1));
+    }
+    const record = ring.peek();                      // over the tail, to the record at 0: held
+    assert.equal(record?.length, 24);
+    assert.equal(await result, 32, 'the writer woke to the room the skipped tail gave: at 28');
+});
+
+test('a writer whose wait for room ran out takes a last look: room made while it slept is room',
+    async()=>{
+    // Room made with nothing moved for the writer to wake to (a reader on
+    // another thread, between the writer's look and its sleep, as a hook
+    // here): the wait times out, and the last look finds the room.
+    for (const asynchronous of [false, true])
+    {
+        const memory = createRingMemory(64);
+        const ring = openRing(memory);
+        assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+        assert.equal(ring.write(new Uint8Array(ring.maxRecord)), true);
+        const control = new Int32Array(memory.control);
+        const freeAll = ()=>Atomics.store(control, 2, Atomics.load(control, 0));   // read = written
+        const wait = Atomics.wait;
+        const waitAsync = /** @type {any} */ (Atomics).waitAsync;
+        Atomics.wait = (...args)=>{
+            freeAll();
+            return 'timed-out';
+        };
+        /** @type {any} */ (Atomics).waitAsync = ()=>{
+            freeAll();
+            return { async: false, value: 'timed-out' };
+        };
+        try
+        {
+            const at = asynchronous ? await ring.reserveWaitingAsync(ring.maxRecord, 20)
+                : ring.reserveWaiting(ring.maxRecord, 20);
+            assert.ok(at >= 0, `${asynchronous ? 'async' : 'blocking'}: room found at the last look`);
+            ring.abandon();
+        }
+        finally
+        {
+            Atomics.wait = wait;
+            /** @type {any} */ (Atomics).waitAsync = waitAsync;
+        }
+    }
+});
+
+test('memory that is not a ring of this layout is refused at open, not read as counts', ()=>{
+    const a = createRingMemory(64);
+    const b = createRingMemory(1 << 12);
+    assert.throws(()=>openRing({ control: a.control, data: b.data, bell: a.bell }), /not a ring/,
+        'one ring\'s control over another\'s data');
+    assert.throws(()=>openRing({ control: new SharedArrayBuffer(64), data: a.data, bell: a.bell }),
+        /not a ring/, 'a control block of zeros');
+    assert.throws(()=>openRing({ control: new SharedArrayBuffer(8), data: a.data, bell: a.bell }),
+        /not a ring/, 'a control block too short');
+    assert.equal(openRing(a).capacity, 64);
 });
