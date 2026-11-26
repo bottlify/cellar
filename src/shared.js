@@ -85,6 +85,12 @@ export const F_NO_DISK = 16;
  * index keeps no more of a body's flags than `F_ONLY_COPY`.
  */
 export const F_FOR_ROOM = 32;
+/**
+ * Memory held (`hold`): a reservation its holder writes and reads in place
+ * for as long as it holds it, never taken back by `abandonAfterMs`. This
+ * run's alone, as every reservation is.
+ */
+export const F_HELD = 64;
 
 /** No body: never had one, or dropped; or a record no name leads to any more. */
 export const GONE = 0;

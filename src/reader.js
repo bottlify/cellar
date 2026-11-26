@@ -41,7 +41,7 @@ import { bytesOf } from './bytes.js';
  *
  * @typedef {Object} KeeperCalls
  * @property {(name: string, length: number, options: { onlyCopy: boolean,
- *     disk?: import('./keeper.js').DiskPolicy, idle?: 'go' | 'stay', known: number })
+ *     disk?: import('./keeper.js').DiskPolicy, idle?: 'go' | 'stay', known: number, hold?: boolean })
  *     => Place | null} reserve
  * @property {(name: string, options: { known: number }) => boolean} raise
  *     `known`: the segments this reader has; a body placed past them could not be read here
@@ -239,7 +239,7 @@ export function createReader({ shared, segments = [], keeper }){
      * object is made for options not given.
      *
      * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
-     *     idle?: 'go' | 'stay' } | undefined} options
+     *     idle?: 'go' | 'stay', hold?: boolean } | undefined} options
      */
     const askOf = options=>{
         if (options === undefined)
@@ -247,8 +247,9 @@ export function createReader({ shared, segments = [], keeper }){
             return { onlyCopy: false, disk: /** @type {const} */ ('kept'), idle: /** @type {const} */ ('go'),
                 known: heard };
         }
-        const { onlyCopy = false, disk = 'kept', idle = 'go' } = options;
-        return { onlyCopy, disk, idle, known: heard };
+        const { onlyCopy = false, disk = 'kept', idle = 'go', hold = false } = options;
+        return hold ? { onlyCopy, disk, idle, known: heard, hold }
+            : { onlyCopy, disk, idle, known: heard };
     };
 
     /**
@@ -446,6 +447,30 @@ export function createReader({ shared, segments = [], keeper }){
         reserve(name, length, options){
             checkName(name);
             const place = reserveRoom(name, length, options);
+            if (place === null)
+            {
+                return null;
+            }
+            writing.set(name, place);
+            return /** @type {Uint8Array} */ (views[place.segment]).subarray(place.offset, place.offset + length);
+        },
+
+        /**
+         * Memory of `length` bytes held under `name`: a view this reader
+         * writes and reads in place for as long as it holds it, which the
+         * keeper never takes back, cools or moves, and no one reads through
+         * `with`: memory, not a body. Counted under its name and in the
+         * keeper's budget like any body; never on the disk. Let go of with
+         * `abandon`, its room the keeper's again at its next sweep. Null
+         * where there is no room, or where the room is in a segment this
+         * reader cannot write.
+         *
+         * @param {string} name @param {number} length
+         * @returns {Uint8Array | null}
+         */
+        hold(name, length){
+            checkName(name);
+            const place = reserveRoom(name, length, { disk: 'never', hold: true });
             if (place === null)
             {
                 return null;

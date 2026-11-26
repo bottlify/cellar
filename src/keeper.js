@@ -34,7 +34,7 @@
 import { UNIT, blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
-    COLD, F_DROP, F_FOR_ROOM, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
+    COLD, F_DROP, F_FOR_ROOM, F_HELD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
     CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_NAMES, H_TICK, MAX_RECORDS,
     MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
@@ -1779,13 +1779,16 @@ export async function openKeeper(options){
          * null with why counted. The writer stores the record hot (`commit`)
          * once it has written.
          *
+         * `hold`: memory the writer keeps writing and reading in place, never
+         * committed and never taken back by `abandonAfterMs` (`Reader.hold`).
+         *
          * @param {string} name @param {number} length
          * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, idle?: 'go' | 'stay',
-         *     known?: number }} [options]
+         *     known?: number, hold?: boolean }} [options]
          * @returns {import('./reader.js').Place | null}
          */
         reserve(name, length, { onlyCopy = false, disk: policy = 'kept', idle = 'go',
-            known = Infinity } = {}){
+            known = Infinity, hold = false } = {}){
             checkName(name);
             const policyFlags = POLICY_FLAGS[policy];
             if (policyFlags === undefined)
@@ -1865,7 +1868,7 @@ export async function openKeeper(options){
             }
             forgetDisk(id);
             set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags
-                | (idle === 'stay' ? F_FOR_ROOM : 0));
+                | (idle === 'stay' ? F_FOR_ROOM : 0) | (hold ? F_HELD : 0));
             store(id, MOVING);
             const segment = segmentOf(found);
             const offset = offsetOf(found);
@@ -2005,6 +2008,7 @@ export async function openKeeper(options){
                     continue;
                 }
                 if ((state === WRITING || state === RETIRED_WRITING)
+                    && (get(id, R_FLAGS) & F_HELD) === 0
                     && age(at, get(id, R_TICK)) >= abandonAfterMs)
                 {
                     // Its writer is taken for gone: what it would commit now
