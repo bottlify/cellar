@@ -70,6 +70,12 @@ Historical measurements reported in the 0.10.0 change (`e4ca6ca`): Node.js 22, f
 
 Not taken, 2026-11-26: flushing only the packs written since their last flush. Every save and sweep flushes each open pack, written to or not; a pack nothing was written to costs nothing to flush. Headless Chromium 158.0.8127.36 on Linux, x86 VM, a dedicated worker, OPFS sync access handles of 64 KiB, 50 runs an arm: flushing 1, 8, 32 or 128 unchanged files took a median of 0 ms and at most 0.2 ms for all of them (the worker's timer counts in 0.1 ms steps), while flushing one file after a 4 KiB write took a median of 0.5-0.7 ms whether the unchanged files were flushed beside it or not. Worth measuring again where a target's OPFS flush of an unchanged file is not free: another engine, or macOS and Windows.
 
+## Ring and channel
+
+Not taken, 2026-11-25: each side's counts on a cache line of its own (128 bytes) against all of them on one. 20 M records of 8 bytes streamed through a 64 KiB ring, writer worker and reader both busy, Node.js 22.22, a four-core x86 VM, 8 runs an arm alternated: 3.00 M records a second with the lines apart (2.68-3.09), 3.01 M without (2.79-3.84); a round trip and a call (`examples/ring.mjs`, `call-a-worker.mjs`) within noise as well. Cellar keeps one line. Worth measuring again on arm64, where an Apple M's lines are 128 bytes and false sharing may cost more.
+
+Not taken, 2026-11-26: the writer waiting on `READ` with `ROOM` as its bell, so the reader moves `ROOM` only while the writer sleeps, instead of an `Atomics.add` of `ROOM` at every release. Node.js 22, a four-core x86 VM at load about 2.3, writer and reader on two threads, 10 runs a mode alternated, median ns a record: 8-byte records 381.2 (274-447) against 344.4 (285-404) for the add; 256-byte records 481.8 against 503.8; one thread 187 against 171. Inside the spread both ways. Worth measuring again when the ring's own cost shows in a profile of a run (a record's `Atomics` calls are about 30 ns of it), on arm64 where an atomic add costs more.
+
 ## Journal
 
 The Journal copy implementation changed in 0.12.2. Use the matching revision when comparing measurements. In the Bottlify log workload reported in `6f605da`, Node.js 22 on an x86 VM, one million records per run, medians of 11, three processes per arm, writing cost 118-122 ns and reading 182-189 ns per record. The prior per-word atomic copy implementation measured 278-313 ns and 307-325 ns respectively. See the [memory-ordering contract](journal.md#memory-ordering).
