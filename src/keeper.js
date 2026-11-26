@@ -677,10 +677,11 @@ export async function openKeeper(options){
     /**
      * Flushes pack `number`: false where the disk failed, counted. A flush
      * that failed may have lost what the pack took since the one before, so
-     * no body written there since is trusted to the disk: a hot one forgets
-     * its copy (memory holds it, written again when it goes cold or is
-     * saved), a cold one goes (it can be made again: a cold only copy was
-     * flushed before it left memory, and lies below).
+     * no body written there since is trusted to the disk: one memory holds
+     * forgets its copy (written again when it goes cold or is saved), a cold
+     * one goes (it can be made again: a cold only copy was flushed before it
+     * left memory, and lies below), and one being raised is let go by the
+     * raise.
      *
      * @param {number} number
      */
@@ -704,11 +705,11 @@ export async function openKeeper(options){
                 continue;
             }
             const state = stateOf(stateWordOf(id));
-            if (state !== COLD)
+            if (get(id, R_SEGMENT) >= 0 || (state !== COLD && (flags & F_ONLY_COPY) === 0))
             {
                 forgetDisk(id, state !== RETIRED);
             }
-            else if ((flags & F_ONLY_COPY) === 0)
+            else if (state === COLD && (flags & F_ONLY_COPY) === 0)
             {
                 drop(id);
                 counts.lostOnDisk++;
@@ -963,6 +964,19 @@ export async function openKeeper(options){
         }
         store(id, MOVING);
         const found = room(length, known);
+        if ((get(id, R_FLAGS) & F_ON_DISK) === 0)
+        {
+            // A flush failed while room was made, and its copy with it.
+            if (found !== null)
+            {
+                giveRoom(found.segment, found.offset, length);
+            }
+            set(id, R_FLAGS, 0);
+            store(id, GONE);
+            counts.lostOnDisk++;
+            counts.raiseFailed++;
+            return false;
+        }
         if (found === null)
         {
             store(id, COLD);

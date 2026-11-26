@@ -2216,3 +2216,22 @@ test('a pack flush that fails may lose what the pack took since the flush before
     assert.deepEqual(await nextRunReads(disk.crash(), ['kept', 'block', 'later']),
         [[...bodyOf(3000, 1)], null, [...bodyOf(6000, 3)]]);
 });
+
+test('a body being raised whose copy a failed flush let go of while room was made goes, rather than'
+    + ' stay cold with no copy', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper } = await cacheOf({ disk, budget: 64 * KIB });
+    reader.put('block', bodyOf(40 * KIB, 1));
+    // Room for the only copy cools the block: written, not flushed yet.
+    reader.put('only', bodyOf(40 * KIB, 2), { onlyCopy: true });
+    assert.equal(reader.look('block'), 'cold');
+    // The block's raise cools the only copy for room, whose flush fails and loses the block's bytes.
+    disk.failing.losing.add('pack-0');
+    assert.equal(keeper.raise('block'), false);
+    disk.failing.losing.clear();
+    assert.equal(reader.look('block'), null);
+    assert.equal(reader.look('only'), 'hot', 'not let go on a failed flush');
+    const failures = keeper.figures().diskFailures;
+    assert.equal(reader.with('block', ()=>1, { wait: true }), undefined);
+    assert.equal(keeper.figures().diskFailures, failures, 'nothing left to read from no pack');
+});
