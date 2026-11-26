@@ -420,6 +420,24 @@ test('a reservation made long after the last sweep counts its age from when it w
     assert.equal(later.reader.look('c'), null);
 });
 
+test('a large reserve refused in a tick does not refuse a small one the same tick could place', async()=>{
+    // The refusal of a block of 8 KiB, whose other half holds an only copy,
+    // says nothing of a block of 4 KiB: a body that can leave makes it.
+    const { keeper, reader } = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT });
+    assert.equal(reader.put('pin', bodyOf(UNIT, 1), { onlyCopy: true, disk: 'never' }), true);
+    assert.equal(reader.put('free', bodyOf(UNIT, 2), { disk: 'never', idle: 'stay' }), true);
+    assert.equal(reader.reserve('big', 2 * UNIT), null, 'no block of 8 KiB can be formed');
+    // The same refusal asked again in the tick costs one look, not a walk.
+    const listed = keeper.figures().oldestListed;
+    for (let i = 0; i < 100; i++)
+    {
+        assert.equal(reader.reserve('big', 2 * UNIT), null);
+    }
+    assert.equal(keeper.figures().oldestListed, listed, 'the same request, refused for a look');
+    assert.ok(reader.reserve('small', UNIT), 'one of 4 KiB can, from the body that can leave');
+    assert.equal(reader.look('pin'), 'hot', 'and the only copy stayed');
+});
+
 test('a body put to stay when idle stays hot past coldAfterMs, and leaves for room as any other', async()=>{
     // A body read again only long after it was written (a translator's
     // function, at a relink): the keeper's idle rule would take exactly

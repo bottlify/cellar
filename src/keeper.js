@@ -626,14 +626,21 @@ export async function openKeeper(options){
     let oldestCount = 0;
     let oldestNext = 0;
     /**
-     * The tick of the last list that gave no room, -1 for none. A body may
-     * leave again without the keeper being told: a reader commits it or lets
-     * go of it in the shared words. So a list that found nothing is not made
-     * again within the same tick. Until the clock moves, a reserve that
-     * needs room is refused for the price of one look, not a walk over every
-     * record.
+     * What the lists of a tick showed gives no room, so that a reserve asking
+     * the same in the same tick is refused for the price of one look, not a
+     * walk over every record. A body may leave again without the keeper being
+     * told (a reader commits it or lets go of it in the shared words), so
+     * nothing is remembered past the tick it was learnt in.
+     * `fruitlessAt`: the tick a fresh list held no candidate at all - no body
+     * hot and unread - which no request of any size, segments known or record
+     * spared can be placed by. `fruitless`: the requests of `fruitlessTick` a
+     * list with candidates gave no room for, by block, segments known and
+     * record spared: the refusal of a large block says nothing of a small one.
      */
     let fruitlessAt = -1;
+    let fruitlessTick = -1;
+    /** @type {Set<string>} */
+    const fruitless = new Set();
 
     const listOldest = ()=>{
         const count = words[H_COUNT];
@@ -756,12 +763,26 @@ export async function openKeeper(options){
             const id = nextOldest(limit, spare);
             if (id < 0)
             {
+                const now = tick();
+                if (fruitlessTick !== now)
+                {
+                    fruitless.clear();
+                    fruitlessTick = now;
+                }
+                const asked = `${block}:${limit}:${spare}`;
                 if (listed)
                 {
-                    fruitlessAt = tick();
+                    if (oldestCount === 0)
+                    {
+                        fruitlessAt = now;
+                    }
+                    else
+                    {
+                        fruitless.add(asked);
+                    }
                     return null;
                 }
-                if (fruitlessAt === tick())
+                if (fruitlessAt === now || fruitless.has(asked))
                 {
                     return null;
                 }
