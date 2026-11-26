@@ -568,6 +568,64 @@ test('a block that cannot be made whole moves no body of it: a failed write leav
         assert.equal(reader.look('b'), 'cold', 'the only copy went to the disk for it');
     });
 
+test('a block that cannot be made whole moves no body of it: a reader entering one after it was '
+    + 'judged free to leave, or a flush failing as the block is made', async()=>{
+    // A reader enters the second body between the keeper's look and its
+    // hold: the first, held already, is let go of as it was.
+    const entered = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT });
+    assert.equal(entered.reader.put('a', bodyOf(UNIT, 1), { disk: 'never' }), true);
+    assert.equal(entered.reader.put('b', bodyOf(UNIT, 2), { disk: 'never' }), true);
+    const exchange = Atomics.compareExchange;
+    let holds = 0;
+    /** The reader that entered, leaving. */
+    let leave = ()=>{};
+    /** @type {any} */ (Atomics).compareExchange = (/** @type {any} */ array, /** @type {number} */ index,
+        /** @type {number} */ expected, /** @type {number} */ replacement)=>{
+        if (expected === stateWord(HOT) && replacement === stateWord(MOVING) && ++holds === 2)
+        {
+            Atomics.add(array, index, 1);
+            leave = ()=>{
+                Atomics.sub(array, index, 1);
+            };
+        }
+        return exchange(array, index, expected, replacement);
+    };
+    try
+    {
+        assert.equal(entered.reader.reserve('big', 2 * UNIT), null, 'a body read meanwhile');
+    }
+    finally
+    {
+        Atomics.compareExchange = exchange;
+    }
+    assert.equal(holds, 2, 'both held, the second too late');
+    assert.deepEqual([entered.reader.look('a'), entered.reader.look('b')], ['hot', 'hot']);
+    assert.equal(entered.reader.with('a', body=>body[1]), bodyOf(UNIT, 1)[1], 'the one held, let go of');
+    assert.equal(entered.keeper.figures().gone, 0);
+    leave();
+    entered.wait(1);
+    assert.ok(entered.reader.reserve('big', 2 * UNIT), 'the reader out, the block is made');
+
+    // An only copy's write lands and its flush fails: the disk may not hold
+    // it, so it stays, and its neighbour with it.
+    const disk = crashDisk();
+    const flushed = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT, packBytes: 2 * UNIT, disk });
+    assert.equal(flushed.reader.put('a', bodyOf(UNIT, 3), { disk: 'never' }), true);
+    assert.equal(flushed.reader.put('b', bodyOf(UNIT, 4), { onlyCopy: true }), true);
+    for (let number = 0; number < 8; number++)
+    {
+        disk.failing.flush.add(`pack-${number}`);
+    }
+    assert.equal(flushed.reader.reserve('big', 2 * UNIT), null, 'the only copy\'s flush failed');
+    assert.equal(flushed.reader.with('a', body=>body[1]), bodyOf(UNIT, 3)[1], 'the one that may go stayed');
+    assert.equal(flushed.reader.with('b', body=>body[1]), bodyOf(UNIT, 4)[1], 'the only copy stayed');
+    assert.equal(flushed.keeper.figures().gone, 0);
+    disk.failing.flush.clear();
+    flushed.wait(1);
+    assert.ok(flushed.reader.reserve('big', 2 * UNIT));
+    assert.equal(flushed.reader.look('b'), 'cold', 'the only copy went to the disk for it');
+});
+
 test('a body put to stay when idle stays hot past coldAfterMs, and leaves for room as any other', async()=>{
     // A body read again only long after it was written (a translator's
     // function, at a relink): the keeper's idle rule would take exactly
