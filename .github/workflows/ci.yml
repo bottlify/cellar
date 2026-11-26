@@ -10,7 +10,31 @@ permissions:
   contents: write
 
 jobs:
+  # The shared-memory protocols on processors that move plain accesses
+  # (ordering.itest.js): x86 does not, so the job below cannot answer that.
+  arm64:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:integration
+        env:
+          CELLAR_EXPECT_REORDERING: '1'
+      - run: npm run test:ordering
+        env:
+          CELLAR_EXPECT_REORDERING: '1'
+
   check-and-build:
+    needs: arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
