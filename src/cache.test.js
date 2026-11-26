@@ -533,7 +533,8 @@ test('an owner\'s names are let go together: what was under its prefix, and what
     }
     // One being written, one being read, as the owner goes.
     assert.ok(reader.reserve('texels/1/c', 500, { onlyCopy: true }));
-    assert.deepEqual(keeper.under('texels/1/'), { bodies: 3, bytes: 2500 });
+    // Each body of 1000 or 500 bytes takes a block of 4096 in memory.
+    assert.deepEqual(keeper.under('texels/1/'), { bodies: 3, bytes: 2500, hotBytes: 2500, placedBytes: 3 * 4096 });
     let released = null;
     reader.with('texels/1/a', ()=>{
         released = keeper.release('texels/1/');
@@ -543,7 +544,8 @@ test('an owner\'s names are let go together: what was under its prefix, and what
     assert.equal(reader.look('texels/1/b'), null, 'one no one held is gone at once');
     assert.equal(reader.commit('texels/1/c'), true);
     keeper.sweep();
-    assert.deepEqual(keeper.under('texels/1/'), { bodies: 0, bytes: 0 }, 'no tail once they are let go of');
+    assert.deepEqual(keeper.under('texels/1/'), { bodies: 0, bytes: 0, hotBytes: 0, placedBytes: 0 },
+        'no tail once they are let go of');
     for (const name of ['texels/10/a', 'texels/2/a', 'reads/x'])
     {
         assert.equal(reader.look(name), 'hot', `${name} is another owner's`);

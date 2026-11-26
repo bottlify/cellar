@@ -1782,24 +1782,36 @@ export async function openKeeper(options){
          * What is held under the names that begin with `prefix` - an owner's,
          * when its names are its own (`texels/<root>/`): the bodies and their
          * bytes, every record of such a name that is not gone counted, one a
-         * name was written anew over and is still read included.
+         * name was written anew over and is still read included. Of them, the
+         * bytes of those in memory (`hotBytes`, as `figures` counts them) and
+         * of the blocks they take there (`placedBytes`): what the owner's
+         * bodies cost the segments, their rounding the difference.
          *
          * @param {string} prefix
-         * @returns {{ bodies: number, bytes: number }}
+         * @returns {{ bodies: number, bytes: number, hotBytes: number, placedBytes: number }}
          */
         under(prefix){
             checkName(prefix);
             let bodies = 0;
             let bytes = 0;
+            let hotBytes = 0;
+            let placedBytes = 0;
             for (let id = 0; id < words[H_COUNT]; id++)
             {
-                if (stateOf(stateWordOf(id)) !== GONE && namedUnder(id, prefix))
+                const state = stateOf(stateWordOf(id));
+                if (state !== GONE && namedUnder(id, prefix))
                 {
+                    const length = get(id, R_LENGTH);
                     bodies++;
-                    bytes += get(id, R_LENGTH);
+                    bytes += length;
+                    if (state === HOT || state === WRITING || state === RETIRED || state === RETIRED_WRITING)
+                    {
+                        hotBytes += length;
+                        placedBytes += blockOf(length);
+                    }
                 }
             }
-            return { bodies, bytes };
+            return { bodies, bytes, hotBytes, placedBytes };
         },
 
         /**
