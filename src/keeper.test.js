@@ -10,6 +10,9 @@ import { createBuddy, UNIT } from './buddy.js';
 import { openKeeper } from './keeper.js';
 import { createReader } from './reader.js';
 import { memoryDisk } from './disk.fixture.js';
+import { readIndexFile } from './index-file.js';
+import { COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
+    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, viewIndex } from './shared.js';
 
 const KIB = 1024;
 
@@ -53,6 +56,27 @@ async function cacheOf(options = {}){
         },
     };
 }
+
+/**
+ * The newer index file of a disk and what it says, as Cellar 0.9.0 wrote an
+ * index (JSON, version 1): what a test changes to see what a run trusts.
+ *
+ * @param {Map<string, Uint8Array>} files
+ */
+function newerAsVersion1(files){
+    const [name, state] = /** @type {[string, import('./index-file.js').IndexFileState][]} */ (
+        [...files].filter(([file])=>file.startsWith('index-'))
+            .map(([file, bytes])=>[file, readIndexFile(bytes, 1 << 20, 1)])
+            .filter(([, read])=>read !== null))
+        .sort(([, x], [, y])=>y.generation - x.generation)[0];
+    return { name, saved: { version: 1, generation: state.generation, packs: state.nextPack,
+        /** @type {any[]} */
+        records: [...state.entries].map(([body, { pack, offset, length, flags }])=>
+            [body, pack, offset, length, flags]) } };
+}
+
+/** @param {any} saved */
+const json = saved=>new TextEncoder().encode(JSON.stringify(saved));
 
 /** @param {number} length @param {number} seed */
 const bodyOf = (length, seed)=>Uint8Array.from({ length }, (_, i)=>(i * 31 + seed) & 255);
@@ -574,16 +598,14 @@ test('a disk that writes less than asked holds no body, and two failed saves kee
         'the index saved last whole');
 });
 
-test('an index entry that does not say a body is skipped, the rest read', async()=>{
+test('an index of Cellar 0.9.0: an entry that does not say a body is skipped, the rest read', async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
     first.reader.put('a', bodyOf(100, 1));
     first.keeper.close();
-    const [name, bytes] = [...disk.files].filter(([file])=>file.startsWith('index-'))
-        .sort(([, x], [, y])=>y.length - x.length)[0];
-    const saved = JSON.parse(new TextDecoder().decode(bytes));
+    const { name, saved } = newerAsVersion1(disk.files);
     saved.records.push([7, 0, 0, 10, 0], ['b', 0, -1, 10, 0], ['c', 0, 0, 'x', 0], null);
-    disk.files.set(name, new TextEncoder().encode(JSON.stringify(saved)));
+    disk.files.set(name, json(saved));
     const second = await cacheOf({ disk });
     assert.equal(second.keeper.figures().loaded, 1);
     assert.equal(second.reader.with('a', body=>body[1], { wait: true }), (31 + 1) & 255);
@@ -662,7 +684,8 @@ test('a pack still opening at close whose close throws is counted, not left a re
     }
 });
 
-test('an index entry past its pack\'s file, of other fields, or an index read short is not trusted',
+test('an index of Cellar 0.9.0: an entry past its pack\'s file or of other fields, or an index read'
+    + ' short, is not trusted',
     async()=>{
         const disk = memoryDisk();
         const first = await cacheOf({ disk });
@@ -670,13 +693,10 @@ test('an index entry past its pack\'s file, of other fields, or an index read sh
         first.keeper.save();
         first.reader.put('b', bodyOf(100, 2));
         first.keeper.close();
-        const files = [...disk.files].filter(([file])=>file.startsWith('index-'))
-            .sort(([, x], [, y])=>y.length - x.length);
-        const [name, bytes] = files[0];
-        const saved = JSON.parse(new TextDecoder().decode(bytes));
+        const { name, saved } = newerAsVersion1(disk.files);
         saved.records.push(['c', 0, 2 ** 40, 10, 0], ['d', 0, 0, 2 ** 31, 0], ['e', 0, 0, 10, 0, 1],
             ['f', 0, 0, 10]);
-        disk.files.set(name, new TextEncoder().encode(JSON.stringify(saved)));
+        disk.files.set(name, json(saved));
         const second = await cacheOf({ disk });
         assert.equal(second.keeper.figures().loaded, 2);
         assert.equal(second.keeper.figures().skippedEntries, 4);
@@ -824,16 +844,15 @@ test('an announce that throws is counted and the keeper goes on', async()=>{
     assert.notEqual(keeper.reserve('a', 100), null);
 });
 
-test('an index of more packs than a run opens, or of an unsafe generation, is not read', async()=>{
+test('an index of Cellar 0.9.0 of more packs than a run opens, or of an unsafe generation, is not'
+    + ' read', async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
     first.reader.put('a', bodyOf(100, 1));
     first.keeper.save();
     first.reader.put('b', bodyOf(100, 2));
     first.keeper.save();
-    const [newer, bytes] = [...disk.files].filter(([file])=>file.startsWith('index-'))
-        .sort(([, x], [, y])=>y.length - x.length)[0];
-    const saved = JSON.parse(new TextDecoder().decode(bytes));
+    const { name: newer, saved } = newerAsVersion1(disk.files);
     /** @type {string[]} */
     const opened = [];
     const counting = {
@@ -844,7 +863,7 @@ test('an index of more packs than a run opens, or of an unsafe generation, is no
     };
     for (const change of [{ packs: 1e9 }, { generation: 2 ** 60 }])
     {
-        disk.files.set(newer, new TextEncoder().encode(JSON.stringify({ ...saved, ...change })));
+        disk.files.set(newer, json({ ...saved, ...change }));
         opened.length = 0;
         const next = await cacheOf({ disk: counting });
         assert.equal(next.reader.look('a'), 'cold', 'the other index read');
@@ -918,19 +937,17 @@ test('names are not spent once the records are full', { timeout: 120_000 }, asyn
     assert.equal(Atomics.load(words, 2), names);
 });
 
-test('a generation past what a save counts to is not read', async()=>{
+test('an index of Cellar 0.9.0 of a generation past what a save counts to is not read', async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
     first.reader.put('a', bodyOf(100, 1));
     first.keeper.save();
     first.reader.put('b', bodyOf(100, 2));
     first.keeper.save();
-    const [newer, bytes] = [...disk.files].filter(([file])=>file.startsWith('index-'))
-        .sort(([, x], [, y])=>y.length - x.length)[0];
-    const saved = JSON.parse(new TextDecoder().decode(bytes));
+    const { name: newer, saved } = newerAsVersion1(disk.files);
     for (const generation of [-3, Number.MAX_SAFE_INTEGER])
     {
-        disk.files.set(newer, new TextEncoder().encode(JSON.stringify({ ...saved, generation })));
+        disk.files.set(newer, json({ ...saved, generation }));
         const next = await cacheOf({ disk });
         assert.equal(next.reader.look('b'), null, `generation ${generation} not read`);
         assert.equal(next.reader.look('a'), 'cold');
@@ -1071,4 +1088,421 @@ test('a disk policy not one of the three is refused', async()=>{
         /disk policy/);
     assert.throws(()=>reader.put('a', bodyOf(8, 1), { disk: /** @type {any} */ ('toString') }),
         /disk policy/);
+});
+
+/**
+ * What a base saved now would say, read from the shared index: every name
+ * whose record is hot or cold with a copy on the disk for the next run.
+ *
+ * @param {import('./keeper.js').Keeper} keeper
+ * @returns {Map<string, import('./index-file.js').Entry>}
+ */
+function indexNow(keeper){
+    const index = viewIndex(keeper.shared);
+    const out = new Map();
+    for (let id = 0; id < index.words[H_COUNT]; id++)
+    {
+        const at = index.at(id);
+        const state = index.state(id);
+        const flags = index.words[at + R_FLAGS];
+        if ((state === HOT || state === COLD) && (flags & (F_ON_DISK | F_THIS_RUN | F_NO_DISK)) === F_ON_DISK)
+        {
+            const from = index.words[at + R_NAME];
+            const name = String.fromCharCode(...index.names.subarray(from,
+                from + index.words[at + R_NAME_LENGTH]));
+            out.set(name, { pack: index.words[at + R_PACK], offset: index.words[at + R_PACK_OFFSET],
+                length: index.words[at + R_LENGTH], flags: flags & F_ONLY_COPY });
+        }
+    }
+    return out;
+}
+
+/** What the newer index file of `files` says. @param {Map<string, Uint8Array>} files */
+const savedIndex = files=>/** @type {import('./index-file.js').IndexFileState} */ ([...files]
+    .filter(([file])=>file.startsWith('index-'))
+    .map(([, bytes])=>readIndexFile(bytes, 1 << 20, F_ONLY_COPY))
+    .filter(read=>read !== null)
+    .sort((x, y)=>/** @type {any} */ (y).generation - /** @type {any} */ (x).generation)[0]);
+
+/** @param {number} seed */
+function random(seed){
+    let state = seed >>> 0 || 1;
+    return ()=>{
+        state ^= state << 13;
+        state ^= state >>> 17;
+        state ^= state << 5;
+        return (state >>> 0) / 0x100000000;
+    };
+}
+
+test('a save of what changed leaves the index a base would: seeded runs of writes, reads, drops,'
+    + ' rewrites while read, idle time and packs compacted', { timeout: 120_000 }, async()=>{
+    let deltas = 0;
+    let compacted = 0;
+    let removed = 0;
+    for (let seed = 1; seed <= 12; seed++)
+    {
+        const next = random(seed);
+        const disk = memoryDisk();
+        const cache = await cacheOf({ disk, packBytes: 48 * KIB });
+        const { reader, keeper } = cache;
+        /** @type {Map<string, number>} */
+        const content = new Map();
+        for (let step = 0; step < 400; step++)
+        {
+            const name = `n${Math.floor(next() * 30)}`;
+            const roll = next();
+            if (roll < 0.35)
+            {
+                const body = 1 + Math.floor(next() * 12 * KIB);
+                const policy = next() < 0.75 ? 'kept' : next() < 0.6 ? 'run' : 'never';
+                if (reader.put(name, bodyOf(body, step), { onlyCopy: next() < 0.3, disk: policy }))
+                {
+                    content.set(name, step);
+                }
+            }
+            else if (roll < 0.45)
+            {
+                // Rewritten while read: the name leads to a new record, the old one retired.
+                reader.with(name, ()=>{
+                    if (reader.put(name, bodyOf(64, step)))
+                    {
+                        content.set(name, step);
+                    }
+                });
+            }
+            else if (roll < 0.6)
+            {
+                reader.with(name, ()=>{}, { wait: true });
+            }
+            else if (roll < 0.65)
+            {
+                reader.drop(name);
+            }
+            else if (roll < 0.85)
+            {
+                cache.step(Math.floor(next() * 150));
+            }
+            else
+            {
+                keeper.save();
+                assert.deepEqual(new Map([...savedIndex(disk.files).entries].sort()),
+                    new Map([...indexNow(keeper)].sort()), `seed ${seed}, step ${step}`);
+            }
+            if (step % 25 === 0)
+            {
+                // A pack opens behind a promise.
+                await new Promise(resolve=>setTimeout(resolve, 0));
+            }
+        }
+        const figures = keeper.figures();
+        deltas += figures.saved - figures.wholeSaves;
+        compacted += figures.compactedBytes;
+        removed += figures.packsRemoved;
+        const left = indexNow(keeper);
+        keeper.close();
+        // A pack let go of is removed behind a promise, as on OPFS.
+        await new Promise(resolve=>setTimeout(resolve, 0));
+        const listed = savedIndex(disk.files).packs;
+        assert.deepEqual([...disk.files.keys()].filter(file=>file.startsWith('pack-')).sort(),
+            listed.map(number=>`pack-${number}`).sort(), 'no pack on the disk the index does not list');
+        const again = await cacheOf({ disk, packBytes: 48 * KIB });
+        for (const [name] of left)
+        {
+            const step = /** @type {number} */ (content.get(name));
+            const length = /** @type {import('./index-file.js').Entry} */ (left.get(name)).length;
+            assert.deepEqual(again.reader.with(name, body=>[...body], { wait: true }),
+                [...bodyOf(length, step)], `seed ${seed}: ${name} read back`);
+        }
+    }
+    assert.ok(deltas > 100, `${deltas} deltas saved`);
+    assert.ok(compacted > 0, `${compacted} bytes compacted`);
+    assert.ok(removed > 0, `${removed} packs removed`);
+});
+
+test('a save torn anywhere in its write, base or delta, leaves the index of the save before it',
+    { timeout: 120_000 }, async()=>{
+    const base = memoryDisk();
+    /** @type {{ name: string, at: number, length: number } | null} */
+    let last = null;
+    const disk = {
+        files: base.files,
+        remove: base.remove,
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            return { ...file,
+                write(/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where){
+                    if (name.startsWith('index-'))
+                    {
+                        last = { name, at: where.at, length: view.length };
+                    }
+                    return file.write(view, where);
+                } };
+        },
+    };
+    const next = random(7);
+    const cache = await cacheOf({ disk, packBytes: 48 * KIB });
+    let torn = 0;
+    let deltas = 0;
+    for (let step = 0; step < 300; step++)
+    {
+        const name = `n${Math.floor(next() * 20)}`;
+        const roll = next();
+        if (roll < 0.5)
+        {
+            cache.reader.put(name, bodyOf(1 + Math.floor(next() * 8 * KIB), step),
+                { onlyCopy: next() < 0.3 });
+        }
+        else if (roll < 0.6)
+        {
+            cache.reader.drop(name);
+        }
+        else if (roll < 0.8)
+        {
+            cache.step(Math.floor(next() * 150));
+        }
+        else
+        {
+            const before = savedIndex(base.files);
+            last = null;
+            const saved = cache.keeper.figures().wholeSaves;
+            cache.keeper.save();
+            const wrote = /** @type {{ name: string, at: number, length: number } | null} */ (last);
+            if (wrote !== null && before !== undefined)
+            {
+                deltas += cache.keeper.figures().wholeSaves === saved ? 1 : 0;
+                // The write cut at a point of it, as a tab closing mid-write leaves it.
+                const cut = wrote.at + Math.floor(next() * wrote.length);
+                const files = new Map(base.files);
+                files.set(wrote.name, /** @type {Uint8Array} */ (base.files.get(wrote.name)).slice(0, cut));
+                assert.deepEqual(new Map([...savedIndex(files).entries].sort()),
+                    new Map([...before.entries].sort()), `step ${step}, cut at ${cut}`);
+                if (torn++ % 8 === 0)
+                {
+                    const copy = memoryDisk();
+                    for (const [file, bytes] of files)
+                    {
+                        copy.files.set(file, bytes.slice());
+                    }
+                    const run = await cacheOf({ disk: copy });
+                    for (const [body, { length }] of before.entries)
+                    {
+                        assert.equal(run.reader.with(body, read=>read.length, { wait: true }), length,
+                            `step ${step}: ${body} read by the next run`);
+                    }
+                }
+            }
+        }
+        if (step % 25 === 0)
+        {
+            await new Promise(resolve=>setTimeout(resolve, 0));
+        }
+    }
+    assert.ok(torn > 20 && deltas > 10, `${torn} saves torn, ${deltas} of them deltas`);
+});
+
+/** Lets the promises of the disk settle: a pack opened ahead, a pack removed. */
+const settle = ()=>new Promise(resolve=>setTimeout(resolve, 0));
+
+/** The packs on a memory disk, by name, and their sizes. @param {Map<string, Uint8Array>} files */
+const packFiles = files=>Object.fromEntries([...files].filter(([file])=>file.startsWith('pack-'))
+    .map(([file, bytes])=>[file, bytes.length]).sort());
+
+test('a pack its bodies fill less than a quarter of is compacted: what is left moves, and the save'
+    + ' after lets the file go', async()=>{
+    for (const remove of [true, false])
+    {
+        const disk = memoryDisk({ remove });
+        const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
+        for (let i = 0; i < 6; i++)
+        {
+            reader.put(`a${i}`, bodyOf(10 * KIB, i));
+        }
+        step(100);
+        await settle();
+        reader.put('b', bodyOf(10 * KIB, 9));
+        step(100);
+        assert.equal(keeper.figures().packs, 2, 'pack-0 full, b in pack-1');
+        for (let i = 1; i < 6; i++)
+        {
+            reader.put(`a${i}`, bodyOf(10 * KIB, 20 + i));
+        }
+        assert.equal(keeper.figures().compactedBytes, 0);
+        step(1);
+        assert.equal(keeper.figures().compactedBytes, 10 * KIB, 'a0 moved, the rest of pack-0 dead');
+        keeper.save();
+        await settle();
+        assert.equal(keeper.figures().packsRemoved, 1);
+        assert.equal(keeper.figures().reclaimedBytes, 60 * KIB);
+        assert.equal(packFiles(disk.files)['pack-0'], remove ? undefined : 0,
+            remove ? 'removed' : 'cut to nothing where the disk cannot remove a file');
+        assert.deepEqual(reader.with('a0', body=>[...body], { wait: true }), [...bodyOf(10 * KIB, 0)]);
+        keeper.close();
+        const again = await cacheOf({ disk, packBytes: 64 * KIB });
+        assert.deepEqual(again.reader.with('a0', body=>[...body], { wait: true }),
+            [...bodyOf(10 * KIB, 0)], 'and found where it moved by the next run');
+        assert.deepEqual(again.reader.with('a3', body=>[...body], { wait: true }),
+            [...bodyOf(10 * KIB, 23)]);
+    }
+});
+
+test('a keeper opening an index lets go of the packs no body of it is in: what the run before'
+    + ' wrote for itself', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk, packBytes: 64 * KIB });
+    for (let i = 0; i < 6; i++)
+    {
+        first.reader.put(`texels${i}`, bodyOf(10 * KIB, i), { onlyCopy: true, disk: 'run' });
+    }
+    first.step(100);
+    await settle();
+    first.reader.put('block', bodyOf(10 * KIB, 9));
+    first.step(100);
+    first.keeper.close();
+    await settle();
+    assert.ok('pack-0' in packFiles(disk.files), 'its bodies were this run\'s to the end');
+    const second = await cacheOf({ disk, packBytes: 64 * KIB });
+    await settle();
+    assert.equal(second.keeper.figures().packsRemoved, 1);
+    assert.ok(!('pack-0' in packFiles(disk.files)));
+    assert.equal(second.reader.look('texels0'), null);
+    assert.deepEqual(second.reader.with('block', body=>[...body], { wait: true }),
+        [...bodyOf(10 * KIB, 9)]);
+});
+
+test('a disk that refuses for room makes it from the bodies used longest ago, not the newest',
+    async()=>{
+    // Packs of 32 KiB, room for two on the disk.
+    const base = memoryDisk();
+    const quota = 64 * KIB;
+    const disk = {
+        files: base.files,
+        remove: base.remove,
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            return { ...file,
+                write(/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where){
+                    const others = [...base.files].filter(([other])=>other.startsWith('pack-')
+                        && other !== name).reduce((sum, [, bytes])=>sum + bytes.length, 0);
+                    if (name.startsWith('pack-') && others + Math.max(file.getSize(),
+                        where.at + view.length) > quota)
+                    {
+                        throw new Error('QuotaExceededError');
+                    }
+                    return file.write(view, where);
+                } };
+        },
+    };
+    const { reader, keeper, step } = await cacheOf({ disk, packBytes: 32 * KIB,
+        goneAfterMs: 1e6 });
+    for (let i = 0; i < 6; i++)
+    {
+        reader.put(`old${i}`, bodyOf(10 * KIB, i));
+        step(100);
+        await settle();
+    }
+    assert.equal(keeper.figures().cold, 6, 'two packs of three');
+    step(5000);
+    reader.put('new0', bodyOf(10 * KIB, 10));
+    step(100);
+    assert.ok(keeper.figures().diskFailures > 0, 'the disk refused it');
+    keeper.save();
+    await settle();
+    assert.equal(keeper.figures().evicted, 3, 'the pack used longest ago emptied');
+    assert.equal(keeper.figures().packsRemoved, 1);
+    for (let i = 1; i <= 3; i++)
+    {
+        reader.put(`new${i}`, bodyOf(10 * KIB, 10 + i));
+        step(100);
+        await settle();
+        assert.equal(reader.look(`new${i}`), 'cold', `new${i} on the disk`);
+    }
+    assert.deepEqual([0, 1, 2].map(i=>reader.look(`old${i}`)), [null, null, null]);
+    assert.deepEqual([3, 4, 5].map(i=>reader.look(`old${i}`)), ['cold', 'cold', 'cold']);
+});
+
+test('a pack an only copy moved out of stays while either index file names it there, so a torn'
+    + ' save still finds the copy', async()=>{
+    const base = memoryDisk();
+    /** @type {{ name: string, at: number } | null} */
+    let last = null;
+    const disk = {
+        files: base.files,
+        remove: base.remove,
+        async open(/** @type {string} */ name){
+            const file = await base.open(name);
+            return { ...file,
+                write(/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where){
+                    if (name.startsWith('index-'))
+                    {
+                        last = { name, at: where.at };
+                    }
+                    return file.write(view, where);
+                } };
+        },
+    };
+    const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
+    reader.put('only', bodyOf(10 * KIB, 1), { onlyCopy: true });
+    for (let i = 0; i < 5; i++)
+    {
+        reader.put(`a${i}`, bodyOf(10 * KIB, 2 + i));
+    }
+    step(100);
+    keeper.save();
+    keeper.save();
+    await settle();
+    reader.put('b', bodyOf(10 * KIB, 9));
+    step(100);
+    for (let i = 0; i < 5; i++)
+    {
+        reader.drop(`a${i}`);
+    }
+    step(1);
+    assert.equal(keeper.figures().compactedBytes, 10 * KIB, 'the only copy moved to pack-1');
+    keeper.save();
+    await settle();
+    assert.ok('pack-0' in packFiles(base.files), 'the file not written names it in pack-0');
+    // That save torn: the index before it is read, the only copy in pack-0.
+    const wrote = /** @type {{ name: string, at: number } | null} */ (last);
+    assert.ok(wrote !== null);
+    const copy = memoryDisk();
+    for (const [file, bytes] of base.files)
+    {
+        copy.files.set(file, file === wrote.name ? bytes.slice(0, wrote.at + 3) : bytes.slice());
+    }
+    const torn = await cacheOf({ disk: copy });
+    assert.deepEqual(torn.reader.with('only', body=>[...body], { wait: true }),
+        [...bodyOf(10 * KIB, 1)]);
+    keeper.save();
+    await settle();
+    assert.ok(!('pack-0' in packFiles(base.files)), 'both files written anew: it goes');
+    keeper.close();
+    const again = await cacheOf({ disk: base });
+    assert.deepEqual(again.reader.with('only', body=>[...body], { wait: true }),
+        [...bodyOf(10 * KIB, 1)]);
+});
+
+test('a save with nothing changed writes nothing, and one after a change writes the change',
+    async()=>{
+    const disk = memoryDisk();
+    const { reader, keeper, step } = await cacheOf({ disk, budget: 4 << 20,
+        segmentBytes: 1 << 20 });
+    for (let i = 0; i < 1000; i++)
+    {
+        reader.put(`bundles/demo/blocks/${i}`, bodyOf(64, i));
+    }
+    step(100);
+    keeper.save();
+    keeper.save();
+    const { saved, savedBytes, wholeSaves } = keeper.figures();
+    assert.equal(wholeSaves, 2, 'a base into each file as the keeper opens');
+    assert.equal(keeper.save(), true);
+    assert.equal(keeper.figures().saved, saved, 'nothing written');
+    assert.equal(keeper.figures().savedBytes, savedBytes);
+    reader.put('bundles/demo/blocks/new', bodyOf(64, 1));
+    step(100);
+    keeper.save();
+    const delta = keeper.figures().savedBytes - savedBytes;
+    assert.equal(keeper.figures().wholeSaves, 2, 'a delta');
+    assert.ok(delta < 200, `${delta} bytes for one body, the base ${savedBytes / 2}`);
 });

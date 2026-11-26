@@ -136,9 +136,17 @@ the name has no body then, and the room goes back. A thread joining later is han
 `keeper.shared` and `keeper.segmentBuffers()` as they are then. A write the disk takes in part
 counts as not written. `save()` writes the hot bodies the disk lacks, then an index of exactly the
 bodies the disk holds, after the packs are flushed: the index is always true, and `false` says some
-body stayed in memory only (the disk refused it, or the next pack was not open yet). A save that
-fails at the index leaves the last whole one, which the next run reads; an entry of it that does
-not fit its pack's file is skipped and counted (`skippedEntries`). `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
+body stayed in memory only (the disk refused it, or the next pack was not open yet). A save writes
+what changed since the last one, appended to the index file (a few dozen bytes a body; nothing
+when nothing changed), and the whole index into the other file once the changes outgrow it. A save
+torn or failed at the index leaves the one before it, which the next run reads; an entry of it
+that does not fit its pack's file is skipped and counted (`skippedEntries`). An index of Cellar
+0.9.0 and before is read too. Packs are compacted: a pack its bodies fill less than a quarter of
+has what is left written anew in the current pack, and the save after lets the file go (removed
+where the disk has `remove`, else cut to nothing), unless an index file the next run may read still
+names an only copy there; a keeper opening an index lets go of the packs no body of it is in (what
+a run wrote with `disk: 'run'`). When the disk refuses a write, the next sweep makes room from the
+pack used longest ago: what can be made again there goes, so newer bodies take its place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
 none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the keeper
 goes on: a thread not told of a segment is never placed in it. After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for

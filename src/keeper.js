@@ -19,8 +19,10 @@
  *
  * The cold part is packs on the disk, `packBytes` each, bodies appended; a
  * body written once stays valid there until its name is written anew, so a
- * body going cold again writes nothing. What the disk holds survives the run:
- * the index of it is saved (`save`) and read back when the keeper opens.
+ * body going cold again writes nothing. A pack mostly dead is compacted, what
+ * is left of it appended anew, and the file let go. What the disk holds
+ * survives the run: the index of it is saved (`save`, `index-file.js`) and
+ * read back when the keeper opens.
  *
  * Bodies are of two kinds. One the cache can make again from its source (a
  * block of a bundle, a translation) goes cold when idle and away when idle
@@ -30,6 +32,7 @@
  */
 
 import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
+import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
     H_COUNT, H_NAMES, H_TICK,
@@ -59,8 +62,16 @@ const MAX_PACKS = 1 << 20;
 const POLICY_FLAGS = Object.assign(Object.create(null),
     { kept: 0, run: F_THIS_RUN, never: F_NO_DISK });
 
-/** The layout of the index saved on the disk: another is not read. */
-const INDEX_VERSION = 1;
+/**
+ * A pack whose bodies fill less than this share of its file is compacted:
+ * what is left of it is written anew, and the file goes. Moving a quarter to
+ * free the rest writes at most a third of a byte for each byte given back.
+ */
+const COMPACT_LIVE = 1 / 4;
+
+/** What `append` answers where it wrote nothing: no pack open yet, or the disk refused. */
+const NOT_YET = -1;
+const REFUSED = -2;
 
 /**
  * A file on the disk as the keeper uses it: the shape of a
@@ -138,21 +149,51 @@ export async function openKeeper(options){
         table: sharedBuffer(FIRST_TABLE * 4),
     };
     const index = viewIndex(shared);
-    const { words } = index;
+    /**
+     * The keeper's own views of the records and the names, of the length the
+     * buffers have now: a view that follows a growable buffer's length is
+     * read several times slower (V8), and the keeper, the one thread that
+     * grows them, makes these again when it does.
+     */
+    let words = new Int32Array(shared.records, 0, shared.records.byteLength / 4);
+    let names = new Uint16Array(shared.names, 0, shared.names.byteLength / 2);
     const started = now();
 
     /** @type {({ buffer: SharedArrayBuffer, bytes: Uint8Array, buddy: import('./buddy.js').Buddy,
      *     emptySince: number } | null)[]} */
     const segments = [];
-    /** @type {DiskFile[]} */
-    const packs = [];
+    /**
+     * The packs on the disk by number, `pack-<number>`. A number is never
+     * given twice: the index of a run before may still name a pack let go.
+     *
+     * @type {Map<number, DiskFile>}
+     */
+    const packs = new Map();
+    /** Bytes each pack's file holds as far as this run knows, and of them bodies a record leads to. */
+    /** @type {Map<number, number>} */
+    const filled = new Map();
+    /** @type {Map<number, number>} */
+    const live = new Map();
+    /** The number the next pack opened takes. */
+    let nextPackNumber = 0;
     /** The pack bodies are appended to, and where. */
     let pack = -1;
     let packTop = 0;
     /** The next pack, opened ahead: opening a file may not be synchronous. @type {Promise<DiskFile> | null} */
     let nextPack = null;
-    /** @type {DiskFile | null} */
+    /** @type {{ number: number, file: DiskFile } | null} */
     let readyPack = null;
+    /** The disk refused a write since the last sweep: room is made on it then. */
+    let refused = false;
+    /**
+     * Records whose entry in the saved index may have changed since the last
+     * save: each the record its name leads to (`replaceRecord` hands it on).
+     *
+     * @type {Set<number>}
+     */
+    const changed = new Set();
+    /** The packs on the disk are not the ones the last save listed. */
+    let packsChanged = false;
     /** Closed: no file is opened any more. */
     let closed = false;
 
@@ -161,7 +202,8 @@ export async function openKeeper(options){
         replaced: 0, raised: 0, raiseFailed: 0, cooled: 0, written: 0, writtenBytes: 0, gone: 0,
         loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
-        segmentFailures: 0,
+        segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
+        reclaimedBytes: 0, evicted: 0,
     };
 
     /**
@@ -217,6 +259,7 @@ export async function openKeeper(options){
         if (need > units)
         {
             growTo(shared.names, Math.min(MAX_NAME_UNITS, Math.max(need, units * 2)) * 2);
+            names = new Uint16Array(shared.names, 0, shared.names.byteLength / 2);
         }
     };
 
@@ -241,7 +284,7 @@ export async function openKeeper(options){
         growNames(from + name.length);
         for (let i = 0; i < name.length; i++)
         {
-            index.names[from + i] = name.charCodeAt(i);
+            names[from + i] = name.charCodeAt(i);
         }
         words[H_NAMES] = from + name.length;
         const id = newRecord(hash[0], hash[1], from, name.length);
@@ -269,6 +312,7 @@ export async function openKeeper(options){
         {
             growTo(shared.records, Math.min(shared.records.maxByteLength,
                 Math.max(bytesNeeded, shared.records.byteLength * 2)));
+            words = new Int32Array(shared.records, 0, shared.records.byteLength / 4);
         }
         set(id, R_HASH_A, a);
         set(id, R_HASH_B, b);
@@ -315,6 +359,9 @@ export async function openKeeper(options){
                 break;
             }
         }
+        // The name leads to the new record: its entry is said by that one.
+        changed.delete(old);
+        changed.add(id);
         counts.replaced++;
         return id;
     };
@@ -508,22 +555,28 @@ export async function openKeeper(options){
 
     const openNextPack = ()=>{
         if (disk !== null && !closed && nextPack === null && readyPack === null
-            && packs.length < MAX_PACKS)
+            && nextPackNumber < MAX_PACKS)
         {
-            const name = `pack-${packs.length}`;
+            const number = nextPackNumber++;
             const opening = disk;
             // A disk that throws at once fails the same way as one whose
             // promise does: counted, and the body that wanted it stays.
-            nextPack = Promise.resolve().then(()=>opening.open(name))
+            nextPack = Promise.resolve().then(()=>opening.open(`pack-${number}`))
                 .then(file=>{
                     nextPack = null;
-                    // Opened after the keeper closed: let go of here, once.
+                    // Opened after the keeper closed: let go of here, once, and
+                    // removed where the disk can, since no index lists it.
                     if (closed)
                     {
                         closeFile(file);
+                        Promise.resolve().then(()=>opening.remove?.(`pack-${number}`))
+                            .catch(()=>{
+                                counts.diskFailures++;
+                            });
                         return file;
                     }
-                    readyPack = file;
+                    readyPack = { number, file };
+                    packsChanged = true;
                     return file;
                 }, e=>{
                     counts.diskFailures++;
@@ -532,6 +585,65 @@ export async function openKeeper(options){
                 });
             nextPack.catch(()=>{});
         }
+    };
+
+    /** @param {number} number @param {number} bytes */
+    const addLive = (number, bytes)=>{
+        live.set(number, (live.get(number) ?? 0) + bytes);
+    };
+
+    /**
+     * Appends `bytes` to the pack bodies go to, flushed where asked: where it
+     * wrote them (in `pack`), or `NOT_YET` where the next pack is not open
+     * yet, or `REFUSED` where the disk failed, counted.
+     *
+     * @param {Uint8Array} bytes @param {boolean} flush
+     */
+    const append = (bytes, flush)=>{
+        const length = bytes.length;
+        if (pack < 0 || packTop + length > packBytes)
+        {
+            // Past the packs a run reads back, the disk is full: an index of
+            // more would not be read (`openNextPack` opens none).
+            if (readyPack === null)
+            {
+                openNextPack();
+                return NOT_YET;
+            }
+            pack = readyPack.number;
+            packs.set(pack, readyPack.file);
+            filled.set(pack, 0);
+            live.set(pack, 0);
+            packTop = 0;
+            readyPack = null;
+            packsChanged = true;
+            openNextPack();
+        }
+        const file = /** @type {DiskFile} */ (packs.get(pack));
+        try
+        {
+            // A disk that wrote less than asked holds no body: what it wrote is
+            // written over by the next one.
+            if (file.write(bytes, { at: packTop }) !== length)
+            {
+                counts.diskFailures++;
+                refused = true;
+                return REFUSED;
+            }
+            if (flush)
+            {
+                file.flush();
+            }
+        }
+        catch {
+            counts.diskFailures++;
+            refused = true;
+            return REFUSED;
+        }
+        const at = packTop;
+        packTop += length;
+        filled.set(pack, Math.max(packTop, filled.get(pack) ?? 0));
+        return at;
     };
 
     /**
@@ -545,63 +657,81 @@ export async function openKeeper(options){
             return false;
         }
         const length = get(id, R_LENGTH);
-        if (pack < 0 || packTop + length > packBytes)
-        {
-            // Past the packs a run reads back, the disk is full: an index of
-            // more would not be read.
-            if (packs.length >= MAX_PACKS)
-            {
-                return false;
-            }
-            if (readyPack === null)
-            {
-                openNextPack();
-                return false;
-            }
-            packs.push(readyPack);
-            readyPack = null;
-            pack = packs.length - 1;
-            packTop = 0;
-            openNextPack();
-        }
         const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[get(id, R_SEGMENT)]);
         const offset = get(id, R_OFFSET);
-        try
+        const at = append(one.bytes.subarray(offset, offset + length),
+            (get(id, R_FLAGS) & F_ONLY_COPY) !== 0);
+        if (at < 0)
         {
-            // A disk that wrote less than asked holds no body: what it wrote is
-            // written over by the next one.
-            if (packs[pack].write(one.bytes.subarray(offset, offset + length), { at: packTop })
-                !== length)
-            {
-                counts.diskFailures++;
-                return false;
-            }
-            if (get(id, R_FLAGS) & F_ONLY_COPY)
-            {
-                packs[pack].flush();
-            }
-        }
-        catch {
-            counts.diskFailures++;
             return false;
         }
         set(id, R_PACK, pack);
-        set(id, R_PACK_OFFSET, packTop);
+        set(id, R_PACK_OFFSET, at);
         set(id, R_FLAGS, get(id, R_FLAGS) | F_ON_DISK);
-        packTop += length;
+        addLive(pack, length);
+        changed.add(id);
         counts.written++;
         counts.writtenBytes += length;
         return true;
     };
 
-    /** @param {number} id */
-    const forgetDisk = id=>{
+    /**
+     * The disk's copy of a body is no longer its: dead bytes in its pack.
+     *
+     * @param {number} id
+     * @param {boolean} [named]  whether its name leads to it: a record retired is no name's
+     */
+    const forgetDisk = (id, named = true)=>{
         if (get(id, R_FLAGS) & F_ON_DISK)
         {
             counts.deadDiskBytes += get(id, R_LENGTH);
+            addLive(get(id, R_PACK), -get(id, R_LENGTH));
+            if (named)
+            {
+                changed.add(id);
+            }
         }
         set(id, R_FLAGS, get(id, R_FLAGS) & ~F_ON_DISK);
         set(id, R_PACK, -1);
+    };
+
+    /**
+     * Lets go of pack `number`, which no record leads to and no index on the
+     * disk names an only copy in: removed where the disk can, else cut to
+     * nothing. A disk that fails is counted, the file left.
+     *
+     * @param {number} number
+     */
+    const removePack = number=>{
+        const file = /** @type {DiskFile} */ (packs.get(number));
+        const opening = disk;
+        packs.delete(number);
+        live.delete(number);
+        counts.reclaimedBytes += filled.get(number) ?? 0;
+        filled.delete(number);
+        if (number === pack)
+        {
+            pack = -1;
+        }
+        packsChanged = true;
+        counts.packsRemoved++;
+        if (opening?.remove === undefined)
+        {
+            try
+            {
+                file.truncate(0);
+            }
+            catch {
+                counts.diskFailures++;
+            }
+            closeFile(file);
+            return;
+        }
+        // A handle open on a file keeps it on OPFS: closed first.
+        closeFile(file);
+        Promise.resolve().then(()=>opening.remove?.(`pack-${number}`)).catch(()=>{
+            counts.diskFailures++;
+        });
     };
 
     // --- moves --------------------------------------------------------------
@@ -676,13 +806,169 @@ export async function openKeeper(options){
         return true;
     };
 
+    // --- room on the disk ---------------------------------------------------
+
+    /** Bytes a body is read into on its way from one pack to another. */
+    let carry = new Uint8Array(0);
+
+    /**
+     * Takes every body out of pack `number`, so the next save lets go of it:
+     * a hot body forgets its copy there (memory holds it, and it is written
+     * again when it goes cold), a cold one is written anew at the end of the
+     * pack bodies go to, or, where `evict` says so and it can be made again,
+     * goes. Stops where the disk will not take a body now: what is left stays.
+     *
+     * @param {number} number @param {boolean} evict
+     */
+    const empty = (number, evict)=>{
+        const from = /** @type {DiskFile} */ (packs.get(number));
+        for (let id = 0; id < words[H_COUNT] && live.get(number) !== 0; id++)
+        {
+            if (get(id, R_PACK) !== number || (get(id, R_FLAGS) & F_ON_DISK) === 0)
+            {
+                continue;
+            }
+            const state = stateOf(stateWordOf(id));
+            if (state !== COLD)
+            {
+                // Hot, or retired and no name's: its copy here is no one's.
+                forgetDisk(id, state !== RETIRED);
+                continue;
+            }
+            const flags = get(id, R_FLAGS);
+            if (evict && (flags & F_ONLY_COPY) === 0)
+            {
+                drop(id);
+                counts.evicted++;
+                continue;
+            }
+            const length = get(id, R_LENGTH);
+            if (carry.length < length)
+            {
+                carry = new Uint8Array(length);
+            }
+            const bytes = carry.subarray(0, length);
+            let read = 0;
+            try
+            {
+                read = from.read(bytes, { at: get(id, R_PACK_OFFSET) });
+            }
+            catch {
+                counts.diskFailures++;
+                return;
+            }
+            if (read !== length)
+            {
+                // The pack holds less than the index says: the body is gone.
+                forgetDisk(id);
+                set(id, R_FLAGS, 0);
+                store(id, GONE);
+                counts.lostOnDisk++;
+                continue;
+            }
+            const at = append(bytes, (flags & F_ONLY_COPY) !== 0);
+            if (at < 0)
+            {
+                return;
+            }
+            addLive(number, -length);
+            addLive(pack, length);
+            set(id, R_PACK, pack);
+            set(id, R_PACK_OFFSET, at);
+            changed.add(id);
+            counts.compactedBytes += length;
+            if (flags & F_ONLY_COPY)
+            {
+                // Both files written anew: neither names it in the old pack.
+                basesOwed = 2;
+            }
+        }
+    };
+
+    /**
+     * One pack bodies fill less than `COMPACT_LIVE` of, the emptiest, taken
+     * out of (`empty`): its dead bytes are given back at the next save.
+     */
+    const compact = ()=>{
+        let emptiest = -1;
+        for (const [number, bytes] of filled)
+        {
+            const share = /** @type {number} */ (live.get(number)) / bytes;
+            if (number !== pack && bytes > 0 && share < COMPACT_LIVE
+                && (emptiest < 0 || share < /** @type {number} */ (live.get(emptiest))
+                    / /** @type {number} */ (filled.get(emptiest))))
+            {
+                emptiest = number;
+            }
+        }
+        if (emptiest >= 0)
+        {
+            empty(emptiest, false);
+        }
+    };
+
+    /**
+     * After the disk refused a write: the bodies used longest ago make room
+     * for the newer ones, not the other way round. The pack whose last used
+     * body is the oldest is taken out of, what can be made again in it going
+     * (`empty`); the pack bodies go to is closed to new ones first where it
+     * is the only one, so that it can be.
+     */
+    const makeRoomOnDisk = ()=>{
+        /** @type {Map<number, number>} */
+        const lastUsed = new Map();
+        const at = tick();
+        for (let id = 0; id < words[H_COUNT]; id++)
+        {
+            const number = get(id, R_PACK);
+            if (number >= 0 && (get(id, R_FLAGS) & F_ON_DISK) !== 0)
+            {
+                const idle = age(at, get(id, R_TICK));
+                lastUsed.set(number, Math.min(lastUsed.get(number) ?? idle, idle));
+            }
+        }
+        let oldest = -1;
+        for (const [number, idle] of lastUsed)
+        {
+            if (number !== pack && (oldest < 0 || idle > /** @type {number} */ (lastUsed.get(oldest))))
+            {
+                oldest = number;
+            }
+        }
+        if (oldest < 0)
+        {
+            // Only the pack bodies go to holds any: the next body opens another.
+            pack = -1;
+            return;
+        }
+        empty(oldest, true);
+    };
+
     // --- the index on the disk -----------------------------------------------
 
-    /** The two files the index is saved to in turn, the newer whole one read. */
+    /**
+     * The two files the index is saved to: a base is written into the one
+     * the last save did not write, deltas appended to the one it did, so a
+     * save torn mid-write leaves the index of the save before it whole.
+     * Each with where its chain ends and the packs an only copy it names lies
+     * in: such a pack stays while either file is the next run's to read.
+     *
+     * @type {{ file: DiskFile, end: number, onlyCopies: Set<number> }[]}
+     */
+    const slots = [];
     const INDEX_FILES = ['index-a', 'index-b'];
-    /** @type {DiskFile[]} */
-    const indexFiles = [];
+    /** The file the last whole save wrote, its deltas after it; -1 for none. */
+    let current = -1;
     let generation = 0;
+    /**
+     * Saves still to be bases: two as the keeper opens and after an only
+     * copy moved, so each file is written anew and neither names a pack it
+     * left; one after a delta failed, which may have left a torn tail.
+     */
+    let basesOwed = 2;
+    /** Bytes of the current file's base and of the deltas after it: past the base, a base. */
+    let baseBytes = 0;
+    let deltaBytes = 0;
 
     /** @param {DiskFile} file */
     const readIndex = file=>{
@@ -694,17 +980,23 @@ export async function openKeeper(options){
             {
                 return null;
             }
-            const saved = JSON.parse(new TextDecoder().decode(bytes));
-            // A generation the next save can count on from, in a file of two.
-            return saved?.version === INDEX_VERSION && Number.isSafeInteger(saved.generation)
-                && saved.generation >= 0 && saved.generation < Number.MAX_SAFE_INTEGER
-                && Number.isInteger(saved.packs) && saved.packs >= 0 && saved.packs <= MAX_PACKS
-                && Array.isArray(saved.records) ? saved : null;
+            return readIndexFile(bytes, MAX_PACKS, F_ONLY_COPY);
         }
         catch {
-            // Torn mid-write, or not read: the other file is the index.
             return null;
         }
+    };
+
+    /**
+     * Whether record `id` is in the index: a body hot or cold whose copy on
+     * the disk is the next run's.
+     *
+     * @param {number} id
+     */
+    const indexed = id=>{
+        const state = stateOf(stateWordOf(id));
+        return (state === HOT || state === COLD)
+            && (get(id, R_FLAGS) & (F_ON_DISK | F_THIS_RUN | F_NO_DISK)) === F_ON_DISK;
     };
 
     /** What the disk held when the keeper opened: packs, and a record cold for each body. */
@@ -715,38 +1007,44 @@ export async function openKeeper(options){
         }
         for (const name of INDEX_FILES)
         {
-            indexFiles.push(await disk.open(name));
+            slots.push({ file: await disk.open(name), end: 0, onlyCopies: new Set() });
         }
-        const saved = indexFiles.map(readIndex).filter(one=>one !== null)
-            .sort((a, b)=>b.generation - a.generation)[0];
-        if (saved === undefined)
+        const read = slots.map(slot=>readIndex(slot.file));
+        read.forEach((state, at)=>{
+            slots[at].onlyCopies = state?.onlyCopies ?? new Set();
+        });
+        const chosen = read[1] !== null && (read[0] === null || read[1].generation > read[0].generation)
+            ? 1 : read[0] !== null ? 0 : -1;
+        const saved = read[chosen];
+        if (saved === null || saved === undefined)
         {
             return;
         }
+        current = chosen;
+        slots[chosen].end = saved.end;
         generation = saved.generation;
-        for (let at = 0; at < saved.packs; at++)
+        nextPackNumber = saved.nextPack;
+        counts.skippedEntries += saved.skipped;
+        for (const number of saved.packs)
         {
-            packs.push(await disk.open(`pack-${at}`));
-        }
-        if (packs.length > 0)
-        {
-            pack = packs.length - 1;
-            packTop = packs[pack].getSize();
-        }
-        for (const entry of saved.records)
-        {
-            // An entry that does not say a body is skipped, not trusted: the
-            // rest of the index is still the disk's.
-            if (!Array.isArray(entry) || entry.length !== 5 || typeof entry[0] !== 'string'
-                || !entry.slice(1).every(Number.isInteger))
+            const file = await disk.open(`pack-${number}`);
+            packs.set(number, file);
+            filled.set(number, file.getSize());
+            live.set(number, 0);
+            if (number > pack)
             {
-                counts.skippedEntries++;
-                continue;
+                pack = number;
             }
-            const [name, from, offset, length, flags] = entry;
+        }
+        if (pack >= 0)
+        {
+            packTop = /** @type {number} */ (filled.get(pack));
+        }
+        for (const [name, { pack: from, offset, length, flags }] of saved.entries)
+        {
             // Within a pack this run opened, and within that pack's file.
-            if (from < 0 || from >= packs.length || offset < 0 || !(length > 0)
-                || offset + length > packs[from].getSize())
+            if (!packs.has(from) || offset < 0 || !(length > 0)
+                || offset + length > /** @type {number} */ (filled.get(from)))
             {
                 counts.skippedEntries++;
                 continue;
@@ -762,24 +1060,19 @@ export async function openKeeper(options){
             set(id, R_FLAGS, (flags & F_ONLY_COPY) | F_ON_DISK);
             set(id, R_TICK, 0);
             store(id, COLD);
+            addLive(from, length);
             counts.loaded++;
         }
-    };
-
-    /**
-     * @param {number} id
-     */
-    const nameOf = id=>{
-        const from = get(id, R_NAME);
-        const units = index.names.subarray(from, from + get(id, R_NAME_LENGTH));
-        // In pieces: a name passed whole as arguments can be longer than a
-        // call may take.
-        let name = '';
-        for (let at = 0; at < units.length; at += 8192)
+        // A pack no body of the index is in holds what the run before wrote
+        // for itself (`disk: 'run'`) or let go of: it goes, unless the other
+        // file, which a torn save leaves to the next run, names an only copy there.
+        for (const number of [...packs.keys()])
         {
-            name += String.fromCharCode(...units.subarray(at, at + 8192));
+            if (live.get(number) === 0 && !slots.some(slot=>slot.onlyCopies.has(number)))
+            {
+                removePack(number);
+            }
         }
-        return name;
     };
 
     /** Flushes a file the keeper wrote: false where the disk failed, counted. @param {DiskFile} file */
@@ -806,7 +1099,7 @@ export async function openKeeper(options){
         // pack still opening is let go of where it opens, so the next try
         // finds none of them held.
         closed = true;
-        for (const file of [...packs, ...indexFiles])
+        for (const file of [...packs.values(), ...slots.map(slot=>slot.file)])
         {
             closeFile(file);
         }
@@ -948,7 +1241,7 @@ export async function openKeeper(options){
             let read = 0;
             try
             {
-                read = packs[get(id, R_PACK)].read(one.bytes.subarray(found.offset,
+                read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(found.offset,
                     found.offset + length), { at: get(id, R_PACK_OFFSET) });
             }
             catch {
@@ -1005,7 +1298,7 @@ export async function openKeeper(options){
                     {
                         giveBack(id);
                     }
-                    forgetDisk(id);
+                    forgetDisk(id, false);
                     store(id, GONE);
                     continue;
                 }
@@ -1055,9 +1348,18 @@ export async function openKeeper(options){
                     tell({ segment: s, buffer: null });
                 }
             }
-            for (const file of packs)
+            for (const file of packs.values())
             {
                 flushed(file);
+            }
+            if (refused)
+            {
+                refused = false;
+                makeRoomOnDisk();
+            }
+            else
+            {
+                compact();
             }
         },
 
@@ -1066,36 +1368,24 @@ export async function openKeeper(options){
          * for the next run to find: true where the disk holds them all now.
          */
         save(){
-            if (disk === null || indexFiles.length === 0)
+            if (disk === null || slots.length === 0)
             {
                 return false;
             }
             let whole = true;
-            /** @type {[string, number, number, number, number][]} */
-            const records = [];
             for (let id = 0; id < words[H_COUNT]; id++)
             {
-                const state = stateOf(stateWordOf(id));
-                const flags = get(id, R_FLAGS);
                 // A body for this run only, or never on the disk, is no next
                 // run's: not written for it, and not named in its index.
-                if ((flags & (F_THIS_RUN | F_NO_DISK)) !== 0)
-                {
-                    continue;
-                }
-                if (state === HOT && (flags & F_ON_DISK) === 0)
+                if (stateOf(stateWordOf(id)) === HOT
+                    && (get(id, R_FLAGS) & (F_ON_DISK | F_THIS_RUN | F_NO_DISK)) === 0)
                 {
                     // Only no one may write it meanwhile: the keeper's thread
                     // is the one placing, and a reader does not write.
                     whole = writeOut(id) && whole;
                 }
-                if ((state === HOT || state === COLD) && (get(id, R_FLAGS) & F_ON_DISK) !== 0)
-                {
-                    records.push([nameOf(id), get(id, R_PACK), get(id, R_PACK_OFFSET),
-                        get(id, R_LENGTH), get(id, R_FLAGS) & F_ONLY_COPY]);
-                }
             }
-            for (const file of packs)
+            for (const file of packs.values())
             {
                 // An index naming bodies the disk may not hold is not written.
                 if (!flushed(file))
@@ -1103,30 +1393,106 @@ export async function openKeeper(options){
                     return false;
                 }
             }
-            const next = generation + 1;
-            const bytes = new TextEncoder().encode(JSON.stringify({
-                version: INDEX_VERSION, generation: next, packs: packs.length, records,
-            }));
-            // The other file keeps the last index whole while this one is
-            // written; a save that fails leaves the next one to this file
-            // again, so the whole one is never the one written over.
-            const file = indexFiles[next % indexFiles.length];
+            const asBase = basesOwed > 0 || current < 0 || deltaBytes > baseBytes;
+            if (!asBase && changed.size === 0 && !packsChanged)
+            {
+                // The index on the disk says all there is.
+                return whole;
+            }
+            const target = !asBase ? current : current < 0 ? (generation + 1) % 2 : 1 - current;
+            const writer = chunkWriter();
+            const onlyCopies = asBase ? new Set() : new Set(slots[current].onlyCopies);
+            /** @param {number} id */
+            const enter = id=>{
+                const named = indexed(id);
+                const from = get(id, R_PACK);
+                const flags = named ? get(id, R_FLAGS) & F_ONLY_COPY : 0;
+                writer.entry(named ? from : -1, named ? get(id, R_PACK_OFFSET) : 0,
+                    named ? get(id, R_LENGTH) : 0, flags, names, get(id, R_NAME),
+                    get(id, R_NAME_LENGTH));
+                if (flags !== 0)
+                {
+                    onlyCopies.add(from);
+                }
+            };
+            if (asBase)
+            {
+                for (let id = 0; id < words[H_COUNT]; id++)
+                {
+                    if (indexed(id))
+                    {
+                        enter(id);
+                    }
+                }
+            }
+            else
+            {
+                for (const id of changed)
+                {
+                    enter(id);
+                }
+            }
+            // Packs no record leads to and neither file, once this one is
+            // written, names an only copy in: not listed, and let go of.
+            const other = slots[1 - target].onlyCopies;
+            const leaving = [...packs.keys()].filter(number=>number !== pack
+                && live.get(number) === 0 && !onlyCopies.has(number) && !other.has(number));
+            // The pack opened ahead is listed too: a file on the disk no index
+            // lists would be no run's to let go of.
+            const listed = [...packs.keys()].filter(number=>!leaving.includes(number));
+            if (readyPack !== null)
+            {
+                listed.push(readyPack.number);
+            }
+            const bytes = writer.finish({ kind: asBase ? BASE : DELTA, generation: generation + 1,
+                nextPack: nextPackNumber, packs: listed });
+            const slot = slots[target];
             try
             {
-                file.truncate(0);
-                if (file.write(bytes, { at: 0 }) !== bytes.length)
+                if (asBase)
                 {
-                    counts.diskFailures++;
-                    return false;
+                    slot.file.truncate(0);
                 }
-                file.flush();
+                if (slot.file.write(bytes, { at: asBase ? 0 : slot.end }) !== bytes.length)
+                {
+                    throw new Error('written short');
+                }
+                slot.file.flush();
             }
             catch {
                 counts.diskFailures++;
+                // A delta cut short may have left a torn tail: the next save
+                // writes a base into the other file. A base that failed leaves
+                // the next one to this file again, so the whole one is never
+                // the one written over.
+                basesOwed = Math.max(basesOwed, 1);
                 return false;
             }
-            generation = next;
+            generation++;
             counts.saved++;
+            counts.savedBytes += bytes.length;
+            slot.onlyCopies = onlyCopies;
+            if (asBase)
+            {
+                current = target;
+                slot.end = bytes.length;
+                baseBytes = bytes.length;
+                deltaBytes = 0;
+                basesOwed = Math.max(0, basesOwed - 1);
+                counts.wholeSaves++;
+            }
+            else
+            {
+                slot.end += bytes.length;
+                deltaBytes += bytes.length;
+            }
+            changed.clear();
+            for (const number of leaving)
+            {
+                removePack(number);
+            }
+            // The packs as listed: those let go of are not in the list.
+            packsChanged = false;
             return whole;
         },
 
@@ -1160,12 +1526,15 @@ export async function openKeeper(options){
                     set(id, R_PACK, -1);
                 }
             }
-            for (const file of [...packs, ...indexFiles, ...readyPack ? [readyPack] : []])
+            for (const file of [...packs.values(), ...slots.map(slot=>slot.file),
+                ...readyPack ? [readyPack.file] : []])
             {
                 closeFile(file);
             }
-            packs.length = 0;
-            indexFiles.length = 0;
+            packs.clear();
+            live.clear();
+            filled.clear();
+            slots.length = 0;
             readyPack = null;
             return whole;
         },
@@ -1190,15 +1559,18 @@ export async function openKeeper(options){
                     coldBytes += get(id, R_LENGTH);
                 }
             }
-            const live = segments.filter(one=>one !== null);
+            const made = segments.filter(one=>one !== null);
             return {
                 records: words[H_COUNT], hot, hotBytes, cold, coldBytes,
-                segments: live.length, segmentBytes: live.length * segmentBytes,
-                placedBytes: live.reduce((sum, one)=>sum + one.buddy.used(), 0),
-                roundingBytes: live.reduce((sum, one)=>sum + one.buddy.wasted(), 0),
+                segments: made.length, segmentBytes: made.length * segmentBytes,
+                placedBytes: made.reduce((sum, one)=>sum + one.buddy.used(), 0),
+                roundingBytes: made.reduce((sum, one)=>sum + one.buddy.wasted(), 0),
                 indexBytes: shared.records.byteLength + shared.names.byteLength
                     + index.table().byteLength,
-                packs: packs.length, ...counts,
+                packs: packs.size,
+                diskBytes: [...filled.values()].reduce((sum, bytes)=>sum + bytes, 0),
+                liveDiskBytes: [...live.values()].reduce((sum, bytes)=>sum + bytes, 0),
+                ...counts,
             };
         },
     };

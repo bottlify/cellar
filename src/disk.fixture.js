@@ -13,12 +13,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** @returns {import('./keeper.js').Disk & { files: Map<string, Uint8Array> }} */
-export function memoryDisk(){
+/**
+ * @param {{ remove?: boolean }} [options]  whether the disk can remove a file (yes)
+ * @returns {import('./keeper.js').Disk & { files: Map<string, Uint8Array> }}
+ */
+export function memoryDisk({ remove = true } = {}){
     /** @type {Map<string, Uint8Array>} */
     const files = new Map();
     return {
         files,
+        ...remove ? { remove: (/** @type {string} */ name)=>{
+            files.delete(name);
+        } } : {},
         async open(name){
             if (!files.has(name))
             {
