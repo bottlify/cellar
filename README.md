@@ -429,7 +429,8 @@ one; one kept past that fails where it is used. `oldest()` and `written()` bound
 asked for; `first` in the memory's options starts the count where a journal it takes over from
 ended. Counts wrap at 2^32 and are compared by their difference, past 2^32 records too. Over an
 `ArrayBuffer` (`shared: false`) the readers are on the writer's own thread. Writing a record and
-reading it back make nothing on the heap.
+reading it back make nothing on the heap, but for a record longer than any before (its view grows,
+once).
 
 The copies are what a record costs: V8 runs each `Atomics` load or store as a call of its own
 (about 9 and 12 ns, x86), and a record takes one a word besides a few for the counts. A record of 16
