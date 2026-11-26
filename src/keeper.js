@@ -1012,21 +1012,30 @@ export async function openKeeper(options){
     let baseBytes = 0;
     let deltaBytes = 0;
 
-    /** @param {DiskFile} file */
-    const readIndex = file=>{
+    /**
+     * What an index file says, null where it is no whole index. A file the
+     * disk fails to read, or reads less of than it holds, throws: it may be
+     * the newer index, and a keeper that went on without it would not know
+     * the packs it names an only copy in, the pack numbers it gives, nor the
+     * generation to save past, so would let go of, write over or outdate
+     * what the next run reads.
+     *
+     * @param {DiskFile} file @param {string} name
+     */
+    const readIndex = (file, name)=>{
+        let bytes;
         try
         {
-            // A file the disk fails to read is no index: the other one is.
-            const bytes = new Uint8Array(file.getSize());
+            bytes = new Uint8Array(file.getSize());
             if (file.read(bytes, { at: 0 }) !== bytes.length)
             {
-                return null;
+                throw new Error('read short');
             }
-            return readIndexFile(bytes, MAX_PACKS, F_ONLY_COPY);
         }
-        catch {
-            return null;
+        catch (e){
+            throw new Error(`cache: the disk failed to read ${name}`, { cause: e });
         }
+        return readIndexFile(bytes, MAX_PACKS, F_ONLY_COPY);
     };
 
     /**
@@ -1051,7 +1060,7 @@ export async function openKeeper(options){
         {
             slots.push({ file: await disk.open(name), end: 0, onlyCopies: new Set() });
         }
-        const read = slots.map(slot=>readIndex(slot.file));
+        const read = slots.map((slot, at)=>readIndex(slot.file, INDEX_FILES[at]));
         read.forEach((state, at)=>{
             slots[at].onlyCopies = state?.onlyCopies ?? new Set();
         });
@@ -1136,9 +1145,9 @@ export async function openKeeper(options){
         openNextPack();
     }
     catch (e){
-        // A file the disk would not open: the files opened are let go, and a
-        // pack still opening is let go of where it opens, so the next try
-        // finds none of them held.
+        // A file the disk would not open or read: the files opened are let
+        // go, nothing on the disk changed, and a pack still opening is let go
+        // of where it opens, so the next try finds none of them held.
         closed = true;
         for (const file of [...packs.values(), ...slots.map(slot=>slot.file)])
         {

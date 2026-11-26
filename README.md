@@ -143,7 +143,10 @@ body stayed in memory only (the disk refused it, or the next pack was not open y
 what changed since the last one, appended to the index file (a few dozen bytes a body; nothing
 when nothing changed), and the whole index into the other file once the changes outgrow it. A save
 torn or failed at the index leaves the one before it, which the next run reads; an entry of it
-that does not fit its pack's file is skipped and counted (`skippedEntries`). An index of Cellar
+that does not fit its pack's file is skipped and counted (`skippedEntries`). An index file the disk
+fails to read, or reads short, keeps the keeper from opening (`openKeeper` rejects, the disk left
+as it was): a keeper that went on without it could let go of, write over or outdate what the next
+run reads, so the program goes on without the disk (`disk: null`) and the next run tries again. An index of Cellar
 0.9.0 and before is read too. Packs are compacted: a pack its bodies fill less than a quarter of
 has what is left written anew in the current pack, and the save after lets the file go (removed
 where the disk has `remove`, else cut to nothing), unless an index file the next run may read still

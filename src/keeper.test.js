@@ -78,6 +78,9 @@ function newerAsVersion1(files){
 /** @param {any} saved */
 const json = saved=>new TextEncoder().encode(JSON.stringify(saved));
 
+/** Lets the promises of the disk settle: a pack opened ahead, a pack removed. */
+const settle = ()=>new Promise(resolve=>setTimeout(resolve, 0));
+
 /** @param {number} length @param {number} seed */
 const bodyOf = (length, seed)=>Uint8Array.from({ length }, (_, i)=>(i * 31 + seed) & 255);
 
@@ -701,7 +704,7 @@ test('an index of Cellar 0.9.0: an entry past its pack\'s file or of other field
         assert.equal(second.keeper.figures().loaded, 2);
         assert.equal(second.keeper.figures().skippedEntries, 4);
 
-        // The newer index read short: the one before it is read.
+        // The newer index read short: no run of it is trusted, not even its older file's.
         const short = {
             files: disk.files,
             async open(/** @type {string} */ file){
@@ -712,9 +715,7 @@ test('an index of Cellar 0.9.0: an entry past its pack\'s file or of other field
                     } };
             },
         };
-        const third = await cacheOf({ disk: short });
-        assert.equal(third.reader.look('a'), 'cold');
-        assert.equal(third.reader.look('b'), null, 'saved in the index read short only');
+        await assert.rejects(cacheOf({ disk: short }), /failed to read/);
     });
 
 test('after close the keeper is memory\'s only: an only copy stays hot, a cold body is the next'
@@ -736,26 +737,50 @@ test('after close the keeper is memory\'s only: an only copy stays hot, a cold b
     assert.deepEqual(second.reader.with('only', body=>[...body], { wait: true }), [...bodyOf(100, 2)]);
 });
 
-test('an index file the disk fails to read leaves the other one to the run', async()=>{
-    const disk = memoryDisk();
-    const first = await cacheOf({ disk });
-    first.reader.put('a', bodyOf(100, 1));
+test('an index file the disk fails to read, or reads short, keeps the keeper from opening: no pack'
+    + ' is let go and no file written, and a run with the disk well reads every body', async()=>{
+    const disk = crashDisk();
+    const first = await cacheOf({ disk, packBytes: 16 * KIB });
+    first.reader.put('old', bodyOf(12 * KIB, 1));
+    first.step(150);
+    await settle();
     first.keeper.save();
-    first.reader.put('b', bodyOf(100, 2));
     first.keeper.save();
-    const [newer] = [...disk.files].filter(([file])=>file.startsWith('index-'))
-        .sort(([, x], [, y])=>y.length - x.length)[0];
-    const failing = {
-        async open(/** @type {string} */ name){
-            const file = await disk.open(name);
-            return name === newer ? { ...file,
-                getSize(){
-                    throw new Error('unreadable');
-                } } : file;
-        },
-    };
-    const second = await cacheOf({ disk: failing });
-    assert.equal(second.reader.look('a'), 'cold');
+    await settle();
+    // An only copy named by a delta of the newer file alone, in a pack the other does not list.
+    first.reader.put('only', bodyOf(12 * KIB, 2), { onlyCopy: true });
+    first.step(150);
+    await settle();
+    assert.equal(first.keeper.save(), true);
+    const left = disk.crash();
+    for (const name of ['index-a', 'index-b'])
+    {
+        for (const fault of ['throws', 'short'])
+        {
+            const again = crashDisk(left);
+            /** @type {import('./keeper.js').Disk} */
+            let failing = again;
+            if (fault === 'throws')
+            {
+                again.failing.read.add(name);
+            }
+            else
+            {
+                failing = { async open(/** @type {string} */ file){
+                    const opened = await again.open(file);
+                    return file !== name ? opened : { ...opened,
+                        read: (/** @type {Uint8Array} */ view, /** @type {{ at: number }} */ where)=>
+                            opened.read(view.subarray(1), where) };
+                } };
+            }
+            await assert.rejects(openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk: failing }),
+                new RegExp(`failed to read ${name}`), `${name} ${fault}`);
+            await settle();
+            assert.deepEqual(again.current(), left, `${name} ${fault}: the disk as it was`);
+        }
+    }
+    assert.deepEqual(await nextRunReads(left, ['old', 'only']), [[...bodyOf(12 * KIB, 1)],
+        [...bodyOf(12 * KIB, 2)]]);
 });
 
 test('a segment past 1 GiB, or not a power of two, is refused when the keeper opens', async()=>{
@@ -1300,9 +1325,6 @@ test('a save torn anywhere in its write, base or delta, leaves the index of the 
     }
     assert.ok(torn > 20 && deltas > 10, `${torn} saves torn, ${deltas} of them deltas`);
 });
-
-/** Lets the promises of the disk settle: a pack opened ahead, a pack removed. */
-const settle = ()=>new Promise(resolve=>setTimeout(resolve, 0));
 
 /** The packs on a memory disk, by name, and their sizes. @param {Map<string, Uint8Array>} files */
 const packFiles = files=>Object.fromEntries([...files].filter(([file])=>file.startsWith('pack-'))
