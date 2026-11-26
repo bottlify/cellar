@@ -312,8 +312,11 @@ again). Either side closes a ring when it goes or knows the other went: a writer
 room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
 reading what was written before. A `take` may not drain its own ring (it holds the record being
 taken), and `release` frees only a record `peek` returned: either throws rather than free a
-record not read. A record is bytes: a `Uint8Array` or an array of numbers; a wider typed array, a
-`DataView` or a buffer is refused.
+record not read. A record is bytes, as a channel's request and answer and a body the cache is
+handed are: a `Uint8Array` (or another view of one-byte elements) or an array of integers from 0
+to 255. Anything else is refused with a `TypeError` rather than written as something it is not: a
+wider typed array, a `DataView`, a buffer, a string, an object with only a length, a number past a
+byte.
 
 `waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
 `Int32Array`, for a protocol of its own; `deadlineOf(timeoutMs)` is a deadline on the clock they

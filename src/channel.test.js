@@ -350,12 +350,25 @@ test('a call waiting for room goes out as soon as one answer frees a slot', { ti
         assert.ok(answered < 4, `the fifth went out with ${answered} answered`);
     });
 
-test('a request that is not bytes is refused', ()=>{
-    const memory = createChannel({ slots: 2, slotBytes: 8 });
-    const client = openClient(memory);
-    assert.throws(()=>client.ask(/** @type {any} */ (new DataView(new ArrayBuffer(4)))), TypeError);
-    assert.equal(openServer(memory).waiting(), 0);
-});
+test('a request that is not bytes is refused, and an answer that is not bytes fails its request',
+    async()=>{
+        const memory = createChannel({ slots: 2, slotBytes: 128 });
+        const client = openClient(memory);
+        const server = openServer(memory);
+        for (const request of [new DataView(new ArrayBuffer(4)), 'hello', { length: 3 }, [256]])
+        {
+            assert.throws(()=>client.ask(/** @type {any} */ (request)), TypeError);
+            await assert.rejects(client.call(/** @type {any} */ (request)), TypeError);
+        }
+        assert.equal(server.waiting(), 0);
+        // A handler answering a string (JSON.stringify without the encoder) was answered zeros.
+        const stringAnswer = client.call([1]);
+        const wideAnswer = client.call([2]);
+        server.serve(request=>/** @type {any} */ (request[0] === 1 ? JSON.stringify({ ok: 1 }) : [300]),
+            { timeoutMs: 0 });
+        await assert.rejects(stringAnswer, (e)=>e instanceof ChannelFailed && /bytes are/.test(e.message));
+        await assert.rejects(wideAnswer, ChannelFailed);
+    });
 
 test('a channel past 1 GiB is refused, its slots found by 32-bit arithmetic', ()=>{
     assert.throws(()=>createChannel({ slots: 1 << 16, slotBytes: 1 << 16 }), RangeError);

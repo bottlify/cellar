@@ -335,16 +335,23 @@ test('a take that drains its own ring, or a release with no record peeked, throw
     assert.equal(ring.held(), 0);
 });
 
-test('a record that is not bytes is refused, not cut or written as nothing', ()=>{
+test('a record that is not bytes is refused, not cut or written as zeros', async()=>{
     const ring = openRing(createRingMemory(256));
     for (const record of [Uint32Array.of(0x12345678), new Float64Array(1),
-        new DataView(new ArrayBuffer(4)), new ArrayBuffer(4), null])
+        new DataView(new ArrayBuffer(4)), new ArrayBuffer(4), null, 'hello', { length: 3 },
+        [300], [-1], [1.5]])
     {
         assert.throws(()=>ring.write(/** @type {any} */ (record)), TypeError);
+        assert.throws(()=>ring.writeWaiting(/** @type {any} */ (record), 0), TypeError);
+        await assert.rejects(ring.writeWaitingAsync(/** @type {any} */ (record), 0), TypeError);
     }
     assert.equal(ring.held(), 0);
-    assert.equal(ring.write([1, 2, 3]), true);
+    assert.equal(ring.write([1, 2, 255]), true);
     assert.equal(ring.write(Uint8Array.of(4)), true);
+    /** @type {number[][]} */
+    const records = [];
+    ring.drain(record=>void records.push([...record]));
+    assert.deepEqual(records, [[1, 2, 255], [4]]);
 });
 
 test('a ring\'s methods work taken off it', async()=>{
@@ -407,21 +414,6 @@ test('a record that grows while it is written is written as long as it was', ()=
     const records = [];
     assert.equal(ring.drain(record=>void records.push([...record])), 2);
     assert.deepEqual(records, [[0, 0, 0, 0, 0, 0, 0, 0], [7]]);
-});
-
-test('bytes over a buffer that cannot grow are copied as they are, nothing made for them', async()=>{
-    const { bytesOf } = await import('./bytes.js');
-    const plain = new Uint8Array(8);
-    const shared = new Uint8Array(new SharedArrayBuffer(8));
-    const numbers = [1, 2, 3];
-    assert.equal(bytesOf(plain, 'test'), plain);
-    assert.equal(bytesOf(shared, 'test'), shared);
-    assert.equal(bytesOf(numbers, 'test'), numbers);
-    // Only a view another thread can grow is cut to a view of its own.
-    const growing = new Uint8Array(new /** @type {any} */ (SharedArrayBuffer)(8, { maxByteLength: 64 }));
-    const taken = bytesOf(growing, 'test');
-    assert.notEqual(taken, growing);
-    assert.equal(taken.length, 8);
 });
 
 test('records built in the ring come out in order, whole and as long as committed, across every'
