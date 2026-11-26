@@ -301,7 +301,12 @@ record not read. A record is bytes: a `Uint8Array` or an array of numbers; a wid
 `waitFor`, `waitForAsync`, `wake`, `publish` and `ring` are the bell over any word of a shared
 `Int32Array`, for a protocol of its own; `deadlineOf(timeoutMs)` is a deadline on the clock they
 read, and `SPIN_MS` about how long a blocking wait looks before it sleeps (a second at most) (counted in looks, not
-time: a wait with no deadline never reads the clock). A timeout or a spin that is
+time: a wait with no deadline never reads the clock). A doorbell's, a ring writer's and a channel
+end's waits learn how long to look (`createSpin`, also a `spinMs` of `waitFor`): a wait that went
+to sleep all the same makes the next look an eighth less, down to a few hundred looks, one that
+saw the word move keeps twice what it needed, and one in sixteen looks the whole way; so a side
+that waits on long work stops spinning a core away from the side doing it. A wait given a
+`spinMs` of its own looks that long. A timeout or a spin that is
 not a number is refused. The count of waits asleep is kept by the waits themselves: a worker
 terminated while asleep stays counted, and every move after notifies once for it (about 50 ns more a move, x86).
 
@@ -318,18 +323,21 @@ and to read each way: posted with the buffer transferred and posted back, copied
 (`write`), and built in the ring (`reserve`, `commit`). Batches go one after another, a gibibyte a
 run (a million batches at most). Wall time a batch, and in brackets the processor time of both
 threads a batch, their waits included: a ring's side looks a moment before it sleeps, a posting
-side sleeps in its event loop (node 26 / node 22, a 4-core x86 VM under load ~8, 5 runs an arm
+side sleeps in its event loop (node 26 / node 22, a 4-core x86 VM, load ~3.5, 5 runs an arm
 alternated, medians):
 
 | batch | postMessage | ring `write` | ring `reserve` |
 | --- | --- | --- | --- |
-| 64 B | 5.3 / 5.9 us (5.4 / 5.7) | 0.42 / 0.42 us (0.46 / 0.44) | 0.44 / 0.35 us (0.47 / 0.39) |
-| 8 KiB | 14.6 / 12.6 us (15.8 / 12.2) | 7.6 / 8.7 us (8.5 / 8.4) | 7.0 / 6.2 us (7.4 / 5.7) |
-| 64 KiB | 108 / 58 us (103 / 55) | 49 / 62 us (49 / 59) | 39 / 39 us (37 / 37) |
-| 256 KiB | 384 / 195 us (375 / 190) | 162 / 223 us (179 / 213) | 135 / 137 us (134 / 134) |
+| 64 B | 3.6 / 3.8 us (6.1 / 6.7) | 0.35 / 0.33 us (0.57 / 0.59) | 0.35 / 0.34 us (0.62 / 0.59) |
+| 8 KiB | 10.5 / 8.2 us (16.4 / 14.4) | 4.5 / 4.4 us (8.6 / 8.2) | 4.0 / 3.1 us (7.3 / 5.4) |
+| 64 KiB | 86 / 40 us (111 / 62) | 26 / 30 us (44 / 56) | 20 / 19 us (36 / 34) |
+| 256 KiB | 312 / 128 us (387 / 203) | 95 / 147 us (168 / 201) | 69 / 70 us (124 / 128) |
 
-Copied in, a large batch costs about what a post does on node 22; built in the ring it costs least
-on both.
+A post transfers its buffer and copies nothing; `write` copies the batch in, which for a large
+one costs about what a post does on node 22 (node 26 pays a post in proportion to its size). Built
+in the ring, a batch is copied by nobody and costs least on both. With four other threads busy on
+the same four cores, the waits that learn their spin take 64 KiB built in the ring from 43 to 34 us
+of processor time a batch.
 
 ## Requirements
 
