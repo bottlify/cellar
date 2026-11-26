@@ -125,6 +125,10 @@ self.onmessage = ({ data })=>{
 
 A body is read only inside `with`: the keeper never takes a body a reader is in. A body that can
 be made again goes away when there is no room and no disk; one marked `onlyCopy` never does.
+`disk` says where a body may go on the disk: `'kept'` (the default) there and in the saved index
+for the next run; `'run'` there while cold, never named in the index, for a body that means
+nothing to the next run (texels a GPU was handed); `'never'` not at all, so an idle body that can
+be made again goes away and an only copy stays in memory.
 
 A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
 `commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:

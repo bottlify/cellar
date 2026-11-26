@@ -28,7 +28,8 @@ import { bytesOf } from './bytes.js';
  * across a link by a blocking call; `raiseLater` and `drop` are not waited on.
  *
  * @typedef {Object} KeeperCalls
- * @property {(name: string, length: number, options: { onlyCopy: boolean, known: number })
+ * @property {(name: string, length: number, options: { onlyCopy: boolean,
+ *     disk?: import('./keeper.js').DiskPolicy, known: number })
  *     => { id: number, segment: number, offset: number } | null} reserve
  * @property {(name: string, options: { known: number }) => boolean} raise
  *     `known`: the segments this reader has; a body placed past them could not be read here
@@ -232,12 +233,15 @@ export function createReader({ shared, segments = [], keeper }){
          * Room for `name`'s body: a view to write it into, or null where the
          * keeper has none. The body is not seen by anyone until `commit`.
          *
-         * @param {string} name @param {number} length @param {{ onlyCopy?: boolean }} [options]
+         * `disk` says where the body may go on the disk (`DiskPolicy`).
+         *
+         * @param {string} name @param {number} length
+         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy }} [options]
          */
-        reserve(name, length, { onlyCopy = false } = {}){
+        reserve(name, length, { onlyCopy = false, disk = 'kept' } = {}){
             // A second reserve of a name not committed yet replaces the first.
             self.abandon(name);
-            const place = keeper.reserve(name, length, { onlyCopy, known: heard });
+            const place = keeper.reserve(name, length, { onlyCopy, disk, known: heard });
             const view = place === null ? null : views[place.segment];
             if (place !== null)
             {
@@ -304,7 +308,8 @@ export function createReader({ shared, segments = [], keeper }){
         /**
          * `reserve`, a copy of `bytes`, `commit`: false where there was no room.
          *
-         * @param {string} name @param {Uint8Array} bytes @param {{ onlyCopy?: boolean }} [options]
+         * @param {string} name @param {Uint8Array} bytes
+         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy }} [options]
          */
         put(name, bytes, options){
             // The bytes as long as they are now, which is what is copied.

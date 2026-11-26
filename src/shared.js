@@ -60,6 +60,10 @@ export const F_ONLY_COPY = 1;
 export const F_ON_DISK = 2;
 /** Asked away while read: the keeper takes it once the readers are out. */
 export const F_DROP = 4;
+/** On the disk only for this run: the saved index leaves it out (`disk: 'run'`). */
+export const F_THIS_RUN = 8;
+/** Never written to the disk (`disk: 'never'`). */
+export const F_NO_DISK = 16;
 
 /** No body: never had one, or dropped. */
 export const GONE = 0;

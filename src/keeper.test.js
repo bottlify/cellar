@@ -1032,3 +1032,43 @@ test('a put whose bytes cannot be copied lets its reservation go', async()=>{
     assert.equal(keeper.figures().placedBytes, UNIT, 'only a');
     assert.equal(reader.figures().abandoned, 1);
 });
+
+test('a body for this run goes cold to the disk and back, and the next run is not told of it',
+    async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('texels', bodyOf(32 * KIB, 7), { onlyCopy: true, disk: 'run' });
+    first.reader.put('block', bodyOf(32 * KIB, 8));
+    first.step(100);
+    assert.equal(first.reader.look('texels'), 'cold', 'an only copy left memory: the disk holds it');
+    assert.deepEqual(first.reader.with('texels', body=>Array.from(body), { wait: true }),
+        Array.from(bodyOf(32 * KIB, 7)));
+    first.keeper.close();
+    const second = await cacheOf({ disk });
+    assert.equal(second.keeper.figures().loaded, 1, 'the block only');
+    assert.equal(second.reader.look('texels'), null);
+    assert.equal(second.reader.look('block'), 'cold');
+});
+
+test('a body never on the disk goes away when idle, or stays hot as the only copy; a save writes '
+    + 'neither', async()=>{
+    const disk = memoryDisk();
+    const first = await cacheOf({ disk });
+    first.reader.put('again', bodyOf(32 * KIB, 1), { disk: 'never' });
+    first.reader.put('only', bodyOf(32 * KIB, 2), { onlyCopy: true, disk: 'never' });
+    first.step(100);
+    assert.equal(first.reader.look('again'), null, 'made again: away, not to the disk');
+    assert.equal(first.reader.look('only'), 'hot', 'the only copy: kept in memory');
+    assert.equal(first.keeper.figures().written, 0);
+    assert.equal(first.keeper.save(), true, 'whole: the next run is owed neither');
+    first.keeper.close();
+    assert.equal((await cacheOf({ disk })).keeper.figures().loaded, 0);
+});
+
+test('a disk policy not one of the three is refused', async()=>{
+    const { reader } = await cacheOf();
+    assert.throws(()=>reader.put('a', bodyOf(8, 1), { disk: /** @type {any} */ ('always') }),
+        /disk policy/);
+    assert.throws(()=>reader.put('a', bodyOf(8, 1), { disk: /** @type {any} */ ('toString') }),
+        /disk policy/);
+});

@@ -31,7 +31,8 @@
 
 import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import {
-    COLD, F_DROP, F_ONLY_COPY, F_ON_DISK, GONE, HEADER_WORDS, HOT, H_COUNT, H_NAMES, H_TICK,
+    COLD, F_DROP, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
+    H_COUNT, H_NAMES, H_TICK,
     MOVING, RECORD_WORDS, RETIRED, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME, R_NAME_LENGTH,
     R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING, growableShared,
     growTo, sharedBuffer,
@@ -46,6 +47,18 @@ const MAX_NAME_UNITS = 1 << 25;
 const FIRST_TABLE = 1024;
 /** Packs a run opens at most: 64 TiB of the default packs. */
 const MAX_PACKS = 1 << 20;
+/**
+ * Where a body may go on the disk: `kept` there and named in the saved index
+ * for the next run (the default), there for this `run` only (a cold body that
+ * means nothing to the next run: texels a GPU was given, say), or `never`
+ * (one the disk must not hold, or not worth a write).
+ *
+ * @typedef {'kept' | 'run' | 'never'} DiskPolicy
+ */
+/** A map with no prototype: `toString` is no policy. @type {Record<string, number>} */
+const POLICY_FLAGS = Object.assign(Object.create(null),
+    { kept: 0, run: F_THIS_RUN, never: F_NO_DISK });
+
 /** The layout of the index saved on the disk: another is not read. */
 const INDEX_VERSION = 1;
 
@@ -527,7 +540,7 @@ export async function openKeeper(options){
      * @param {number} id
      */
     const writeOut = id=>{
-        if (disk === null)
+        if (disk === null || (get(id, R_FLAGS) & F_NO_DISK) !== 0)
         {
             return false;
         }
@@ -811,9 +824,14 @@ export async function openKeeper(options){
          * The writer stores the record hot (`commit`) once it has written.
          *
          * @param {string} name @param {number} length
-         * @param {{ onlyCopy?: boolean, known?: number }} [options]
+         * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, known?: number }} [options]
          */
-        reserve(name, length, { onlyCopy = false, known = Infinity } = {}){
+        reserve(name, length, { onlyCopy = false, disk: policy = 'kept', known = Infinity } = {}){
+            const policyFlags = POLICY_FLAGS[policy];
+            if (policyFlags === undefined)
+            {
+                throw new RangeError(`cache: a disk policy of ${String(policy)}`);
+            }
             if (!Number.isInteger(length))
             {
                 throw new RangeError(`cache: a body of ${length} bytes`);
@@ -881,7 +899,7 @@ export async function openKeeper(options){
                 id = fresh;
             }
             forgetDisk(id);
-            set(id, R_FLAGS, onlyCopy ? F_ONLY_COPY : 0);
+            set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags);
             store(id, MOVING);
             set(id, R_SEGMENT, found.segment);
             set(id, R_OFFSET, found.offset);
@@ -1058,7 +1076,14 @@ export async function openKeeper(options){
             for (let id = 0; id < words[H_COUNT]; id++)
             {
                 const state = stateOf(stateWordOf(id));
-                if (state === HOT && (get(id, R_FLAGS) & F_ON_DISK) === 0)
+                const flags = get(id, R_FLAGS);
+                // A body for this run only, or never on the disk, is no next
+                // run's: not written for it, and not named in its index.
+                if ((flags & (F_THIS_RUN | F_NO_DISK)) !== 0)
+                {
+                    continue;
+                }
+                if (state === HOT && (flags & F_ON_DISK) === 0)
                 {
                     // Only no one may write it meanwhile: the keeper's thread
                     // is the one placing, and a reader does not write.
