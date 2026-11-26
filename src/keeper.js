@@ -715,18 +715,85 @@ export async function openKeeper(options){
     };
 
     /**
-     * Takes the body in a block out of it (`canLeave`): false where it stays.
+     * Takes every body out of a block (`canLeave` said each may go), or none:
+     * a block that cannot be made whole moves nothing. A reader may enter a
+     * hot body between `canLeave` and here, and an only copy's write to the
+     * disk may fail; so first every hot body is held (HOT to MOVING, which no
+     * reader enters), then the copies the disk must have are written, and
+     * only once all of that held does any body leave. On a failure each body
+     * held is hot again as it was; a copy written meanwhile stays the
+     * body's, on the disk, for the next time it goes cold. Gone and retired
+     * bodies no one reads can change only here, and go last.
      *
-     * @param {number} id
+     * @param {number[]} ids
      */
-    const leave = id=>{
-        const state = stateOf(stateWordOf(id));
-        if (state === GONE)
+    const vacate = ids=>{
+        /** @type {number[]} */
+        const taken = [];
+        const giveUp = ()=>{
+            for (const id of taken)
+            {
+                store(id, HOT);
+            }
+            return false;
+        };
+        for (const id of ids)
         {
-            giveBack(id);
-            return true;
+            if (stateOf(stateWordOf(id)) !== HOT)
+            {
+                continue;
+            }
+            if (Atomics.compareExchange(words, index.at(id) + R_STATE, stateWord(HOT),
+                stateWord(MOVING)) !== stateWord(HOT))
+            {
+                return giveUp();
+            }
+            taken.push(id);
         }
-        return state === RETIRED ? takeRetired(id) : cool(id);
+        for (const id of taken)
+        {
+            const flags = get(id, R_FLAGS);
+            if ((flags & F_DROP) === 0 && (flags & F_ON_DISK) === 0 && !writeOut(id)
+                && (flags & F_ONLY_COPY) !== 0)
+            {
+                return giveUp();
+            }
+        }
+        for (const id of taken)
+        {
+            const flags = get(id, R_FLAGS);
+            giveBack(id);
+            if ((flags & F_DROP) !== 0)
+            {
+                forgetDisk(id);
+                set(id, R_FLAGS, 0);
+                store(id, GONE);
+                counts.gone++;
+            }
+            else if ((flags & F_ON_DISK) !== 0)
+            {
+                store(id, COLD);
+                counts.cooled++;
+            }
+            else
+            {
+                store(id, GONE);
+                counts.gone++;
+            }
+        }
+        for (const id of ids)
+        {
+            const state = stateOf(stateWordOf(id));
+            if (state === GONE && get(id, R_SEGMENT) >= 0)
+            {
+                giveBack(id);
+            }
+            else if (state === RETIRED)
+            {
+                takeRetired(id);
+            }
+        }
+        return true;
     };
 
     /**
@@ -813,8 +880,9 @@ export async function openKeeper(options){
                     (held ??= new Set()).add(key);
                     continue;
                 }
-                if (!inside.every(leave))
+                if (!vacate(inside))
                 {
+                    (held ??= new Set()).add(key);
                     continue;
                 }
             }

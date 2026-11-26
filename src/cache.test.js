@@ -13,6 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { UNIT } from './buddy.js';
 import { bodyOf, cacheOf } from './cache.fixture.js';
+import { crashDisk } from './disk.fixture.js';
 import { createReader } from './reader.js';
 import { HEADER_WORDS, HOT, H_NAMES, MOVING, RECORD_WORDS, R_STATE, stateWord, viewIndex } from './shared.js';
 
@@ -437,6 +438,32 @@ test('a large reserve refused in a tick does not refuse a small one the same tic
     assert.ok(reader.reserve('small', UNIT), 'one of 4 KiB can, from the body that can leave');
     assert.equal(reader.look('pin'), 'hot', 'and the only copy stayed');
 });
+
+test('a block that cannot be made whole moves no body of it: a failed write leaves its neighbour too',
+    async()=>{
+        // The 8 KiB block is two bodies: one that may go away, one only copy
+        // whose write to the disk fails. Neither may leave for a block that
+        // is not formed.
+        const disk = crashDisk();
+        const { keeper, reader, wait } = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT,
+            packBytes: 2 * UNIT, disk });
+        assert.equal(reader.put('a', bodyOf(UNIT, 1), { disk: 'never' }), true);
+        assert.equal(reader.put('b', bodyOf(UNIT, 2), { onlyCopy: true }), true);
+        for (const name of disk.current().keys())
+        {
+            disk.failing.write.add(name);
+        }
+        assert.equal(reader.reserve('big', 2 * UNIT), null, 'the only copy could not be written');
+        assert.equal(reader.with('a', body=>body[1]), bodyOf(UNIT, 1)[1], 'the one that may go stayed');
+        assert.equal(reader.with('b', body=>body[1]), bodyOf(UNIT, 2)[1], 'the only copy stayed');
+        assert.equal(keeper.figures().gone, 0);
+        // The disk taking writes again, the block is made (in the next
+        // millisecond: the same request refused is remembered within one).
+        disk.failing.write.clear();
+        wait(1);
+        assert.ok(reader.reserve('big', 2 * UNIT));
+        assert.equal(reader.look('b'), 'cold', 'the only copy went to the disk for it');
+    });
 
 test('a body put to stay when idle stays hot past coldAfterMs, and leaves for room as any other', async()=>{
     // A body read again only long after it was written (a translator's
