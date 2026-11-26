@@ -148,7 +148,8 @@ fails to read, or reads short, keeps the keeper from opening (`openKeeper` rejec
 as it was): a keeper that went on without it could let go of, write over or outdate what the next
 run reads, so the program goes on without the disk (`disk: null`) and the next run tries again. An index of Cellar
 0.9.0 and before is read too. Packs are compacted: a pack its bodies fill less than a quarter of
-has what is left written anew in the current pack, and the save after lets the file go (removed
+has what is left written anew in the current pack (a hot body too, from memory, so that its copy
+on the disk stays named), and the save after lets the file go (removed
 where the disk has `remove`, else cut to nothing), unless an index file the next run may read still
 names an only copy there; a keeper opening an index lets go of the packs no body of it is in (what
 a run wrote with `disk: 'run'`). When the disk refuses a write, the next sweep makes room from the

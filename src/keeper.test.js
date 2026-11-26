@@ -1600,3 +1600,34 @@ test('a save whose index the disk took but did not flush spends its generation: 
     assert.deepEqual(await nextRunReads(disk.current(), ['a', 'b', 'c']),
         [[...bodyOf(5000, 1)], [...bodyOf(5000, 2)], [...bodyOf(5000, 3)]]);
 });
+
+test('a pack compacted moves a hot body as it moves a cold one: an only copy read again is still'
+    + ' named where it went, though the disk refuses to write it after', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
+    reader.put('only', bodyOf(10 * KIB, 1), { onlyCopy: true });
+    for (let i = 0; i < 5; i++)
+    {
+        reader.put(`a${i}`, bodyOf(10 * KIB, 2 + i));
+    }
+    step(150);
+    await settle();
+    keeper.save();
+    keeper.save();
+    reader.put('b', bodyOf(10 * KIB, 9));
+    step(150);
+    await settle();
+    assert.deepEqual(reader.with('only', body=>[...body], { wait: true }), [...bodyOf(10 * KIB, 1)]);
+    assert.equal(reader.look('only'), 'hot', 'read again: its copy in pack-0 still its own');
+    for (let i = 0; i < 5; i++)
+    {
+        reader.drop(`a${i}`);
+    }
+    step(1);
+    assert.equal(keeper.figures().compactedBytes, 10 * KIB, 'the hot only copy moved to pack-1');
+    disk.failing.write.add('pack-1');
+    assert.equal(keeper.save(), true, 'nothing left to write');
+    await settle();
+    assert.deepEqual(await nextRunReads(disk.crash(), ['only', 'b']),
+        [[...bodyOf(10 * KIB, 1)], [...bodyOf(10 * KIB, 9)]]);
+});

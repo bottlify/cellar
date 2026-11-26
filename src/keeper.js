@@ -856,10 +856,11 @@ export async function openKeeper(options){
 
     /**
      * Takes every body out of pack `number`, so the next save lets go of it:
-     * a hot body forgets its copy there (memory holds it, and it is written
-     * again when it goes cold), a cold one is written anew at the end of the
-     * pack bodies go to, or, where `evict` says so and it can be made again,
-     * goes. Stops where the disk will not take a body now: what is left stays.
+     * each is written anew at the end of the pack bodies go to, its copy
+     * there the disk's (a hot one from its segment, a cold one read from
+     * here), or, where `evict` says so and it can be made again, a cold one
+     * goes and a hot one forgets its copy (memory holds it). Stops where the
+     * disk will not take a body now: what is left stays.
      *
      * @param {number} number @param {boolean} evict
      */
@@ -872,42 +873,60 @@ export async function openKeeper(options){
                 continue;
             }
             const state = stateOf(stateWordOf(id));
-            if (state !== COLD)
+            if (state !== COLD && state !== HOT)
             {
-                // Hot, or retired and no name's: its copy here is no one's.
-                forgetDisk(id, state !== RETIRED);
+                // Retired and no name's: its copy here is no one's.
+                forgetDisk(id, false);
                 continue;
             }
             const flags = get(id, R_FLAGS);
             if (evict && (flags & F_ONLY_COPY) === 0)
             {
-                drop(id);
-                counts.evicted++;
+                if (state === COLD)
+                {
+                    drop(id);
+                    counts.evicted++;
+                }
+                else
+                {
+                    forgetDisk(id);
+                }
                 continue;
             }
             const length = get(id, R_LENGTH);
-            if (carry.length < length)
+            /** @type {Uint8Array} */
+            let bytes;
+            if (state === HOT)
             {
-                carry = new Uint8Array(length);
+                // A hot body is not written while it is hot: memory holds the copy's bytes.
+                const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[get(id, R_SEGMENT)]);
+                bytes = one.bytes.subarray(get(id, R_OFFSET), get(id, R_OFFSET) + length);
             }
-            const bytes = carry.subarray(0, length);
-            let read = 0;
-            try
+            else
             {
-                read = from.read(bytes, { at: get(id, R_PACK_OFFSET) });
-            }
-            catch {
-                counts.diskFailures++;
-                return;
-            }
-            if (read !== length)
-            {
-                // The pack holds less than the index says: the body is gone.
-                forgetDisk(id);
-                set(id, R_FLAGS, 0);
-                store(id, GONE);
-                counts.lostOnDisk++;
-                continue;
+                if (carry.length < length)
+                {
+                    carry = new Uint8Array(length);
+                }
+                bytes = carry.subarray(0, length);
+                let read = 0;
+                try
+                {
+                    read = from.read(bytes, { at: get(id, R_PACK_OFFSET) });
+                }
+                catch {
+                    counts.diskFailures++;
+                    return;
+                }
+                if (read !== length)
+                {
+                    // The pack holds less than the index says: the body is gone.
+                    forgetDisk(id);
+                    set(id, R_FLAGS, 0);
+                    store(id, GONE);
+                    counts.lostOnDisk++;
+                    continue;
+                }
             }
             const at = append(bytes, (flags & F_ONLY_COPY) !== 0);
             if (at < 0)
