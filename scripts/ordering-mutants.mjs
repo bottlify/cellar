@@ -40,7 +40,7 @@ const mutants = [
 const gate = (/** @type {string} */ src)=>{
     const got = spawnSync(process.execPath, ['--test', '--test-reporter=spec',
         '--test-name-pattern=never hands on a torn', join(src, 'ordering.itest.js')],
-    { encoding: 'utf8', timeout: 120_000 });
+    { encoding: 'utf8', timeout: 120_000, env: { ...process.env, CELLAR_ORDERING_MS: '10000' } });
     const lines = (got.stdout + got.stderr).split('\n').filter(line=>/journal: |plain words: /.test(line));
     return { failed: got.status !== 0, said: lines.map(line=>line.trim()).join('; ') };
 };

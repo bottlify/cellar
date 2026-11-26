@@ -63,7 +63,7 @@ Measured on ARM64, 2026-11-26: Apple M4 Pro (8 performance and 4 efficiency core
 
 Without the bracket, plain copies tear on this processor. With it on both sides, none did. The bracket on the writer alone does not hold. The torn copies hold words newer than the sequence the reader checked: the reader's plain loads were satisfied after its second load of the sequence. The reader's side is what closes that, and it gave 0 in 5,483,084 copies, where the unbracketed rate predicts about 4,150. The writer's side guards the store order the reader relies on. It is kept although these runs did not need it. On x86 every arm gave 0, so x86 cannot tell the arms apart.
 
-The journal itself, under the gate below, on CI's runners with Node 22, 2026-11-26 (one run each, 3 s a mutant, one writer and two readers):
+The journal itself, under the gate below, on CI's runners with Node 22, 2026-11-26 (first run, 3 s a mutant, one writer and two readers). A second run tore the journal with no bracket 3 times on macOS and 156,593 on Linux, so the mutants now race 10 s:
 
 | Journal | macOS ARM64 (`macos-latest`) torn / read | Linux ARM64 (`ubuntu-24.04-arm`) torn / read |
 | --- | --- | --- |

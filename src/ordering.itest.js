@@ -25,8 +25,12 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { createJournalMemory } from './journal.js';
 
-/** How long each shape races: enough on an M4 Pro for thousands of torn bare copies. */
-const RACE_MS = 3000;
+/**
+ * How long each shape races: 3 s by default, enough on an M4 Pro for
+ * thousands of torn bare copies. The mutants run it longer: a macOS runner
+ * tore a journal with no bracket 3 times in one 3 s race, 3,303 in another.
+ */
+const RACE_MS = Number(process.env.CELLAR_ORDERING_MS ?? 3000);
 const READERS = 2;
 /**
  * Set where the machine is known to move plain accesses (CI's ARM64 jobs):
