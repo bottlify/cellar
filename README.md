@@ -135,44 +135,44 @@ nothing to the next run (texels a GPU was handed); `'never'` not at all, so an i
 be made again goes away and an only copy stays in memory.
 
 A `reserve` the keeper refuses leaves the name's body as it was; one it grants takes it, and
-`commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`:
-the name has no body then, and the room goes back. A thread joining later is handed
-`keeper.shared` and `keeper.segmentBuffers()` as they are then. A write the disk takes in part
-counts as not written, and a flush the disk fails may have lost what the pack took since the one
-before: no body written there since is trusted to the disk (a hot one is written again, a cold one
-that can be made again goes, counted in `lostOnDisk`). A body the disk reads back short is gone where it can be made again
+`commit` makes the new one readable. A writer that fails between the two calls `abandon(name)`: the
+name has no body then, and the room goes back. A thread joining later is handed `keeper.shared` and
+`keeper.segmentBuffers()` as they are then. A write the disk takes in part counts as not written,
+and a flush the disk fails may have lost what the pack took since the one before: no body written
+there since is trusted to the disk (a hot one is written again, a cold one that can be made again
+goes, counted in `lostOnDisk`). A body the disk reads back short is gone where it can be made again
 (`lostOnDisk`); an only copy stays cold and the read counts as a failure (`diskFailures`): the
 keeper never lets an only copy go on its own judgement, and a run reading the pack afresh skips it
-there if the pack is short (`skippedEntries`). `save()` writes the hot bodies the disk lacks, then an index of exactly the
-bodies the disk holds, after the packs are flushed: the index is always true, and `false` says some
-body stayed in memory only (the disk refused it, or the next pack was not open yet). A save writes
-what changed since the last one, appended to the index file (a few dozen bytes a body; nothing
-when nothing changed), and the whole index into the other file once the changes outgrow it. A save
-torn or failed at the index leaves the one before it, which the next run reads; an entry of it
-that does not fit its pack's file is skipped and counted (`skippedEntries`). An index file the disk
-fails to read, or reads short, keeps the keeper from opening (`openKeeper` rejects, the disk left
-as it was): a keeper that went on without it could let go of, write over or outdate what the next
-run reads, so the program goes on without the disk (`disk: null`) and the next run tries again. An index of Cellar
-0.9.0 and before is read too. Packs are compacted: a pack its bodies fill less than a quarter of
-has what is left written anew in the current pack (a hot body too, from memory, so that its copy
-on the disk stays named), and the save after lets the file go (removed
-where the disk has `remove`, else cut to nothing), unless an index file the next run may read still
-names an only copy there; a keeper opening an index lets go of the packs no body of it is in (what
-a run wrote with `disk: 'run'`). Every save lists each pack whose file may be on the disk, the one
-still opening and one let go of until its file is gone, so a crash before a removal, or a removal
-the disk failed, leaves the file to the next run to let go of, and none stays that no index lists.
-A pack's number is given from past the highest either index file names, so the numbers of packs let
-go of come back. When the disk refuses a write, the next sweep makes room from the
-pack used longest ago of those holding no only copy (one could not move while the disk refuses, and
-what went beside it would free nothing): what can be made again there goes, so newer bodies take
-its place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
-none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the keeper
-goes on: a thread not told of a segment is never placed in it. After `close()` the files are
+there if the pack is short (`skippedEntries`). `save()` writes the hot bodies the disk lacks, then
+an index of exactly the bodies the disk holds, after the packs are flushed: the index is always
+true, and `false` says some body stayed in memory only (the disk refused it, or the next pack was
+not open yet). A save writes what changed since the last one, appended to the index file (a few
+dozen bytes a body; nothing when nothing changed), and the whole index into the other file once the
+changes outgrow it. A save torn or failed at the index leaves the one before it, which the next run
+reads; an entry of it that does not fit its pack's file is skipped and counted (`skippedEntries`).
+An index file the disk fails to read, or reads short, keeps the keeper from opening (`openKeeper`
+rejects, the disk left as it was): a keeper that went on without it could let go of, write over or
+outdate what the next run reads, so the program goes on without the disk (`disk: null`) and the next
+run tries again. An index of Cellar 0.9.0 and before is read too. Packs are compacted: a pack its
+bodies fill less than a quarter of has what is left written anew in the current pack (a hot body
+too, from memory, so that its copy on the disk stays named), and the save after lets the file go
+(removed where the disk has `remove`, else cut to nothing), unless an index file the next run may
+read still names an only copy there; a keeper opening an index lets go of the packs no body of it is
+in (what a run wrote with `disk: 'run'`). Every save lists each pack whose file may be on the disk,
+the one still opening and one let go of until its file is gone, so a crash before a removal, or a
+removal the disk failed, leaves the file to the next run to let go of, and none stays that no index
+lists. A pack's number is given from past the highest either index file names, so the numbers of
+packs let go of come back. When the disk refuses a write, the next sweep makes room from the pack
+used longest ago of those holding no only copy (one could not move while the disk refuses, and what
+went beside it would free nothing): what can be made again there goes, so newer bodies take its
+place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they
+call none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the
+keeper goes on: a thread not told of a segment is never placed in it. After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for
-good), a cold one is the next run's, on the disk, and no body of this run any more. A cold only
-copy no whole save names where it lies (the save failed, or it is a body for this run) is brought
-back into memory first, room made from what can be made again; one memory has no room for is
-counted (`lostAtClose`).
+good), a cold one is the next run's, on the disk, and no body of this run any more. A cold only copy
+no whole save names where it lies (the save failed, or it is a body for this run) is brought back
+into memory first, room made from what can be made again; one memory has no room for is counted
+(`lostAtClose`).
 `budget` is a finite number of bytes; `segmentBytes` a power of two from 4 KiB to 1 GiB;
 `packBytes` under 2 GiB; a body's length a whole number of bytes. The idle spans (`coldAfterMs`,
 `goneAfterMs`, `releaseAfterMs`) are under 24.8 days: the keeper's

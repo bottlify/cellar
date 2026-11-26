@@ -1745,7 +1745,8 @@ test('a full disk makes room from the oldest pack it can empty: not one an only 
             `${order}: the oldest pack that could be emptied`);
         assert.deepEqual([...first, 'X0'].map(name=>reader.look(name)), ['cold', 'cold', 'cold', 'cold'],
             `${order}: the pack of the only copy kept whole`);
-        assert.deepEqual(reader.with('X0', body=>[...body], { wait: true }), [...bodyOf(4000, '0'.charCodeAt(0))]);
+        assert.deepEqual(reader.with('X0', body=>[...body], { wait: true }),
+            [...bodyOf(4000, '0'.charCodeAt(0))]);
         assert.equal(keeper.figures().evicted, 4, order);
         keeper.close();
     }
@@ -1805,7 +1806,11 @@ test('compaction passes over a pack it has emptied that an index still names an 
     assert.equal(compacted[0], compacted[1], 'as much moved with the emptied pack still named');
 });
 
-/** The pack files of `files`, and the packs the index they hold lists. @param {Map<string, Uint8Array>} files */
+/**
+ * The pack files of `files`, and the packs the index they hold lists.
+ *
+ * @param {Map<string, Uint8Array>} files
+ */
 const packsOf = files=>({
     files: [...files.keys()].filter(name=>name.startsWith('pack-')).sort(),
     listed: (readSaved(INDEX_FILES.map(name=>files.get(name) ?? null))?.packs ?? [])
@@ -1857,7 +1862,8 @@ test('a pack is listed until its file is gone: a crash before the removal a save
         run.keeper.close();
         await settle();
         const after = packsOf(disk.current());
-        assert.deepEqual(after.files.filter(file=>!after.listed.includes(file)), [], `${what}: after a run`);
+        assert.deepEqual(after.files.filter(file=>!after.listed.includes(file)), [],
+            `${what}: after a run`);
         return after.files;
     };
 
@@ -1928,7 +1934,8 @@ function baseOf(generation, nextPack, packs, entries){
     const writer = chunkWriter();
     for (const [name, pack, length] of entries)
     {
-        writer.entry(pack, 0, length, 0, Uint16Array.from(name, unit=>unit.charCodeAt(0)), 0, name.length);
+        const units = Uint16Array.from(name, unit=>unit.charCodeAt(0));
+        writer.entry(pack, 0, length, 0, units, 0, name.length);
     }
     return writer.finish({ kind: BASE, generation, nextPack, packs });
 }
@@ -2080,9 +2087,13 @@ test('seeded runs crashed at random points, each change a flush had not reached 
         const next = random(seed * 7919);
         let disk = crashDisk();
         let cache = await cacheOf({ disk, ...options });
-        /** The body each name has in this run. @type {Map<string, { version: number, onlyCopy: boolean }>} */
+        /**
+         * The body each name has in this run.
+         *
+         * @type {Map<string, { version: number, onlyCopy: boolean }>}
+         */
         const has = new Map();
-        /** Only copies the last save that answered true held, each its version. @type {Map<string, number>} */
+        /** Only copies the last save that answered true held, by version. @type {Map<string, number>} */
         let promised = new Map();
         let version = 0;
         for (let step = 0; step < 400; step++)

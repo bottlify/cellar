@@ -69,9 +69,10 @@ const newerIndex = read=>(read[1] !== null && (read[0] === null
  * The bodies a keeper's disk holds as its last saved index says, read without
  * a keeper and without writing anything: a page asking how much of a cache is
  * there, or putting a whole file together from its bodies. Each body by name,
- * in pack `packFile(pack)` at `offset`, `length` bytes; null where neither
- * file is an index. A body past its pack's end is the reader's to check: the
- * index is true of the disk only as of its save.
+ * in pack `packFile(pack)` at `offset`, `length` bytes; `packs` every pack
+ * whose file may be on the disk (one let go of is listed until its file is
+ * gone); null where neither file is an index. A body past its pack's end is
+ * the reader's to check: the index is true of the disk only as of its save.
  *
  * @param {(Uint8Array | null)[]} files  the bytes of `INDEX_FILES`, in order; null for one
  *     the disk does not have
@@ -1303,8 +1304,8 @@ export async function openKeeper(options){
         {
             if (disk.remove !== undefined && !withBodies.has(number) && !spokenFor(number))
             {
-                // A pack no body of the index is in (below) is removed by its
-                // name, unopened: opening makes a file the run before removed.
+                // A pack no entry names is let go of by its name, unopened:
+                // opening would make again a file the run before removed.
                 removePack(number);
                 continue;
             }

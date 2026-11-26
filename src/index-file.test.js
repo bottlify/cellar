@@ -151,7 +151,8 @@ test('a chunk listing a pack twice is not read, and an entry that does not say a
     assert.deepEqual([...(read?.entries.keys() ?? [])], ['kept', 'end']);
     assert.equal(read?.skipped, 3);
     const json = JSON.stringify({ version: 1, generation: 4, packs: 2, records: [
-        ['a', 0, 0, 10, 0], ['negative', 0, -1, 10, 0], ['empty', 1, 5, 0, 0], ['past', 1, 2 ** 40, 10, 0],
+        ['a', 0, 0, 10, 0], ['negative', 0, -1, 10, 0], ['empty', 1, 5, 0, 0],
+        ['past', 1, 2 ** 40, 10, 0],
     ] });
     const old = readIndexFile(new TextEncoder().encode(json), MAX, ONLY);
     assert.deepEqual([...(old?.entries.keys() ?? [])], ['a']);

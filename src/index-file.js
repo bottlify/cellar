@@ -23,7 +23,7 @@
  *
  * Chunk, little-endian:
  *   u32 MAGIC, u32 its bytes, u32 kind (BASE, DELTA), f64 generation,
- *   u32 next pack number, u32 packs on the disk, u32 each pack's number,
+ *   u32 next pack number, u32 packs whose file may be on the disk, u32 each pack's number,
  *   u32 entries, each { i32 pack, u32 offset, u32 length, u8 flags,
  *   u32 name units (the top bit: a byte a unit), the units },
  *   u32 FNV-1a of every byte before it.
@@ -152,7 +152,8 @@ export function chunkWriter(){
 /**
  * @typedef {Object} Chunk
  * @property {number} kind @property {number} generation @property {number} nextPack
- * @property {number[]} packs  the numbers of the packs on the disk when it was written
+ * @property {number[]} packs  the numbers of the packs whose file may be on the disk when it was
+ *     written: a pack let go of is listed until its file is gone
  * @property {[string, Entry][]} entries
  * @property {number} end  where it ends in its file
  */
