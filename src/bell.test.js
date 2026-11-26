@@ -218,10 +218,9 @@ test('a side whose waits always end asleep learns to look little, the one in six
     // its whole spin, whatever the machine's speed.
     const words = new Int32Array(new SharedArrayBuffer(12));
     const mover = new Worker(`
-        const { parentPort, workerData } = require('node:worker_threads');
+        const { workerData } = require('node:worker_threads');
         const words = new Int32Array(workerData);
         const nap = new Int32Array(new SharedArrayBuffer(4));
-        parentPort.postMessage('up');
         for (let n = 1; n <= 40; n++)
         {
             while (Atomics.load(words, 2) !== n - 1 || Atomics.load(words, 1) === 0)
@@ -229,8 +228,6 @@ test('a side whose waits always end asleep learns to look little, the one in six
             Atomics.store(words, 0, n);
             Atomics.notify(words, 0);
         }`, { eval: true, workerData: words.buffer });
-    // Up before this thread blocks: a worker starts through its parent's loop.
-    await new Promise(resolve=>mover.once('message', resolve));
     const spin = createSpin(0.05);
     /** @type {number[]} */
     const looks = [];
@@ -256,11 +253,10 @@ test('a doorbell\'s waits learn their spin, unless a wait names its own', { time
     // before it said it ended.
     const ended = new Int32Array(new SharedArrayBuffer(4));
     const ringer = new Worker(`
-        const { parentPort, workerData } = require('node:worker_threads');
+        const { workerData } = require('node:worker_threads');
         const words = new Int32Array(workerData.bell);
         const ended = new Int32Array(workerData.ended);
         const nap = new Int32Array(new SharedArrayBuffer(4));
-        parentPort.postMessage('up');
         for (let n = 0; n < 3; n++)
         {
             while (Atomics.load(ended, 0) !== n || Atomics.load(words, 1) === 0)
@@ -268,7 +264,6 @@ test('a doorbell\'s waits learn their spin, unless a wait names its own', { time
             Atomics.add(words, 0, 1);
             Atomics.notify(words, 0);
         }`, { eval: true, workerData: { bell: memory.buffer, ended: ended.buffer } });
-    await new Promise(resolve=>ringer.once('message', resolve));
     for (let n = 0; n < 3; n++)
     {
         assert.equal(bell.wait(bell.seen()), 'woke');
