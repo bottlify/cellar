@@ -391,6 +391,27 @@ test('a full cache walks its records once for many reserves, and a body read sin
         `${keeper.figures().oldestListed - listed} walks for 100 reserves of 16 bodies`);
 });
 
+test('a cache nothing in can leave walks its records once a tick for reserves it refuses, not once each',
+    async()=>{
+    const { keeper, reader, step } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
+    // Every block reserved and none committed: nothing can be cooled for room.
+    for (let i = 0; i < 16; i++)
+    {
+        assert.ok(reader.reserve(`w${i}`, UNIT) !== null);
+    }
+    const listed = keeper.figures().oldestListed;
+    for (let i = 0; i < 100; i++)
+    {
+        assert.equal(keeper.reserve(`x${i}`, UNIT), null, 'no room');
+    }
+    assert.ok(keeper.figures().oldestListed - listed <= 1,
+        `${keeper.figures().oldestListed - listed} walks for 100 refused reserves in one tick`);
+    // A body committed since: a later tick looks again and finds it.
+    reader.commit('w0');
+    step(1);
+    assert.ok(keeper.reserve('y', UNIT) !== null, 'room made from the body committed since');
+});
+
 test('segments let go and made again keep their numbers apart, the budget and every body', async()=>{
     const { keeper, reader, step, said } = await cacheOf({ budget: 192 * KIB, segmentBytes: 64 * KIB,
         coldAfterMs: 1e6, goneAfterMs: 1e6 });

@@ -625,6 +625,15 @@ export async function openKeeper(options){
     let oldestTicks = new Int32Array(0);
     let oldestCount = 0;
     let oldestNext = 0;
+    /**
+     * The tick of the last list that gave no room, -1 for none. A body may
+     * leave again without the keeper being told: a reader commits it or lets
+     * go of it in the shared words. So a list that found nothing is not made
+     * again within the same tick. Until the clock moves, a reserve that
+     * needs room is refused for the price of one look, not a walk over every
+     * record.
+     */
+    let fruitlessAt = -1;
 
     const listOldest = ()=>{
         const count = words[H_COUNT];
@@ -748,6 +757,11 @@ export async function openKeeper(options){
             if (id < 0)
             {
                 if (listed)
+                {
+                    fruitlessAt = tick();
+                    return null;
+                }
+                if (fruitlessAt === tick())
                 {
                     return null;
                 }
