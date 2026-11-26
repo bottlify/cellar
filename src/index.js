@@ -14,7 +14,7 @@
 export { openKeeper } from './keeper.js';
 export { createReader } from './reader.js';
 export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } from './channel.js';
-export { SPIN_MS, createDoorbell, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
+export { SPIN_MS, createDoorbell, createSpin, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
     waitForAsync } from './bell.js';
 export { RingClosed, createRingMemory, openRing } from './ring.js';
 

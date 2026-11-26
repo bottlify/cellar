@@ -62,6 +62,55 @@ const MAX_SPIN_MS = 1000;
 const looksFor = spinMs=>Math.max(SPIN_LOOKS + 1, Math.round(spinMs * LOOKS_PER_MS));
 
 /**
+ * A spin that learns from the waits it serves, for one waiting side: a side
+ * whose word usually moves while it looks keeps looking as long as `most`; one
+ * that went to sleep all the same looks an eighth less, down to a few hundred
+ * (slowly: a side whose waits are mostly short loses little to a long one), so
+ * a side that waits on long work does not burn a core for nothing -- on a
+ * machine short of cores it is the other side's core. One wait in
+ * `PROBE_EVERY` looks the whole way, and one that saw the word move at look
+ * `k` keeps at least `2k`: a side whose waits grew short gets its spin back.
+ * Counted in looks: no clock is read for it.
+ *
+ * @typedef {{ most: number, looks: number, waits: number }} Spin
+ */
+
+/** One wait in so many takes the whole spin, whatever was learnt. */
+const PROBE_EVERY = 16;
+
+/**
+ * A spin of `spinMs` at most that learns (`Spin`).
+ *
+ * @param {number} [spinMs]
+ * @returns {Spin}
+ */
+export function createSpin(spinMs = SPIN_MS){
+    checkTimes(Infinity, spinMs);
+    const most = spinMs > 0 ? looksFor(spinMs) : 0;
+    return { most, looks: most, waits: 0 };
+}
+
+/**
+ * How many looks the next wait of a spin takes: what it learnt, or the whole
+ * spin when this wait is the one in `PROBE_EVERY` that looks again.
+ *
+ * @param {Spin} spin
+ * @returns {number}
+ */
+export const nextLooks = spin=>(++spin.waits % PROBE_EVERY === 0 ? spin.most : spin.looks);
+
+/**
+ * What a spin learns from a wait that looked `looks` times: whether it then
+ * slept. Its looks, an eighth less, or kept at least twice what this wait needed.
+ *
+ * @param {Spin} spin @param {number} looks @param {boolean} slept
+ * @returns {number}
+ */
+export const learnt = (spin, looks, slept)=>slept
+    ? Math.max(Math.min(spin.most, SPIN_LOOKS + 1), spin.looks - (spin.looks >> 3))
+    : Math.min(spin.most, Math.max(spin.looks, looks * 2));
+
+/**
  * How a wait ended: the word moved before it counted itself asleep (`moved`)
  * or after (`woke`: a mover may have seen the count and notified it, whether
  * or not the sleep itself began), the deadline passed (`timed-out`), or the
@@ -114,7 +163,8 @@ const checkTimes = (deadline, spinMs)=>{
  * @param {Int32Array} words @param {number} index @param {number} seen
  * @param {number} sleeps  the word counting the waits asleep on `index`
  * @param {number} [deadline]  on the clock of `performance.now()`; Infinity by default
- * @param {number} [spinMs]  how long it looks before it sleeps (`SPIN_MS`); 0 sleeps at once
+ * @param {number | Spin} [spinMs]  how long it looks before it sleeps (`SPIN_MS`), 0 sleeps at
+ *     once; or a spin that learns (`createSpin`), its side's own
  * @param {number} [closed]  a word that, once not zero, ends the wait (none by default)
  * @param {number} [bell]  the word it sleeps on, `index` by default
  * @returns {WaitEnd}
@@ -122,16 +172,26 @@ const checkTimes = (deadline, spinMs)=>{
 export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs = SPIN_MS,
     closed = -1, bell = index){
     seen |= 0;
-    checkTimes(deadline, spinMs);
-    if (spinMs <= 0)
+    const spin = typeof spinMs === 'object' ? spinMs : null;
+    checkTimes(deadline, spin === null ? /** @type {number} */ (spinMs) : 0);
+    let most = 0;
+    if (spin === null)
+    {
+        most = /** @type {number} */ (spinMs) > 0 ? looksFor(/** @type {number} */ (spinMs)) : 0;
+    }
+    else
+    {
+        most = nextLooks(spin);
+    }
+    if (most <= 0)
     {
         return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
     }
     // The clock is read only for a wait with a deadline, once in a few hundred
     // looks: each answer of it is a number made on the heap.
-    const most = looksFor(spinMs);
     const timed = deadline !== Infinity;
-    for (let looks = 1; Atomics.load(words, index) === seen; looks++)
+    let looks = 1;
+    for (; Atomics.load(words, index) === seen; looks++)
     {
         if ((looks & SPIN_LOOKS) === 0)
         {
@@ -141,9 +201,17 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
             }
             if (looks >= most || (timed && clock.now() >= deadline))
             {
+                if (spin !== null && looks >= most)
+                {
+                    spin.looks = learnt(spin, looks, true);
+                }
                 return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
             }
         }
+    }
+    if (spin !== null)
+    {
+        spin.looks = learnt(spin, looks, false);
     }
     return 'moved';
 }
@@ -333,19 +401,24 @@ export function openDoorbell(memory){
     const words = new Int32Array(memory.buffer);
     const at = memory.index;
     const sleeps = at + 1;
+    /** The spin of this opening's waits: the thread that waits on it opens it. */
+    const spin = createSpin();
     return {
         memory,
+        /** What this opening's waits learnt of their spin, for diagnostics. */
+        spin,
         /** The count now. */
         seen: ()=>Atomics.load(words, at),
         /**
-         * Blocks until the count is no longer `seen`, looking for `spinMs`
-         * first: for a thread that may block.
+         * Blocks until the count is no longer `seen`, looking first: for
+         * `spinMs`, or by default as long as this opening's waits learnt to
+         * (`createSpin`). For a thread that may block.
          *
          * @param {number} seen @param {number} [timeoutMs] @param {number} [spinMs]
          * @returns {WaitEnd}
          */
-        wait: (seen, timeoutMs, spinMs = SPIN_MS)=>waitFor(words, at, seen, sleeps,
-            deadlineOf(timeoutMs), spinMs),
+        wait: (seen, timeoutMs, spinMs)=>waitFor(words, at, seen, sleeps,
+            deadlineOf(timeoutMs), spinMs ?? spin),
         /**
          * The same on the event loop.
          *

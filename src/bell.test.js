@@ -7,8 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { createDoorbell, deadlineOf, openDoorbell, publish, waitFor, waitForAsync, wake }
-    from './bell.js';
+import { createDoorbell, createSpin, deadlineOf, learnt, nextLooks, openDoorbell, publish, waitFor,
+    waitForAsync, wake } from './bell.js';
 
 const WORD = 0;
 const SLEEPS = 1;
@@ -187,4 +187,96 @@ test('a wait on a bell past its words takes itself off the count', ()=>{
     const words = new Int32Array(new SharedArrayBuffer(12));
     assert.throws(()=>waitFor(words, WORD, 0, SLEEPS, Infinity, 0, -1, 99), RangeError);
     assert.equal(Atomics.load(words, SLEEPS), 0);
+});
+
+test('a spin looks an eighth less after a wait that slept, down to a few hundred, and keeps twice '
+    + 'what a wait that ended looking needed, up to its most', ()=>{
+    const spin = createSpin(0.05);
+    assert.equal(spin.most, 5000);
+    assert.equal(spin.looks, 5000, 'it begins with the whole spin');
+    assert.equal(learnt(spin, 5000, true), 4375);
+    assert.equal(learnt({ ...spin, looks: 280 }, 280, true), 256, 'never below a few hundred');
+    assert.equal(learnt({ ...spin, looks: 256 }, 3, false), 256, 'a quick wait takes nothing away');
+    assert.equal(learnt({ ...spin, looks: 256 }, 1800, false), 3600, 'a longer one gives back');
+    assert.equal(learnt({ ...spin, looks: 4000 }, 4500, false), 5000, 'up to its most');
+    const probed = { ...spin, looks: 256, waits: 0 };
+    const taken = Array.from({ length: 32 }, ()=>nextLooks(probed));
+    assert.deepEqual(taken.flatMap((looks, i)=>looks === 5000 ? [i + 1] : []), [16, 32],
+        'one wait in sixteen looks the whole way');
+    assert.ok(taken.every(looks=>looks === 5000 || looks === 256), 'the others as learnt');
+    const none = createSpin(0);
+    assert.equal(none.most, 0, 'no spin is no spin');
+    assert.equal(learnt(none, 0, true), 0);
+    assert.throws(()=>createSpin(NaN), RangeError);
+    assert.throws(()=>createSpin(1001), RangeError);
+});
+
+test('a side whose waits always end asleep learns to look little, the one in sixteen that looks '
+    + 'the whole way asleep all the same', { timeout: 60_000 }, async()=>{
+    // The other side moves the word only once the wait counted itself asleep,
+    // and the wait before it said it ended (the third word): every wait spends
+    // its whole spin, whatever the machine's speed.
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const mover = new Worker(`
+        const { parentPort, workerData } = require('node:worker_threads');
+        const words = new Int32Array(workerData);
+        const nap = new Int32Array(new SharedArrayBuffer(4));
+        parentPort.postMessage('up');
+        for (let n = 1; n <= 40; n++)
+        {
+            while (Atomics.load(words, 2) !== n - 1 || Atomics.load(words, 1) === 0)
+                Atomics.wait(nap, 0, 0, 1);
+            Atomics.store(words, 0, n);
+            Atomics.notify(words, 0);
+        }`, { eval: true, workerData: words.buffer });
+    // Up before this thread blocks: a worker starts through its parent's loop.
+    await new Promise(resolve=>mover.once('message', resolve));
+    const spin = createSpin(0.05);
+    /** @type {number[]} */
+    const looks = [];
+    for (let n = 0; n < 40; n++)
+    {
+        assert.equal(waitFor(words, WORD, n, SLEEPS, Infinity, spin), 'woke');
+        looks.push(spin.looks);
+        Atomics.store(words, 2, n + 1);
+    }
+    await mover.terminate();
+    assert.deepEqual(looks.slice(0, 3), [4375, 3829, 3351], 'an eighth less at each');
+    assert.equal(looks[29], 256, 'down to a few hundred');
+    assert.equal(looks[31], 256, 'the thirty-second looked the whole way, slept all the same');
+    assert.equal(looks[39], 256);
+    assert.equal(spin.waits, 40);
+});
+
+test('a doorbell\'s waits learn their spin, unless a wait names its own', { timeout: 60_000 },
+    async()=>{
+    const memory = createDoorbell();
+    const bell = openDoorbell(memory);
+    // The ringer rings only once the wait counted itself asleep and the wait
+    // before it said it ended.
+    const ended = new Int32Array(new SharedArrayBuffer(4));
+    const ringer = new Worker(`
+        const { parentPort, workerData } = require('node:worker_threads');
+        const words = new Int32Array(workerData.bell);
+        const ended = new Int32Array(workerData.ended);
+        const nap = new Int32Array(new SharedArrayBuffer(4));
+        parentPort.postMessage('up');
+        for (let n = 0; n < 3; n++)
+        {
+            while (Atomics.load(ended, 0) !== n || Atomics.load(words, 1) === 0)
+                Atomics.wait(nap, 0, 0, 1);
+            Atomics.add(words, 0, 1);
+            Atomics.notify(words, 0);
+        }`, { eval: true, workerData: { bell: memory.buffer, ended: ended.buffer } });
+    await new Promise(resolve=>ringer.once('message', resolve));
+    for (let n = 0; n < 3; n++)
+    {
+        assert.equal(bell.wait(bell.seen()), 'woke');
+        Atomics.store(ended, 0, n + 1);
+    }
+    await ringer.terminate();
+    assert.equal(bell.spin.looks, 3351, 'an eighth less for each of three waits that slept');
+    assert.equal(bell.wait(bell.seen(), 0, 0.05), 'timed-out', 'a spin of its own');
+    assert.equal(bell.spin.waits, 3, 'is not the learning one');
+    assert.throws(()=>bell.wait(bell.seen(), undefined, NaN), RangeError);
 });

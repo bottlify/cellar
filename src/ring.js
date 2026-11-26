@@ -36,7 +36,7 @@
  * reader is rung to find it closed, after it has read what was written before.
  */
 
-import { createDoorbell, deadlineOf, openDoorbell, waitFor, waitForAsync, wake } from './bell.js';
+import { createDoorbell, createSpin, deadlineOf, openDoorbell, waitFor, waitForAsync, wake } from './bell.js';
 import { bytesOf } from './bytes.js';
 
 /**
@@ -128,6 +128,8 @@ export function openRing(memory){
     let peeked = false;
     /** The reader is inside `drain`'s `take`. */
     let draining = false;
+    /** The spin of the writer's waits for room. */
+    const roomSpin = createSpin();
 
     /**
      * The reservation `reserve` holds until `commit` or `abandon`: the bytes
@@ -254,7 +256,7 @@ export function openRing(memory){
                 {
                     return at;
                 }
-                const end = waitFor(control, ROOM, room, ROOM_SLEEPS, deadline, undefined, CLOSED);
+                const end = waitFor(control, ROOM, room, ROOM_SLEEPS, deadline, roomSpin, CLOSED);
                 if (end === 'closed')
                 {
                     throw new RingClosed();

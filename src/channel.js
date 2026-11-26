@@ -35,7 +35,7 @@
  * between that look and the wait is either seen by the look or rung for.
  */
 
-import { SPIN_MS, deadlineOf, publish as publishWord, waitFor as waitWord,
+import { createSpin, deadlineOf, publish as publishWord, waitFor as waitWord,
     waitForAsync as waitWordAsync } from './bell.js';
 import { bytesOf } from './bytes.js';
 
@@ -147,8 +147,10 @@ export class ChannelFailed extends Error {
  *
  * @param {SharedArrayBuffer} memory @param {{ spinMs?: number }} options
  */
-function endOver(memory, { spinMs = SPIN_MS }){
+function endOver(memory, { spinMs }){
     const words = new Int32Array(memory);
+    /** The spin of this end's waits: `spinMs` where asked, else one that learns. */
+    const spin = spinMs ?? createSpin();
     const bytes = new Uint8Array(memory);
     const slots = words[SLOTS];
     const slotBytes = words[SLOT_BYTES];
@@ -240,7 +242,7 @@ function endOver(memory, { spinMs = SPIN_MS }){
      * @param {number} counter @param {number} seen @param {number} sleeps @param {number} deadline
      */
     const waitFor = (counter, seen, sleeps, deadline)=>{
-        const end = waitWord(words, counter, seen, sleeps, deadline, spinMs, CLOSED, bellOf(counter));
+        const end = waitWord(words, counter, seen, sleeps, deadline, spin, CLOSED, bellOf(counter));
         if (end === 'closed')
         {
             throw new ChannelClosed();
