@@ -68,6 +68,8 @@ Historical measurements reported in the 0.10.0 change (`e4ca6ca`): Node.js 22, f
 | Save without changes | 19-23 ms | 0.11 ms |
 | Sweep | 0.94-1.04 ms | 0.17-0.19 ms |
 
+Not taken, 2026-11-26: flushing only the packs written since their last flush. Every save and sweep flushes each open pack, written to or not; a pack nothing was written to costs nothing to flush. Headless Chromium 158.0.8127.36 on Linux, x86 VM, a dedicated worker, OPFS sync access handles of 64 KiB, 50 runs an arm: flushing 1, 8, 32 or 128 unchanged files took a median of 0 ms and at most 0.2 ms for all of them (the worker's timer counts in 0.1 ms steps), while flushing one file after a 4 KiB write took a median of 0.5-0.7 ms whether the unchanged files were flushed beside it or not. Worth measuring again where a target's OPFS flush of an unchanged file is not free: another engine, or macOS and Windows.
+
 ## Journal
 
 The Journal copy implementation changed in 0.12.2. Use the matching revision when comparing measurements. In the Bottlify log workload reported in `6f605da`, Node.js 22 on an x86 VM, one million records per run, medians of 11, three processes per arm, writing cost 118-122 ns and reading 182-189 ns per record. The prior per-word atomic copy implementation measured 278-313 ns and 307-325 ns respectively. See the [memory-ordering contract](journal.md#memory-ordering).
