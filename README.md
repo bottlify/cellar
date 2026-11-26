@@ -273,13 +273,18 @@ import { openDoorbell, openRing } from '@bottlify/cellar';
 self.onmessage = ({ data })=>{
     const ring = openRing(data.memory);
     const doorbell = openDoorbell(data.memory.bell);
-    while (!ring.closed())
+    for (;;)
     {
         const seen = doorbell.seen();                // before the look: nothing written after it is missed
+        const closed = ring.closed();                // before the drain: what came before the close is drained
         ring.drain(record=>{                         // each record a view, valid inside the call
             const fields = new DataView(record.buffer, record.byteOffset, record.length);
             move(fields.getInt32(0, true), fields.getInt32(4, true));
         });
+        if (closed)
+        {
+            break;
+        }
         doorbell.wait(seen);                         // blocks; waitAsync keeps the event loop
     }
 };
@@ -310,7 +315,9 @@ takes at most `most` records, so one ring written without a pause does not starv
 thread reads (a reader that took `most` drains again before it waits: what is left will not ring
 again). Either side closes a ring when it goes or knows the other went: a writer waiting for
 room, and every write after, end with `RingClosed`, and the reader is rung to find it closed after
-reading what was written before. A `take` may not drain its own ring (it holds the record being
+reading what was written before: it looks at `closed()` before its drain, as the loop above does,
+and goes once a drain followed a close (one that looked after the drain would leave a record
+written just before the close unread). A `take` may not drain its own ring (it holds the record being
 taken), and `release` frees only a record `peek` returned: either throws rather than free a
 record not read. A record is bytes, as a channel's request and answer and a body the cache is
 handed are: a `Uint8Array` (or another view of one-byte elements) or an array of integers from 0
