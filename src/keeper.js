@@ -716,11 +716,13 @@ export async function openKeeper(options){
     };
 
     /**
-     * Writes a hot body to the disk: true where the disk holds it now.
+     * Writes a hot body to the disk: true where the disk holds it now. An
+     * only copy is flushed, as it may leave memory next, unless the caller
+     * flushes the pack itself before anything trusts the copy (`save`).
      *
-     * @param {number} id
+     * @param {number} id @param {boolean} [flush]
      */
-    const writeOut = id=>{
+    const writeOut = (id, flush = (get(id, R_FLAGS) & F_ONLY_COPY) !== 0)=>{
         if (disk === null || (get(id, R_FLAGS) & F_NO_DISK) !== 0)
         {
             return false;
@@ -728,8 +730,7 @@ export async function openKeeper(options){
         const length = get(id, R_LENGTH);
         const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[get(id, R_SEGMENT)]);
         const offset = get(id, R_OFFSET);
-        const at = append(one.bytes.subarray(offset, offset + length),
-            (get(id, R_FLAGS) & F_ONLY_COPY) !== 0);
+        const at = append(one.bytes.subarray(offset, offset + length), flush);
         if (at < 0)
         {
             return false;
@@ -1523,6 +1524,8 @@ export async function openKeeper(options){
                 return false;
             }
             let whole = true;
+            /** @type {number[]} */
+            const written = [];
             for (let id = 0; id < words[H_COUNT]; id++)
             {
                 // A body for this run only, or never on the disk, is no next
@@ -1531,15 +1534,29 @@ export async function openKeeper(options){
                     && (get(id, R_FLAGS) & (F_ON_DISK | F_THIS_RUN | F_NO_DISK)) === 0)
                 {
                     // Only no one may write it meanwhile: the keeper's thread
-                    // is the one placing, and a reader does not write.
-                    whole = writeOut(id) && whole;
+                    // is the one placing, and a reader does not write. Each
+                    // pack is flushed once below, not once a body.
+                    if (writeOut(id, false))
+                    {
+                        written.push(id);
+                    }
+                    else
+                    {
+                        whole = false;
+                    }
                 }
             }
             for (const file of packs.values())
             {
-                // An index naming bodies the disk may not hold is not written.
+                // An index naming bodies the disk may not hold is not written,
+                // and a body written here unflushed is not the disk's: an only
+                // copy trusting it would leave memory going cold.
                 if (!flushed(file))
                 {
+                    for (const id of written)
+                    {
+                        forgetDisk(id);
+                    }
                     return false;
                 }
             }

@@ -76,7 +76,9 @@ export function memoryDisk({ remove = true } = {}){
  * leaves: `crash(keep)` answers every file as its last flush left it, with
  * each change since that `keep` says reached the disk anyway. A file removed
  * is gone at once. An operation fails while the file's name is in its set of
- * `failing` (a write as a full disk refuses it, by throwing).
+ * `failing` (a write as a full disk refuses it, by throwing); a flush of a
+ * file in `failing.losing` fails and loses what the file took since the
+ * flush before, as a crash of that file would.
  *
  * @param {Map<string, Uint8Array>} [start]  the files as a crash left them
  * @param {{ remove?: boolean }} [options]  whether the disk can remove a file (yes)
@@ -86,7 +88,7 @@ export function crashDisk(start = new Map(), { remove = true } = {}){
     const held = new Map([...start].map(([name, bytes])=>[name,
         { bytes: bytes.slice(), flushed: bytes.slice(), since: [] }]));
     const failing = { open: new Set(), read: new Set(), write: new Set(), flush: new Set(),
-        remove: new Set() };
+        losing: new Set(), remove: new Set() };
     /** Every flush asked, by file. @type {string[]} */
     const flushes = [];
     /** @param {Uint8Array} bytes @param {Change} change */
@@ -136,7 +138,12 @@ export function crashDisk(start = new Map(), { remove = true } = {}){
                 },
                 flush(){
                     flushes.push(name);
-                    if (failing.flush.has(name))
+                    if (failing.losing.has(name))
+                    {
+                        file.bytes = file.flushed.slice();
+                        file.since = [];
+                    }
+                    if (failing.flush.has(name) || failing.losing.has(name))
                     {
                         throw new Error(`${name} does not flush`);
                     }

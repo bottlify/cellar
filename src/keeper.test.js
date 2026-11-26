@@ -1963,3 +1963,28 @@ test('readSaved trusts no more than a keeper opening the index: an entry of 0.9.
     assert.deepEqual([...(readSaved([json, null])?.bodies.keys() ?? [])], ['a']);
     assert.equal(readSaved([baseOf(1, 4, [2, 2], []), null]), null);
 });
+
+test('a save flushes each pack once, not once a body; where that flush fails, no body it wrote counts'
+    + ' as the disk\'s, so an only copy is written again before it leaves memory', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper, step } = await cacheOf({ disk, budget: 1024 * KIB });
+    for (let i = 0; i < 200; i++)
+    {
+        reader.put(`only${i}`, bodyOf(64, i), { onlyCopy: true });
+    }
+    const before = disk.flushes.length;
+    assert.equal(keeper.save(), true);
+    const flushed = disk.flushes.slice(before).filter(name=>name.startsWith('pack-'));
+    assert.deepEqual(flushed, ['pack-0'], 'one pack, one flush');
+
+    // The pack's flush fails and loses what the save wrote: the copy there is not the body's.
+    reader.put('lost', bodyOf(3000, 7), { onlyCopy: true });
+    disk.failing.losing.add('pack-0');
+    assert.equal(keeper.save(), false);
+    disk.failing.losing.clear();
+    step(150);
+    assert.equal(reader.look('lost'), 'cold');
+    assert.equal(keeper.save(), true);
+    assert.deepEqual(await nextRunReads(disk.crash(), ['lost', 'only0'], { budget: 1024 * KIB }),
+        [[...bodyOf(3000, 7)], [...bodyOf(64, 0)]]);
+});
