@@ -153,7 +153,9 @@ on the disk stays named), and the save after lets the file go (removed
 where the disk has `remove`, else cut to nothing), unless an index file the next run may read still
 names an only copy there; a keeper opening an index lets go of the packs no body of it is in (what
 a run wrote with `disk: 'run'`). When the disk refuses a write, the next sweep makes room from the
-pack used longest ago: what can be made again there goes, so newer bodies take its place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
+pack used longest ago of those holding no only copy (one could not move while the disk refuses, and
+what went beside it would free nothing): what can be made again there goes, so newer bodies take
+its place. `announce` and the disk's methods run on the keeper's thread in the middle of its work: they call
 none of its methods. One that throws is counted (`announceFailures`, `diskFailures`) and the keeper
 goes on: a thread not told of a segment is never placed in it. After `close()` the files are
 let go and the keeper goes on in memory, as without a disk: a hot body stays (an only copy for

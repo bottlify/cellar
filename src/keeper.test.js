@@ -1392,12 +1392,15 @@ test('a keeper opening an index lets go of the packs no body of it is in: what t
         [...bodyOf(10 * KIB, 9)]);
 });
 
-test('a disk that refuses for room makes it from the bodies used longest ago, not the newest',
-    async()=>{
-    // Packs of 32 KiB, room for two on the disk.
+/**
+ * A memory disk that refuses a write to a pack, as a full disk does, where
+ * the packs would hold more than `quota` bytes.
+ *
+ * @param {number} quota
+ */
+function quotaDisk(quota){
     const base = memoryDisk();
-    const quota = 64 * KIB;
-    const disk = {
+    return {
         files: base.files,
         remove: base.remove,
         async open(/** @type {string} */ name){
@@ -1415,6 +1418,12 @@ test('a disk that refuses for room makes it from the bodies used longest ago, no
                 } };
         },
     };
+}
+
+test('a disk that refuses for room makes it from the bodies used longest ago, not the newest',
+    async()=>{
+    // Packs of 32 KiB, room for two on the disk.
+    const disk = quotaDisk(64 * KIB);
     const { reader, keeper, step } = await cacheOf({ disk, packBytes: 32 * KIB,
         goneAfterMs: 1e6 });
     for (let i = 0; i < 6; i++)
@@ -1682,4 +1691,50 @@ test('a close whose save fails brings back into memory the cold only copies no w
     assert.equal(keeper.close(), false);
     assert.equal(reader.look('only'), null);
     assert.equal(keeper.figures().lostAtClose, 1);
+});
+
+test('a full disk makes room from the oldest pack it can empty: not one an only copy holds, whose'
+    + ' bodies would go for nothing', async()=>{
+    for (const order of ['only copy first', 'only copy last'])
+    {
+        const { reader, keeper, step } = await cacheOf({ disk: quotaDisk(40_000), packBytes: 16_384,
+            goneAfterMs: 1e6 });
+        /** @param {string[]} names @param {boolean} [onlyCopy] */
+        const round = async(names, onlyCopy = false)=>{
+            for (const name of names)
+            {
+                reader.put(name, bodyOf(4000, name.charCodeAt(1)), { onlyCopy });
+            }
+            step(100);
+            keeper.save();
+            await settle();
+        };
+        const first = ['c0', 'c1', 'c2'];
+        if (order === 'only copy first')
+        {
+            await round(['X0'], true);
+            await round(first);
+        }
+        else
+        {
+            await round(first);
+            await round(['X0'], true);
+        }
+        await round(['d0', 'd1', 'd2', 'd3']);
+        await round(['e0', 'e1', 'e2', 'e3']);
+        assert.ok(keeper.figures().diskFailures > 0, `${order}: the disk full`);
+        for (let i = 0; i < 4; i++)
+        {
+            await round([`o${i}`], true);
+        }
+        assert.deepEqual([0, 1, 2, 3].map(i=>reader.look(`o${i}`)), ['cold', 'cold', 'cold', 'cold'],
+            `${order}: the only copies written after made room`);
+        assert.deepEqual(['d0', 'd1', 'd2', 'd3'].map(name=>reader.look(name)), [null, null, null, null],
+            `${order}: the oldest pack that could be emptied`);
+        assert.deepEqual([...first, 'X0'].map(name=>reader.look(name)), ['cold', 'cold', 'cold', 'cold'],
+            `${order}: the pack of the only copy kept whole`);
+        assert.deepEqual(reader.with('X0', body=>[...body], { wait: true }), [...bodyOf(4000, '0'.charCodeAt(0))]);
+        assert.equal(keeper.figures().evicted, 4, order);
+        keeper.close();
+    }
 });

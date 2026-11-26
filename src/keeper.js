@@ -1028,14 +1028,19 @@ export async function openKeeper(options){
 
     /**
      * After the disk refused a write: the bodies used longest ago make room
-     * for the newer ones, not the other way round. The pack whose last used
-     * body is the oldest is taken out of, what can be made again in it going
-     * (`empty`); the pack bodies go to is closed to new ones first where it
-     * is the only one, so that it can be.
+     * for the newer ones, not the other way round. Of the packs that can be
+     * emptied without a write, the one whose last used body is the oldest is
+     * taken out of, what can be made again in it going (`empty`); a pack
+     * holding an only copy is not one of them, since the copy cannot move
+     * while the disk refuses, and what went for it would free nothing. The
+     * pack bodies go to is closed to new ones first where no other can be
+     * emptied, so that it can be.
      */
     const makeRoomOnDisk = ()=>{
         /** @type {Map<number, number>} */
         const lastUsed = new Map();
+        /** @type {Set<number>} */
+        const held = new Set();
         const at = tick();
         for (let id = 0; id < words[H_COUNT]; id++)
         {
@@ -1044,19 +1049,25 @@ export async function openKeeper(options){
             {
                 const idle = age(at, get(id, R_TICK));
                 lastUsed.set(number, Math.min(lastUsed.get(number) ?? idle, idle));
+                const state = stateOf(stateWordOf(id));
+                if ((get(id, R_FLAGS) & F_ONLY_COPY) !== 0 && (state === HOT || state === COLD))
+                {
+                    held.add(number);
+                }
             }
         }
         let oldest = -1;
         for (const [number, idle] of lastUsed)
         {
-            if (number !== pack && (oldest < 0 || idle > /** @type {number} */ (lastUsed.get(oldest))))
+            if (number !== pack && !held.has(number)
+                && (oldest < 0 || idle > /** @type {number} */ (lastUsed.get(oldest))))
             {
                 oldest = number;
             }
         }
         if (oldest < 0)
         {
-            // Only the pack bodies go to holds any: the next body opens another.
+            // No other pack can be emptied: the next body opens another.
             pack = -1;
             return;
         }
