@@ -100,7 +100,7 @@ test('a body the keeper is moving is there: a wait reads it once the move is ove
 
 test('a name written anew while read gives its record back once read: the records and the table stay'
     + ' the size of the names', async()=>{
-    const { keeper, reader, step, said } = await cacheOf({ budget: 1024 * KIB, segmentBytes: 1024 * KIB });
+    const { keeper, reader, step, said } = await cacheOf({ budget: 4096 * KIB, segmentBytes: 1024 * KIB });
     reader.put('x', bodyOf(64, 0));
     const tables = said.filter(message=>message.table !== undefined).length;
     for (let i = 1; i <= 3000; i++)
@@ -109,7 +109,8 @@ test('a name written anew while read gives its record back once read: the record
         reader.with('x', ()=>{
             assert.equal(reader.put('x', bodyOf(64, i)), true);
         });
-        if (i % 200 === 0)
+        // Records retired and not swept yet past the first table's half.
+        if (i % 600 === 0)
         {
             step(1);
         }
@@ -117,7 +118,7 @@ test('a name written anew while read gives its record back once read: the record
     step(1);
     const figures = keeper.figures();
     assert.equal(figures.replaced, 3000);
-    assert.ok(figures.records <= 202, `${figures.records} records for one name`);
+    assert.ok(figures.records <= 602, `${figures.records} records for one name`);
     assert.equal(figures.freeRecords, figures.records - 1, 'all but the name\'s kept for another');
     reader.put('y', bodyOf(64, 1));
     assert.equal(keeper.figures().records, figures.records, 'a new name takes a record given back');
@@ -156,10 +157,14 @@ test('a reader that remembers a record given since to another name reads its nam
     + ' the other\'s', async()=>{
     const { keeper, reader, step } = await cacheOf();
     reader.put('x', bodyOf(100, 1));
-    // Another thread's reader, which found x before.
-    const other = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers(),
-        keeper: { reserve: ()=>null, raise: ()=>false, raiseLater: ()=>{}, drop: ()=>{} } });
-    assert.equal(other.with('x', body=>body[1]), (31 + 1) & 255);
+    // Readers of other threads, which found x before.
+    const others = Array.from({ length: 4 }, ()=>createReader({ shared: keeper.shared,
+        segments: keeper.segmentBuffers(),
+        keeper: { reserve: ()=>null, raise: ()=>false, raiseLater: ()=>{}, drop: ()=>{} } }));
+    for (const other of others)
+    {
+        assert.equal(other.with('x', body=>body[1]), (31 + 1) & 255);
+    }
     const first = recordOf(keeper, 'x');
     reader.with('x', ()=>{
         reader.put('x', bodyOf(200, 2));
@@ -168,12 +173,21 @@ test('a reader that remembers a record given since to another name reads its nam
     // The record x left goes to the next name written.
     reader.put('y', bodyOf(300, 3));
     assert.equal(recordOf(keeper, 'y'), first, 'y took the record x had');
-    assert.deepEqual(other.with('x', body=>[...body]), [...bodyOf(200, 2)], 'x\'s body, not y\'s');
-    assert.equal(other.look('x'), 'hot');
-    assert.deepEqual(other.with('y', body=>[...body]), [...bodyOf(300, 3)]);
+    assert.deepEqual(others[0].with('x', body=>[...body]), [...bodyOf(200, 2)], 'x\'s body, not y\'s');
+    assert.equal(others[0].look('x'), 'hot');
+    assert.deepEqual(others[0].with('y', body=>[...body]), [...bodyOf(300, 3)]);
+    // y's body being moved by the keeper: what a reader remembering x finds
+    // there is y's, which says nothing of x.
+    const { words, at } = stateIndex(keeper, first);
+    Atomics.store(words, at, stateWord(MOVING));
+    assert.equal(others[1].look('x'), 'hot', 'x\'s own state, not y\'s');
+    assert.deepEqual(others[2].with('x', body=>[...body]), [...bodyOf(200, 2)], 'not a miss for y\'s move');
+    Atomics.store(words, at, stateWord(HOT));
+    // x gone, y there: x is no body.
     reader.drop('x');
-    assert.equal(other.look('x'), null);
-    assert.equal(other.with('x', body=>body.length), undefined);
+    assert.equal(others[3].look('x'), null);
+    assert.equal(others[0].look('x'), null);
+    assert.equal(others[0].with('x', body=>body.length), undefined);
 });
 
 test('a record given to another name between a reader\'s lookup and its entering is not read as the'
@@ -290,17 +304,17 @@ test('a drop that reaches a name being written takes the body written, once comm
 });
 
 test('a reserve no block can be formed for cools nothing', async()=>{
-    // One segment, an only copy at its start that cannot leave: no 64 KiB block can form.
+    // One segment, an only copy at its end that cannot leave: no 64 KiB block can form.
     const { keeper, reader } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
-    reader.put('pinned', bodyOf(UNIT, 0), { onlyCopy: true });
-    for (let i = 0; i < 10; i++)
+    for (let i = 0; i < 15; i++)
     {
         reader.put(`n${i}`, bodyOf(UNIT, i + 1));
     }
+    reader.put('pinned', bodyOf(UNIT, 0), { onlyCopy: true });
     assert.equal(reader.reserve('big', 64 * KIB), null);
     assert.equal(keeper.figures().refusedRoom, 1);
     assert.equal(keeper.figures().gone, 0, 'nothing taken away for it');
-    for (let i = 0; i < 10; i++)
+    for (let i = 0; i < 15; i++)
     {
         assert.equal(reader.look(`n${i}`), 'hot', `n${i}`);
     }
@@ -309,12 +323,12 @@ test('a reserve no block can be formed for cools nothing', async()=>{
 test('room is made in a block the body fits, not by cooling the oldest bodies around one that stays',
     async()=>{
         const { keeper, reader, step } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
-        // Units 0 to 7: an only copy that cannot leave, then the oldest bodies.
-        reader.put('pinned', bodyOf(UNIT, 0), { onlyCopy: true });
+        // Units 0 to 7: the oldest bodies, then an only copy that cannot leave.
         for (let i = 1; i < 8; i++)
         {
             reader.put(`old${i}`, bodyOf(UNIT, i));
         }
+        reader.put('pinned', bodyOf(UNIT, 0), { onlyCopy: true });
         step(10);
         // Units 8 to 15: newer ones.
         for (let i = 8; i < 16; i++)
@@ -405,6 +419,10 @@ test('a reader made before the index grew finds, reads and writes names past its
         {
             early.adopt(message);
         }
+        // A reservation past every record this reader has looked at, let go of.
+        assert.ok(early.reserve('given back', 16));
+        early.abandon('given back');
+        assert.equal(early.look('given back'), null);
         for (const i of [0, 1500, 2999])
         {
             assert.deepEqual(early.with(`a name of some length, ${i}`, body=>[...body]), [...bodyOf(16, i)]);
