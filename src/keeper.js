@@ -31,7 +31,7 @@
  * only once the disk holds it.
  */
 
-import { blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
+import { UNIT, blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_FOR_ROOM, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
@@ -596,20 +596,38 @@ export async function openKeeper(options){
 
     /** One segment no body is in, announced ahead of need, where the budget has room. */
     const keepSpare = ()=>{
-        if (!liveSegments.some(at=>segmentAt(at).buddy.empty()))
+        for (let i = 0; i < liveSegments.length; i++)
         {
-            makeSegment();
+            if (segmentAt(liveSegments[i]).buddy.empty())
+            {
+                return;
+            }
         }
+        makeSegment();
     };
 
+    /*
+     * Where a block lies, as one number: its segment and the unit it starts
+     * at there (`segment * unitsPerSegment + unit`), exact in a double for
+     * any segment number a run reaches. A reserve finds room on every call,
+     * and a number is no object made for it.
+     */
+    const unitsPerSegment = segmentBytes / UNIT;
+    /** @param {number} place */
+    const segmentOf = place=>Math.floor(place / unitsPerSegment);
+    /** @param {number} place */
+    const offsetOf = place=>(place % unitsPerSegment) * UNIT;
+
     /**
-     * Room for `length` bytes in a segment below `limit`: where it is, or null.
+     * Room for `length` bytes in a segment below `limit`: where it is (a
+     * place, `segmentOf`, `offsetOf`), or -1.
      *
      * @param {number} length @param {number} limit
      */
     const placeIn = (length, limit)=>{
-        for (const at of liveSegments)
+        for (let i = 0; i < liveSegments.length; i++)
         {
+            const at = liveSegments[i];
             if (at >= limit)
             {
                 break;
@@ -617,10 +635,10 @@ export async function openKeeper(options){
             const offset = segmentAt(at).buddy.place(length);
             if (offset >= 0)
             {
-                return { segment: at, offset };
+                return at * unitsPerSegment + offset / UNIT;
             }
         }
-        return null;
+        return -1;
     };
 
     /**
@@ -814,14 +832,14 @@ export async function openKeeper(options){
      * find it, but only where that forms a block for it: a body is taken out
      * only with every other in the block of the size asked it lies in, and
      * only where all of them can leave. A request no block can be formed for
-     * moves nothing.
+     * moves nothing. Where it is (a place, as `placeIn`'s), or -1.
      *
      * @param {number} length @param {number} limit  segments a writer has
      * @param {number} [spare]  the record the room is for, never cooled for it
      */
     const room = (length, limit, spare = -1)=>{
         let found = placeIn(length, limit);
-        if (found !== null)
+        if (found >= 0)
         {
             return found;
         }
@@ -829,7 +847,7 @@ export async function openKeeper(options){
         if (made >= 0 && made < limit)
         {
             found = placeIn(length, limit);
-            if (found !== null)
+            if (found >= 0)
             {
                 return found;
             }
@@ -860,11 +878,11 @@ export async function openKeeper(options){
                     {
                         fruitless.add(asked);
                     }
-                    return null;
+                    return -1;
                 }
                 if (fruitlessAt === now || fruitless.has(asked))
                 {
-                    return null;
+                    return -1;
                 }
                 listOldest();
                 listed = true;
@@ -900,7 +918,7 @@ export async function openKeeper(options){
                 }
             }
             found = placeIn(length, limit);
-            if (found !== null)
+            if (found >= 0)
             {
                 return found;
             }
@@ -908,14 +926,14 @@ export async function openKeeper(options){
     };
 
     /**
-     * Record `id`'s body is at `found` from now on.
+     * Record `id`'s body is at `segment` and `offset` from now on.
      *
-     * @param {number} id @param {{ segment: number, offset: number }} found
+     * @param {number} id @param {number} segment @param {number} offset
      */
-    const placeBody = (id, found)=>{
-        set(id, R_SEGMENT, found.segment);
-        set(id, R_OFFSET, found.offset);
-        segmentAt(found.segment).buddy.own(found.offset, id);
+    const placeBody = (id, segment, offset)=>{
+        set(id, R_SEGMENT, segment);
+        set(id, R_OFFSET, offset);
+        segmentAt(segment).buddy.own(offset, id);
     };
 
     /** @param {number} segment @param {number} offset @param {number} length */
@@ -1335,12 +1353,14 @@ export async function openKeeper(options){
         }
         store(id, MOVING);
         const found = room(length, known);
+        const segment = segmentOf(found);
+        const offset = offsetOf(found);
         if ((get(id, R_FLAGS) & F_ON_DISK) === 0)
         {
             // A flush failed while room was made, and its copy with it.
-            if (found !== null)
+            if (found >= 0)
             {
-                giveRoom(found.segment, found.offset, length);
+                giveRoom(segment, offset, length);
             }
             set(id, R_FLAGS, 0);
             store(id, GONE);
@@ -1348,19 +1368,19 @@ export async function openKeeper(options){
             counts.raiseFailed++;
             return false;
         }
-        if (found === null)
+        if (found < 0)
         {
             store(id, COLD);
             counts[beyond(known) ? 'refusedUnseen' : 'raiseFailed']++;
             return false;
         }
-        const one = segmentAt(found.segment);
+        const one = segmentAt(segment);
         /** Bytes read, -1 where the disk threw. */
         let read = -1;
         try
         {
-            read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(found.offset,
-                found.offset + length), { at: get(id, R_PACK_OFFSET) });
+            read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(offset,
+                offset + length), { at: get(id, R_PACK_OFFSET) });
         }
         catch
         {
@@ -1368,7 +1388,7 @@ export async function openKeeper(options){
         }
         if (read !== length)
         {
-            giveRoom(found.segment, found.offset, length);
+            giveRoom(segment, offset, length);
             counts.raiseFailed++;
             if (read >= 0 && (get(id, R_FLAGS) & F_ONLY_COPY) === 0)
             {
@@ -1384,7 +1404,7 @@ export async function openKeeper(options){
             store(id, COLD);
             return false;
         }
-        placeBody(id, found);
+        placeBody(id, segment, offset);
         // Brought back now: not taken for idle since the last sweep.
         set(id, R_TICK, tick());
         store(id, HOT);
@@ -1804,14 +1824,14 @@ export async function openKeeper(options){
             // The name's own body is not cooled for it: a reader that leaves
             // it meanwhile does not make it a candidate.
             let found = room(length, known, id);
-            if (found === null && held && get(id, R_SEGMENT) < known
+            if (found < 0 && held && get(id, R_SEGMENT) < known
                 && blockOf(length) <= blockOf(get(id, R_LENGTH)))
             {
                 // Its own block holds the new body: written over in place.
                 giveBack(id);
                 found = placeIn(length, known);
             }
-            if (found === null)
+            if (found < 0)
             {
                 if (held)
                 {
@@ -1834,7 +1854,7 @@ export async function openKeeper(options){
                 const fresh = replaceRecord(id);
                 if (fresh < 0)
                 {
-                    giveRoom(found.segment, found.offset, length);
+                    giveRoom(segmentOf(found), offsetOf(found), length);
                     counts.refusedRoom++;
                     return null;
                 }
@@ -1844,7 +1864,9 @@ export async function openKeeper(options){
             set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags
                 | (idle === 'stay' ? F_FOR_ROOM : 0));
             store(id, MOVING);
-            placeBody(id, found);
+            const segment = segmentOf(found);
+            const offset = offsetOf(found);
+            placeBody(id, segment, offset);
             set(id, R_LENGTH, length);
             // Now, not the last sweep's tick: a reservation's age, which
             // `abandonAfterMs` takes it back by, counts from when it was made.
@@ -1854,7 +1876,7 @@ export async function openKeeper(options){
             Atomics.store(words, index.at(id) + R_STATE, stateWord(WRITING, mark));
             counts.reserved++;
             keepSpare();
-            return { id, segment: found.segment, offset: found.offset, mark };
+            return { id, segment, offset, mark };
         },
 
         /**

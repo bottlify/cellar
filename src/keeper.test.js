@@ -342,6 +342,18 @@ test('a reservation let go of, or reserved again before its commit, gives its ro
     assert.equal(reader.figures().abandoned, 2);
 });
 
+test('a put lets go of the name\'s reservation not committed yet and holds none of its own', async()=>{
+    const { reader, keeper, step } = await cacheOf();
+    assert.ok(reader.reserve('a', 9000));
+    assert.equal(reader.put('a', bodyOf(100, 1)), true);
+    assert.throws(()=>reader.commit('a'), /not reserved/, 'neither the reserve nor the put is held');
+    reader.abandon('a');
+    assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(100, 1)]);
+    step(1);
+    assert.equal(keeper.figures().placedBytes, UNIT, 'the put\'s body alone');
+    assert.deepEqual([reader.figures().abandoned, reader.figures().reserved], [1, 2]);
+});
+
 test('a cold body is raised only into a segment the asking thread has', async()=>{
     const { keeper, reader, step } = await cacheOf({ disk: memoryDisk() });
     reader.put('a', bodyOf(60 * KIB, 1));

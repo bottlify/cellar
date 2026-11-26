@@ -227,6 +227,77 @@ export function createReader({ shared, segments = [], keeper }){
         return false;
     };
 
+    /**
+     * What `reserve` and `put` ask the keeper with: their options, the
+     * defaults filled in, and the segments this reader has heard of. No
+     * object is made for options not given.
+     *
+     * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
+     *     idle?: 'go' | 'stay' } | undefined} options
+     */
+    const askOf = options=>{
+        if (options === undefined)
+        {
+            return { onlyCopy: false, disk: /** @type {const} */ ('kept'), idle: /** @type {const} */ ('go'),
+                known: heard };
+        }
+        const { onlyCopy = false, disk = 'kept', idle = 'go' } = options;
+        return { onlyCopy, disk, idle, known: heard };
+    };
+
+    /**
+     * The body written at `place` made readable: false where it came too
+     * late, the reservation taken back. Stamped once published: a record
+     * taken back, and perhaps another name's now, is stamped by nothing here.
+     *
+     * @param {Place} place @returns {boolean}
+     */
+    const publish = place=>{
+        const published = finish(place, HOT);
+        if (published)
+        {
+            index.stamp(place.id);
+        }
+        return published;
+    };
+
+    /**
+     * Room for `name`'s body from the keeper, an earlier reservation of the
+     * name here let go of first: the place, in a segment this reader can
+     * write, or null with why counted.
+     *
+     * @param {string} name @param {number} length
+     * @param {Parameters<typeof askOf>[0]} options
+     * @returns {Place | null}
+     */
+    const reserveRoom = (name, length, options)=>{
+        // A second reserve of a name not committed yet replaces the first.
+        self.abandon(name);
+        const place = keeper.reserve(name, length, askOf(options));
+        if (place === null)
+        {
+            counts.refused++;
+            return null;
+        }
+        const view = views[place.segment];
+        if (view === null || view === undefined)
+        {
+            // Placed where this reader cannot write: given back.
+            counts.abandoned++;
+            finish(place, GONE);
+            counts.refused++;
+            return null;
+        }
+        if (!stillReserved(place))
+        {
+            // Taken back before a byte was written: nothing to give back.
+            counts.late++;
+            return null;
+        }
+        counts.reserved++;
+        return place;
+    };
+
     const self = {
         /**
          * A message from the keeper: a segment made or let go, a larger table.
@@ -362,32 +433,15 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
          *     idle?: 'go' | 'stay' }} [options]
          */
-        reserve(name, length, { onlyCopy = false, disk = 'kept', idle = 'go' } = {}){
+        reserve(name, length, options){
             checkName(name);
-            // A second reserve of a name not committed yet replaces the first.
-            self.abandon(name);
-            const place = keeper.reserve(name, length, { onlyCopy, disk, idle, known: heard });
-            const view = place === null ? null : views[place.segment];
-            if (place !== null)
+            const place = reserveRoom(name, length, options);
+            if (place === null)
             {
-                writing.set(name, place);
-            }
-            if (place === null || view === null || view === undefined)
-            {
-                // Placed where this reader cannot write: given back.
-                self.abandon(name);
-                counts.refused++;
                 return null;
             }
-            if (!stillReserved(place))
-            {
-                // Taken back before a byte was written: nothing to give back.
-                writing.delete(name);
-                counts.late++;
-                return null;
-            }
-            counts.reserved++;
-            return view.subarray(place.offset, place.offset + length);
+            writing.set(name, place);
+            return /** @type {Uint8Array} */ (views[place.segment]).subarray(place.offset, place.offset + length);
         },
 
         /**
@@ -404,14 +458,7 @@ export function createReader({ shared, segments = [], keeper }){
                 throw new Error(`cache: ${name} was not reserved here`);
             }
             writing.delete(name);
-            // Stamped once published: a commit that came too late, its
-            // record taken back and perhaps another name's now, stamps nothing.
-            const published = finish(place, HOT);
-            if (published)
-            {
-                index.stamp(place.id);
-            }
-            return published;
+            return publish(place);
         },
 
         /**
@@ -445,20 +492,23 @@ export function createReader({ shared, segments = [], keeper }){
             checkName(name);
             // The bytes as long as they are now, which is what is copied.
             const taken = bytesOf(bytes, 'cache');
-            const into = self.reserve(name, taken.length, options);
-            if (into === null)
+            // `reserve` and `commit` without their view or their entry in
+            // `writing`: a put holds its reservation only for the copy.
+            const place = reserveRoom(name, taken.length, options);
+            if (place === null)
             {
                 return false;
             }
             try
             {
-                into.set(taken);
+                /** @type {Uint8Array} */ (views[place.segment]).set(taken, place.offset);
             }
             catch (e){
-                self.abandon(name);
+                counts.abandoned++;
+                finish(place, GONE);
                 throw e;
             }
-            return self.commit(name);
+            return publish(place);
         },
 
         /** @param {string} name */

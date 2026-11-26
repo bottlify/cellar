@@ -75,3 +75,17 @@ Not taken, 2026-11-26: flushing only the packs written since their last flush. E
 The Journal copy implementation changed in 0.12.2. Use the matching revision when comparing measurements. In the Bottlify log workload reported in `6f605da`, Node.js 22 on an x86 VM, one million records per run, medians of 11, three processes per arm, writing cost 118-122 ns and reading 182-189 ns per record. The prior per-word atomic copy implementation measured 278-313 ns and 307-325 ns respectively. See the [memory-ordering contract](journal.md#memory-ordering).
 
 Do not mix these measurements with earlier record-size microbenchmarks: the workloads differ.
+
+## Cache put and hit
+
+`node scripts/bench-cache.mjs` - the keeper and the reader in one thread, no transport between them, 256-byte bodies; nine runs per process after a warm-up, three processes per arm, arms alternated. Node.js 22.23.5, four-core x86 VM (Xeon 2.1 GHz), other jobs running (load 2.7-5.6). Each cell is the range of the three processes' medians, ns per operation; within one process the runs spread 10-30%. Allocation per put was sampled separately (V8 sampling heap profiler, objects collected included).
+
+| Work | 0.14.0 | Without the put path's garbage |
+| --- | ---: | ---: |
+| `put`, the same 1,024 names over and over | 811-939 | 571-728 |
+| `put`, 4,096 names through room for 1,024 (every put evicts) | 1,470-1,665 | 991-1,408 |
+| `with`, a hit | 198-226 | 211-229 |
+| Bytes allocated per put | ~640 | ~110 |
+| Collections, 1.8 M puts over the same names | 127 | 28-31 |
+
+What went: a `Map` entry per put (the `Map` shrinks its table on each delete), the reserved view, the buddy allocator's `Set` iterators and resized tables, the `{ segment, offset }` of each placement and a closure per reserve. What is left is the `Place` and the options a reserve sends, both part of the `KeeperCalls` contract. A put into names never written costs 2-3 µs, but most of that is the first touch of a new segment's pages and the segment's allocation, not Cellar's code. A hit allocates only its view.

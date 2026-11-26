@@ -53,16 +53,69 @@ export const checkSegmentBytes = bytes=>{
 export function createBuddy(bytes){
     checkSegmentBytes(bytes);
     const top = log2(bytes / UNIT);
-    /** Free blocks by order (block = UNIT << order), as offsets. @type {Set<number>[]} */
-    const free = Array.from({ length: top + 1 }, ()=>new Set());
-    free[top].add(0);
+    const units = bytes / UNIT;
+    /*
+     * Free blocks by order (block = UNIT << order), each order a list linked
+     * through the unit its blocks start at, taken from the front and added at
+     * the back: a block is taken, joined to its twin or added with no object
+     * made, where a set of offsets made garbage on most of those changes.
+     */
+    /** By order: the unit the first free block starts at, -1 where none is free. */
+    const heads = new Int32Array(top + 1).fill(-1);
+    /** By order: the unit the last free block starts at. */
+    const tails = new Int32Array(top + 1).fill(-1);
+    /** By the unit a free block starts at: the next and previous free block of its order, -1 for none. */
+    const next = new Int32Array(units);
+    const previous = new Int32Array(units);
+    /** By the unit a free block starts at: its order, -1 where none starts. */
+    const freeOrders = new Int8Array(units).fill(-1);
     /** By the unit a block handed out starts at: its order, -1 where none starts. */
-    const orders = new Int8Array(bytes / UNIT).fill(-1);
+    const orders = new Int8Array(units).fill(-1);
     /** By the unit a block handed out starts at: whose it is (`own`). */
-    const owners = new Int32Array(bytes / UNIT);
+    const owners = new Int32Array(units);
     let given = 0;
     let used = 0;
     let asked = 0;
+
+    /** @param {number} order @param {number} unit  a block not free, added free */
+    const addFree = (order, unit)=>{
+        freeOrders[unit] = order;
+        next[unit] = -1;
+        previous[unit] = tails[order];
+        if (tails[order] >= 0)
+        {
+            next[tails[order]] = unit;
+        }
+        else
+        {
+            heads[order] = unit;
+        }
+        tails[order] = unit;
+    };
+
+    /** @param {number} unit  a free block, taken off its list */
+    const takeFree = unit=>{
+        const order = freeOrders[unit];
+        freeOrders[unit] = -1;
+        if (previous[unit] >= 0)
+        {
+            next[previous[unit]] = next[unit];
+        }
+        else
+        {
+            heads[order] = next[unit];
+        }
+        if (next[unit] >= 0)
+        {
+            previous[next[unit]] = previous[unit];
+        }
+        else
+        {
+            tails[order] = previous[unit];
+        }
+    };
+
+    addFree(top, 0);
 
     /** @param {number} length */
     const orderOf = length=>{
@@ -84,7 +137,7 @@ export function createBuddy(bytes){
             }
             const order = orderOf(length);
             let at = order;
-            while (at <= top && free[at].size === 0)
+            while (at <= top && heads[at] < 0)
             {
                 at++;
             }
@@ -92,14 +145,15 @@ export function createBuddy(bytes){
             {
                 return -1;
             }
-            const offset = /** @type {number} */ (free[at].values().next().value);
-            free[at].delete(offset);
+            const unit = heads[at];
+            takeFree(unit);
             // Split down to the order asked, the upper halves left free.
             while (at > order)
             {
                 at--;
-                free[at].add(offset + (UNIT << at));
+                addFree(at, unit + (1 << at));
             }
+            const offset = unit * UNIT;
             orders[offset / UNIT] = order;
             owners[offset / UNIT] = -1;
             given++;
@@ -122,18 +176,19 @@ export function createBuddy(bytes){
             given--;
             used -= UNIT << order;
             asked -= length;
-            let at = offset;
+            let at = offset / UNIT;
             while (order < top)
             {
-                const twin = at ^ (UNIT << order);
-                if (!free[order].delete(twin))
+                const twin = at ^ (1 << order);
+                if (freeOrders[twin] !== order)
                 {
                     break;
                 }
+                takeFree(twin);
                 at = Math.min(at, twin);
                 order++;
             }
-            free[order].add(at);
+            addFree(order, at);
         },
         /**
          * Says whose body the block at `offset` holds, for `ownersWithin`.
@@ -163,12 +218,7 @@ export function createBuddy(bytes){
                     continue;
                 }
                 // A free block starts here, of the one order it is free at.
-                let freeOrder = 0;
-                while (!free[freeOrder].has(at))
-                {
-                    freeOrder++;
-                }
-                at += UNIT << freeOrder;
+                at += UNIT << freeOrders[at / UNIT];
             }
             return found;
         },
@@ -182,7 +232,7 @@ export function createBuddy(bytes){
         largest(){
             for (let order = top; order >= 0; order--)
             {
-                if (free[order].size > 0)
+                if (heads[order] >= 0)
                 {
                     return UNIT << order;
                 }
