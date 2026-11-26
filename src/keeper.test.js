@@ -1520,6 +1520,7 @@ test('what a saved index names is read without a keeper as a keeper opening it r
     reader.put('run', bodyOf(5000, 10), { onlyCopy: true, disk: 'run' });
     step(100);
     assert.equal(keeper.save(), true);
+    /** @returns {(Uint8Array | null)[]} */
     const bytes = ()=>INDEX_FILES.map(name=>disk.files.get(name)?.slice() ?? null);
     const saved = readSaved(bytes());
     assert.ok(saved);
