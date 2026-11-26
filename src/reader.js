@@ -23,7 +23,7 @@
  */
 
 import {
-    COLD, GONE, HOT, MAX_RECORDS, MOVING, RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT,
+    COLD, GONE, HOT, MOVING, RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT,
     R_STATE, WRITING, checkName, stateWord, viewIndex,
 } from './shared.js';
 import { bytesOf } from './bytes.js';
@@ -65,17 +65,11 @@ const STALE = 5;
 const KNOWN_MOST = 1 << 16;
 
 /**
- * A name's record and where its name lies, in one number: what a reader
- * remembers of a name it found, and checks a record against once inside.
- * Exact in a double: ids are under 2^20, names under 2^25 units.
+ * What a reader remembers of a name it found: its record, and where the name
+ * lies, which a record is checked against once inside.
  *
- * @param {number} id @param {number} nameAt
+ * @typedef {{ id: number, nameAt: number }} Found
  */
-const entryOf = (id, nameAt)=>nameAt * MAX_RECORDS + id;
-/** @param {number} entry */
-const recordIn = entry=>entry & (MAX_RECORDS - 1);
-/** @param {number} entry */
-const nameIn = entry=>(entry - recordIn(entry)) / MAX_RECORDS;
 
 /**
  * @param {Object} options
@@ -101,56 +95,55 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
-     * Names this reader found, by their record and where the name lies
-     * (`entryOf`). Asked first, it spares a hit the hash and the walk over
-     * the shared index. A record no name leads to goes back to the keeper for
+     * Names this reader found (`Found`). Asked first, it spares a hit the
+     * hash and the walk over the shared index. A record no name leads to goes back to the keeper for
      * another name, so what is remembered is checked once inside (`holds`): a
      * record that is not the name's, or not hot nor cold any more, sends the
      * name to the index again.
      *
-     * @type {Map<string, number>}
+     * @type {Map<string, Found>}
      */
     const known = new Map();
 
     /**
-     * `name` looked up in the index and remembered: its entry, or -1.
+     * `name` looked up in the index and remembered, or undefined.
      *
-     * @param {string} name
+     * @param {string} name @returns {Found | undefined}
      */
     const lookUp = name=>{
         const id = index.find(name);
         if (id < 0)
         {
-            return -1;
+            return undefined;
         }
         if (known.size >= KNOWN_MOST)
         {
             known.clear();
         }
-        const entry = entryOf(id, index.matched());
-        known.set(name, entry);
-        return entry;
+        const found = { id, nameAt: index.matched() };
+        known.set(name, found);
+        return found;
     };
 
     /** What the last `readHot` read, when it answered DONE. @type {any} */
     let readValue;
 
     /**
-     * Reads the body of the name of `entry`, `length` units long, inside
-     * `read`, where it is hot here: DONE with the value in `readValue`, or why
-     * not. A hit makes no object of its own.
+     * Reads the body of the name `found`, `length` units long, inside `read`,
+     * where it is hot here: DONE with the value in `readValue`, or why not. A
+     * hit makes no object of its own.
      *
-     * @param {number} entry @param {number} length @param {(body: Uint8Array) => any} read
+     * @param {Found} found @param {number} length @param {(body: Uint8Array) => any} read
      * @returns {number} DONE, NOT_HERE_COLD, MOVED_NOW, NOT_HOT, UNSEEN or STALE
      */
-    const readHot = (entry, length, read)=>{
-        const id = recordIn(entry);
+    const readHot = (found, length, read)=>{
+        const id = found.id;
         if (!index.enter(id))
         {
             // The state first, then whose it is: a record taken for another
             // name since had that name written before its state.
             const state = index.state(id);
-            if (!index.holds(id, nameIn(entry), length))
+            if (!index.holds(id, found.nameAt, length))
             {
                 return STALE;
             }
@@ -158,7 +151,7 @@ export function createReader({ shared, segments = [], keeper }){
         }
         try
         {
-            if (!index.holds(id, nameIn(entry), length))
+            if (!index.holds(id, found.nameAt, length))
             {
                 return STALE;
             }
@@ -180,16 +173,16 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
-     * Where the name of `entry`, `length` units long, is: hot, cold (a body
-     * the keeper is moving counts as cold: there, but not read in place now),
-     * or undefined where the record says nothing of it any more.
+     * Where the name `found`, `length` units long, is: hot, cold (a body the
+     * keeper is moving counts as cold: there, but not read in place now), or
+     * undefined where the record says nothing of it any more.
      *
-     * @param {number} entry @param {number} length
+     * @param {Found} found @param {number} length
      */
-    const whereIs = (entry, length)=>{
-        const id = recordIn(entry);
+    const whereIs = (found, length)=>{
+        const id = found.id;
         const state = index.state(id);
-        if (!index.holds(id, nameIn(entry), length))
+        if (!index.holds(id, found.nameAt, length))
         {
             return undefined;
         }
@@ -266,8 +259,8 @@ export function createReader({ shared, segments = [], keeper }){
                 }
                 known.delete(name);
             }
-            const entry = lookUp(name);
-            return entry < 0 ? null : whereIs(entry, name.length) ?? null;
+            const found = lookUp(name);
+            return found === undefined ? null : whereIs(found, name.length) ?? null;
         },
 
         /**
@@ -283,28 +276,28 @@ export function createReader({ shared, segments = [], keeper }){
          */
         with(name, read, options){
             checkName(name);
-            let entry = known.get(name);
+            let found = known.get(name);
             let got = NOT_HOT;
-            if (entry !== undefined)
+            if (found !== undefined)
             {
-                got = readHot(entry, name.length, read);
+                got = readHot(found, name.length, read);
                 if (got === NOT_HOT || got === STALE)
                 {
                     // Not the name's record any more, or a record the name
                     // left: the index says which is its now.
                     known.delete(name);
-                    entry = undefined;
+                    found = undefined;
                 }
             }
-            if (entry === undefined)
+            if (found === undefined)
             {
-                entry = lookUp(name);
-                if (entry < 0)
+                found = lookUp(name);
+                if (found === undefined)
                 {
                     counts.misses++;
                     return undefined;
                 }
-                got = readHot(entry, name.length, read);
+                got = readHot(found, name.length, read);
             }
             const wait = options !== undefined && options.wait;
             // The keeper answers once whatever it was doing is done: a body it
@@ -314,8 +307,8 @@ export function createReader({ shared, segments = [], keeper }){
             {
                 counts.raisedWaiting++;
                 known.delete(name);
-                entry = lookUp(name);
-                got = entry < 0 ? NOT_HOT : readHot(entry, name.length, read);
+                found = lookUp(name);
+                got = found === undefined ? NOT_HOT : readHot(found, name.length, read);
             }
             if (got === DONE)
             {

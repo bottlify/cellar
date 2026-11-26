@@ -122,9 +122,10 @@ export const stateWord = (state, readers = 0)=>((state << 24) | readers) | 0;
  * Two 32-bit lanes of FNV-1a over the name's UTF-16 units, each from its own
  * basis, into `lanes`: the table probes by the first, a record is matched by
  * both and then by its name. Written into an array the caller keeps, so a
- * lookup makes nothing on the heap.
+ * lookup makes nothing on the heap; always an `Int32Array`, so the stores
+ * here meet one kind of array (fed two, a miss ran a third slower, V8).
  *
- * @param {string} name @param {Int32Array | number[]} lanes
+ * @param {string} name @param {Int32Array} lanes
  */
 export function hashInto(name, lanes){
     let a = 0x811c9dc5;
@@ -146,10 +147,9 @@ export function hashInto(name, lanes){
  * @returns {[number, number]}
  */
 export function hashName(name){
-    /** @type {[number, number]} */
-    const lanes = [0, 0];
+    const lanes = new Int32Array(2);
     hashInto(name, lanes);
-    return lanes;
+    return [lanes[0], lanes[1]];
 }
 
 /**
