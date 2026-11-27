@@ -643,3 +643,18 @@ test('calls failed by a close reject, and the pump of answers starts again for t
     assert.equal(client.out(), 0, 'no taker left behind');
     await assert.rejects(client.call([3]), ChannelClosed, 'a call after the close rejects');
 });
+
+test('a blocking ask to a server on the same thread is served in place, not waited for', async()=>{
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const server = openServer(memory);
+    const client = openClient(memory);
+    const serving = server.serveAsync(request=>[request[0] + 1]);
+    assert.deepEqual([...client.ask([41], { timeoutMs: 1000 })], [42]);
+    assert.equal(await serving, 0, 'the wait finds its request answered');
+    const again = server.serveAsync(request=>[request[0] * 2]);
+    assert.deepEqual([...client.ask([4], { timeoutMs: 1000 })], [8], 'the handler of the wait now');
+    await again;
+    assert.throws(()=>client.ask([1], { timeoutMs: 5 }), /no answer in 5 ms/,
+        'no wait on this thread: the serving side is taken to be elsewhere');
+});
+

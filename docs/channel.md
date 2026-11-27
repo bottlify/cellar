@@ -24,6 +24,8 @@ const valueLater = await client.call(request, { read: answer=>answer[0] });
 | `serveAsync(handler, options)` | Asynchronous serving. |
 | `close()` | Ends the channel on both sides. |
 
+A blocking `ask` to a server on the same thread that is waiting in `serveAsync` is served in place: the event loop that would answer it is the one the ask blocks, so waiting would only time out. A server on the same thread that is not waiting is taken to be served from elsewhere, and the ask waits as usual.
+
 The request and answer are read where they lie, valid only inside their synchronous callbacks. The default answer reader returns a copy; use a read callback and reusable input buffers for allocation-sensitive blocking calls. Large payloads can remain in shared memory while the request identifies their location.
 
 Inputs are byte views or arrays of integers 0-255; invalid inputs are refused. Invalid memory layouts are refused on open.

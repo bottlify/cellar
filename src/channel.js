@@ -305,6 +305,17 @@ function endOver(memory, { spinMs }){
  */
 
 /**
+ * The servers of this thread waiting for a request on its event loop
+ * (`serveAsync`), by their channel's memory, with the handler each waits
+ * with. A blocking ask to one of them cannot wait: the loop that would answer
+ * it is the one the ask blocks. It is served in place instead.
+ *
+ * @type {Map<SharedArrayBuffer, { answerAll: (handler: Handler) => number,
+ *     handler: Handler | null }>}
+ */
+const servedHere = new Map();
+
+/**
  * The asking side of a channel.
  *
  * @param {SharedArrayBuffer} memory @param {{ spinMs?: number }} [options]
@@ -569,6 +580,11 @@ export function openClient(memory, options = {}){
             }
             // Sent before it waits: a request refused leaves nothing behind.
             send(message);
+            const here = servedHere.get(memory);
+            if (here !== undefined && here.handler !== null)
+            {
+                here.answerAll(here.handler);
+            }
             try
             {
                 // Calls out before it are answered first: hand them theirs.
@@ -714,6 +730,10 @@ export function openServer(memory, options = {}){
         return answered;
     };
 
+    /** This server as an ask on its thread finds it, its handler set while a `serveAsync` waits. */
+    const here = { answerAll, handler: /** @type {Handler | null} */ (null) };
+    servedHere.set(memory, here);
+
     return {
         /**
          * Answers every request waiting; with none, blocks for one first (up to
@@ -746,7 +766,12 @@ export function openServer(memory, options = {}){
                 {
                     return Promise.resolve(answerAll(handler));
                 }
+                here.handler = handler;
+                const waited = ()=>{
+                    here.handler = null;
+                };
                 return end.waitForAsync(ASKED, taken, SERVER_SLEEPS, deadlineOf(options?.timeoutMs))
+                    .finally(waited)
                     .then(moved=>(moved ? answerAll(handler) : 0));
             }
             catch (e){
@@ -758,7 +783,14 @@ export function openServer(memory, options = {}){
         waiting: ()=>(Atomics.load(words, ASKED) - taken) >>> 0,
         /** What this side's blocking waits learnt of their spin, for diagnostics. */
         spin: end.spin,
-        close: end.close,
+        close(){
+            // A server closed answers nothing more: an ask goes to its memory as to a thread's.
+            if (servedHere.get(memory) === here)
+            {
+                servedHere.delete(memory);
+            }
+            end.close();
+        },
         closed: end.closed,
     };
 }
