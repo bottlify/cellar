@@ -260,6 +260,22 @@ test('memory held is never taken back: written and read in place by its holder f
     assert.deepEqual(keeper.under('sound/').bodies, 0);
 });
 
+test('an owner released takes its held memory with it: the room is the next body\'s at once, its'
+    + ' holder\'s view no longer the cache\'s', async()=>{
+    const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,
+        goneAfterMs: 1e6, budget: 4 * UNIT, segmentBytes: 4 * UNIT });
+    // An owner - a worker, a process - that went without letting its holds go.
+    assert.ok(reader.hold('scratch/7/rows', 2 * UNIT));
+    assert.ok(reader.hold('scratch/7/texels', UNIT));
+    assert.ok(reader.put('other', bodyOf(UNIT, 1)));
+    assert.deepEqual(keeper.release('scratch/7/'), { bodies: 2, bytes: 3 * UNIT, waiting: 0 },
+        'both held, none waiting on a reader');
+    assert.deepEqual(keeper.under('scratch/'), { bodies: 0, bytes: 0, hotBytes: 0, placedBytes: 0 });
+    step(1);
+    assert.equal(reader.put('next', bodyOf(2 * UNIT, 2)), true, 'their room given back');
+    assert.deepEqual(reader.with('other', body=>[...body]), [...bodyOf(UNIT, 1)], 'the rest kept');
+});
+
 test('a reservation never committed is taken back after abandonAfterMs, and its commit then fails',
     async()=>{
         const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,

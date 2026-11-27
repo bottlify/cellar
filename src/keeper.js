@@ -1977,6 +1977,20 @@ export async function openKeeper(options){
                 }
                 bodies++;
                 bytes += get(id, R_LENGTH);
+                // Memory held is its owner's alone and nobody reads it: the
+                // owner going is its holder going, so its room comes back now,
+                // as a reservation abandoned does - the sweep never takes it.
+                if (state === WRITING && (get(id, R_FLAGS) & F_HELD) !== 0)
+                {
+                    const word = stateWordOf(id);
+                    if (Atomics.compareExchange(words, index.at(id) + R_STATE, word,
+                        stateWord(GONE)) === word)
+                    {
+                        giveBack(id);
+                        set(id, R_FLAGS, 0);
+                        continue;
+                    }
+                }
                 // A name written anew is another record's now: its old body
                 // goes when its readers leave, by no drop.
                 if (state === RETIRED || state === RETIRED_WRITING || !drop(id))

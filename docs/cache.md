@@ -108,7 +108,7 @@ A recreatable body may go away when there is no room. An `onlyCopy` body is not 
 Choose a prefix with a delimiter for an owner's resources, for example `texels/root-42/`.
 
 - `keeper.under(prefix)` reports bodies and bytes under the prefix, and of those in memory their bytes (`hotBytes`) and the blocks they take (`placedBytes`): the difference is what rounding to blocks costs that owner.
-- `keeper.release(prefix)` drops those bodies together, including only copies, and reports what was there and what is still held by readers or writers. Deferred drops complete when the relevant use ends.
+- `keeper.release(prefix)` drops those bodies together, including only copies, and reports what was there and what is still held by readers or writers. Deferred drops complete when the relevant use ends. Memory held under the prefix (`reader.hold`) is taken back at once: the owner going is its holder going, and the sweep never takes held memory itself.
 
 Prefixes are literal string prefixes, not path or glob expressions. `figures()` includes release counters.
 
