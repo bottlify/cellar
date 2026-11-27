@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { createDoorbell, createSpin, deadlineOf, learnt, nextLooks, openDoorbell, publish, waitFor,
     waitForAsync, wake } from './bell.js';
+import { bytesPerCall } from './allocation.fixture.js';
 
 const WORD = 0;
 const SLEEPS = 1;
@@ -327,4 +328,76 @@ test('a word moved before the close is moved, not closed: the wait was for it, s
     const still = new Int32Array(new SharedArrayBuffer(12));
     assert.equal(beforeLoadOf(still, CLOSED, ()=>Atomics.store(still, CLOSED, 1),
         ()=>waitFor(still, WORD, 0, SLEEPS, Infinity, 0.05, CLOSED)), 'closed');
+});
+
+test('a wait with a deadline reads the clock before its spin and at its sleep, not as it spins',
+    ()=>{
+    // Read every few hundred looks, a timed wait that spun its whole spin made
+    // a number on the heap each time: 33 readings for a 2 ms wait spinning 1 ms.
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const now = performance.now;
+    let readings = 0;
+    performance.now = function(){
+        readings++;
+        return now.call(performance);
+    };
+    try
+    {
+        assert.equal(waitFor(words, WORD, 0, SLEEPS, now.call(performance) + 2, 1), 'timed-out');
+    }
+    finally
+    {
+        performance.now = now;
+    }
+    assert.ok(readings <= 3, `${readings} readings`);
+    assert.equal(Atomics.load(words, SLEEPS), 0);
+});
+
+test('a deadline shorter than the spin ends the spin early, the spin learning nothing of it', ()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const spin = createSpin(1);
+    const from = performance.now();
+    assert.equal(waitFor(words, WORD, 0, SLEEPS, from + 0.2, spin), 'timed-out');
+    assert.ok(performance.now() - from < 50, 'it did not spin the whole millisecond and more');
+    assert.equal(spin.looks, spin.most, 'a spin cut short by its deadline is no sleep to learn from');
+});
+
+test('a wait on the event loop that ends without sleeping makes no promise of its own', async()=>{
+    // A word already moved, a deadline passed, a channel closed: answered by a
+    // promise made once, where an async function made one a wait (393 bytes,
+    // node).
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    Atomics.store(words, WORD, 1);
+    assert.equal(await waitForAsync(words, WORD, 0, SLEEPS), 'moved');
+    assert.equal(await waitForAsync(words, WORD, 1, SLEEPS, 0), 'timed-out');
+    const bytes = await bytesPerCall(()=>waitForAsync(words, WORD, 0, SLEEPS));
+    assert.ok(bytes < 16, `${bytes.toFixed(1)} bytes a wait`);
+});
+
+test('waits on the event loop asleep at once hold a node thread with one timer, let go with the last',
+    async()=>{
+    const words = new Int32Array(new SharedArrayBuffer(12));
+    const made = setInterval;
+    let timers = 0;
+    globalThis.setInterval = /** @type {any} */ ((/** @type {any[]} */ ...args)=>{
+        timers++;
+        return /** @type {any} */ (made)(...args);
+    });
+    try
+    {
+        const waits = [0, 1, 2].map(()=>waitForAsync(words, WORD, 0, SLEEPS));
+        assert.equal(Atomics.load(words, SLEEPS), 3, 'all three asleep');
+        assert.equal(timers, 1, 'one timer holds the thread for all of them');
+        publish(words, WORD, 1, SLEEPS);
+        assert.deepEqual(await Promise.all(waits), ['woke', 'woke', 'woke']);
+        assert.equal(Atomics.load(words, SLEEPS), 0);
+        const again = waitForAsync(words, WORD, 1, SLEEPS);
+        assert.equal(timers, 2, 'let go with the last, held again by the next');
+        publish(words, WORD, 2, SLEEPS);
+        assert.equal(await again, 'woke');
+    }
+    finally
+    {
+        globalThis.setInterval = made;
+    }
 });

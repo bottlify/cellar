@@ -189,9 +189,22 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
     {
         return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
     }
-    // The clock is read only for a wait with a deadline, once in a few hundred
-    // looks: each answer of it is a number made on the heap.
-    const timed = deadline !== Infinity;
+    // A wait with a deadline reads the clock once, here, and spins no more
+    // looks than the time left holds: each answer of the clock is a number
+    // made on the heap, and read every few hundred looks a timed wait that
+    // spun its whole millisecond made 5.6 KB of them. The sleep after it reads
+    // the clock again, so a processor slower than `LOOKS_PER_MS` passes the
+    // deadline by a spin's length at most, never by a sleep.
+    let reach = most;
+    if (deadline !== Infinity)
+    {
+        const left = deadline - clock.now();
+        if (left <= 0)
+        {
+            return sleepFor(words, index, seen, sleeps, deadline, closed, bell);
+        }
+        reach = Math.min(most, looksFor(Math.min(left, MAX_SPIN_MS)));
+    }
     let looks = 1;
     for (; Atomics.load(words, index) === seen; looks++)
     {
@@ -205,8 +218,10 @@ export function waitFor(words, index, seen, sleeps, deadline = Infinity, spinMs 
                 }
                 return 'closed';
             }
-            if (looks >= most || (timed && clock.now() >= deadline))
+            if (looks >= reach)
             {
+                // A spin the deadline cut short says nothing of how long the
+                // side's waits are.
                 if (spin !== null && looks >= most)
                 {
                     spin.looks = learnt(spin, looks, true);
@@ -278,11 +293,76 @@ function sleepFor(words, index, seen, sleeps, deadline, closed, bell){
  * @param {number} [bell]  as `waitFor`'s
  * @returns {Promise<WaitEnd>}
  */
-export async function waitForAsync(words, index, seen, sleeps, deadline = Infinity,
+export function waitForAsync(words, index, seen, sleeps, deadline = Infinity,
     closed = -1, bell = index){
-    seen |= 0;
-    checkTimes(deadline, 0);
-    let slept = false;
+    // Not an async function: a wait that ends without sleeping - its word
+    // moved, its deadline passed, its channel closed - answers a promise made
+    // once (`ENDED`), and one that sleeps makes only its sleep and the one
+    // promise it is answered with: a graphics worker waiting on a channel
+    // tens of thousands of times a second made most of its garbage here.
+    try
+    {
+        seen |= 0;
+        checkTimes(deadline, 0);
+        const first = lookAsync(words, index, seen, sleeps, deadline, closed, bell);
+        return typeof first === 'string' ? ENDED[first]
+            : sleptAsync(first, words, index, seen, sleeps, deadline, closed, bell);
+    }
+    catch (e){
+        return Promise.reject(e);
+    }
+}
+
+/** What a wait on the event loop that ended without sleeping answers, by how. */
+const ENDED = Object.freeze(/** @type {Record<WaitEnd, Promise<WaitEnd>>} */ ({
+    moved: Promise.resolve('moved'),
+    woke: Promise.resolve('woke'),
+    'timed-out': Promise.resolve('timed-out'),
+    closed: Promise.resolve('closed'),
+}));
+
+/**
+ * The rest of a wait on the event loop that sleeps: each sleep awaited, then
+ * looked again (`lookAsync`).
+ *
+ * @param {Promise<unknown>} sleeping @param {Int32Array} words @param {number} index
+ * @param {number} seen @param {number} sleeps @param {number} deadline @param {number} closed
+ * @param {number} bell
+ * @returns {Promise<WaitEnd>}
+ */
+async function sleptAsync(sleeping, words, index, seen, sleeps, deadline, closed, bell){
+    for (;;)
+    {
+        try
+        {
+            await sleeping;
+        }
+        finally
+        {
+            awake(words, sleeps);
+        }
+        const end = lookAsync(words, index, seen, sleeps, deadline, closed, bell);
+        if (typeof end === 'string')
+        {
+            // It counted itself asleep: a move now is a wake.
+            return end === 'moved' ? 'woke' : end;
+        }
+        sleeping = end;
+    }
+}
+
+/**
+ * One look of a wait on the event loop, with no await: how it ended, or the
+ * promise its sleep ends with, the wait counted asleep (and the thread held)
+ * until its caller calls `awake`. The shared half of `waitForAsync` and of a
+ * caller that keeps a loop of its own (a channel's pump of answers).
+ *
+ * @param {Int32Array} words @param {number} index @param {number} seen @param {number} sleeps
+ * @param {number} deadline @param {number} closed @param {number} bell
+ * @returns {WaitEnd | Promise<unknown>}
+ */
+export function lookAsync(words, index, seen, sleeps, deadline, closed, bell){
+    let counted = false;
     while (Atomics.load(words, index) === seen)
     {
         if (closed >= 0 && Atomics.load(words, closed) !== 0)
@@ -299,7 +379,7 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
             return 'timed-out';
         }
         Atomics.add(words, sleeps, 1);
-        slept = true;
+        counted = true;
         try
         {
             const rung = bell === index ? seen : Atomics.load(words, bell);
@@ -308,38 +388,57 @@ export async function waitForAsync(words, index, seen, sleeps, deadline = Infini
             {
                 const waited = /** @type {any} */ (Atomics).waitAsync?.(words, bell, rung,
                     left === Infinity ? undefined : left);
-                if (waited?.async)
+                if (waited?.async || !waited)
                 {
-                    // Node lets a thread whose loop has only this wait end:
-                    // something of the loop's own keeps it while it waits. A
-                    // browser keeps its threads, and the wait costs no timer there.
-                    const holding = NODE ? setInterval(()=>{}, 1 << 30) : null;
-                    try
-                    {
-                        await waited.value;
-                    }
-                    finally
-                    {
-                        if (holding !== null)
-                        {
-                            clearInterval(holding);
-                        }
-                    }
-                }
-                else if (!waited)
-                {
+                    hold();
                     // No waitAsync here: look again on a later turn of the loop.
-                    await new Promise(resolve=>setTimeout(resolve, 1));
+                    return waited ? waited.value : new Promise(resolve=>setTimeout(resolve, 1));
                 }
             }
         }
-        finally
-        {
+        catch (e){
             Atomics.sub(words, sleeps, 1);
+            throw e;
         }
+        // The bell moved before the sleep began: off the count, and look again.
+        Atomics.sub(words, sleeps, 1);
     }
-    return slept ? 'woke' : 'moved';
+    return counted ? 'woke' : 'moved';
 }
+
+/**
+ * Ends a sleep `lookAsync` began: the wait off the count of `sleeps`, and the
+ * thread let go.
+ *
+ * @param {Int32Array} words @param {number} sleeps
+ */
+export function awake(words, sleeps){
+    Atomics.sub(words, sleeps, 1);
+    letGo();
+}
+
+/** The waits on the event loop asleep in this thread, and what holds it for them. */
+let held = 0;
+/** @type {ReturnType<typeof setInterval> | null} */
+let holding = null;
+/**
+ * Node lets a thread whose loop has only async waits end: something of the
+ * loop's own keeps it while any sleeps, one for all of them, not a timer
+ * made a sleep. A browser keeps its threads, and a wait costs no timer there.
+ */
+const hold = ()=>{
+    if (NODE && held++ === 0)
+    {
+        holding = setInterval(()=>{}, 1 << 30);
+    }
+};
+const letGo = ()=>{
+    if (NODE && --held === 0 && holding !== null)
+    {
+        clearInterval(holding);
+        holding = null;
+    }
+};
 
 /**
  * Wakes the waits asleep on `words[index]`, which the caller has just stored,

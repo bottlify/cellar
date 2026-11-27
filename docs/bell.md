@@ -12,7 +12,7 @@ A registered wait is not necessarily physically asleep. A worker terminated duri
 
 Blocking waits can learn how many times to inspect the shared word before sleeping. A wait that still has to sleep decreases the next spin budget by one eighth down to a floor. A wait that sees a move keeps twice the work it needed; one in sixteen explores the full spin budget. This reduces wasted CPU when the other thread does long work, while preserving responsiveness for short handoffs.
 
-`createSpin`, `doorbell.spin`, `ring.roomSpin` and a Channel end's `spin` expose this mechanism. An explicit `spinMs` selects a fixed budget instead. `SPIN_MS` is approximate: the budget is counted in looks, not elapsed time; an infinite blocking wait does not read the clock. A spin may not exceed one second. Invalid times are refused.
+`createSpin`, `doorbell.spin`, `ring.roomSpin` and a Channel end's `spin` expose this mechanism. An explicit `spinMs` selects a fixed budget instead. `SPIN_MS` is approximate: the budget is counted in looks, not elapsed time; an infinite blocking wait does not read the clock, and one with a deadline reads it once before its spin, which it cuts to the time left, and once a sleep: on a processor slower than the count assumes, a deadline is passed by a spin at most. Async waits that end without sleeping answer a promise made once; in node, the async waits asleep in a thread hold it with one timer between them. A spin may not exceed one second. Invalid times are refused.
 
 ## Doorbell
 
