@@ -13,7 +13,7 @@
  * times wake the other side only when it sleeps, and lose no wake.
  */
 
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { handlersOf, reference, treeOf } from './link-gate.fixture.js';
@@ -21,6 +21,30 @@ import { createLinkMemory, openLink } from './link.js';
 
 const WORKER = new URL('./link.worker.fixture.js', import.meta.url);
 const SEEDS = 24;
+
+/**
+ * What a test left open - its workers, its side of a link - is ended after
+ * it: a gate that fails or runs out of time then ends the file with its
+ * failure, rather than holding the file open for good. Each gate's time is
+ * ten times or more what a passing run takes (2 s, 2 s and 0.2 s on a loaded
+ * four-core VM).
+ *
+ * @type {Set<{ terminate?: () => any, close?: () => any }>}
+ */
+const left = new Set();
+afterEach(async()=>{
+    for (const each of left)
+    {
+        await (each.terminate?.() ?? each.close?.());
+    }
+    left.clear();
+});
+/** A worker of the fixture, ended after the test. @param {any} workerData */
+const worker = workerData=>{
+    const made = new Worker(WORKER, { workerData });
+    left.add(made);
+    return made;
+};
 
 /** @param {Worker} worker @returns {Promise<any>} */
 const resultOf = worker=>new Promise((resolve, reject)=>{
@@ -36,13 +60,13 @@ const expected = (seed, wordsFromB)=>{
 };
 
 test('trees of calls between two blocking threads are answered as in one thread, in its order',
-    { timeout: 300_000 }, async()=>{
+    { timeout: 20_000 }, async()=>{
         for (let seed = 1; seed <= SEEDS; seed++)
         {
             const { a, b } = createLinkMemory({ capacity: 16 * 1024 });
-            const sideB = new Worker(WORKER, { workerData: { role: 'b', end: a, seed, wordsFromB: true } });
+            const sideB = worker({ role: 'b', end: a, seed, wordsFromB: true });
             const served = resultOf(sideB);
-            const sideA = new Worker(WORKER, { workerData: { role: 'a', end: b, seed, wordsFromB: true } });
+            const sideA = worker({ role: 'a', end: b, seed, wordsFromB: true });
             const asked = await resultOf(sideA);
             const { log } = await served;
             const want = expected(seed, true);
@@ -54,7 +78,7 @@ test('trees of calls between two blocking threads are answered as in one thread,
     });
 
 test('trees of calls between a blocking thread and one serving on its event loop are answered as'
-    + ' in one thread', { timeout: 300_000 }, async()=>{
+    + ' in one thread', { timeout: 20_000 }, async()=>{
     for (let seed = 101; seed <= 100 + SEEDS; seed++)
     {
         const { a, b } = createLinkMemory({ capacity: 16 * 1024 });
@@ -65,8 +89,9 @@ test('trees of calls between a blocking thread and one serving on its event loop
         let link = null;
         const { handlers, words } = handlersOf(nodes, ()=>link, log, false);
         link = openLink(a, handlers, { words });
+        left.add(link);
         const serving = link.serve();
-        const sideA = new Worker(WORKER, { workerData: { role: 'a', end: b, seed, wordsFromB: false } });
+        const sideA = worker({ role: 'a', end: b, seed, wordsFromB: false });
         const asked = await resultOf(sideA);
         await serving;
         const want = expected(seed, false);
@@ -86,8 +111,9 @@ test('trees of calls between a blocking thread and one serving on its event loop
 async function handTurns(rounds, mineMs, theirsMs){
     const { a, b } = createLinkMemory({ capacity: 4096, words: 1 });
     const link = openLink(a, {}, { spinMs: mineMs });
-    const worker = new Worker(WORKER, { workerData: { role: 'words', end: b, rounds, spinMs: theirsMs } });
-    const theirs = resultOf(worker);
+    left.add(link);
+    const other = worker({ role: 'words', end: b, rounds, spinMs: theirsMs });
+    const theirs = resultOf(other);
     const began = performance.now();
     for (let round = 0; round < rounds; round++)
     {
@@ -98,7 +124,7 @@ async function handTurns(rounds, mineMs, theirsMs){
     }
     const counts = await theirs;
     const elapsedMs = performance.now() - began;
-    await worker.terminate();
+    await other.terminate();
     const sleeps = new Int32Array(a.in.bell.buffer)[a.in.bell.index + 1];
     assert.equal(sleeps, 0, 'no sleeper left counted');
     return { mine: link.diagnostics(), theirs: counts, elapsedMs };
@@ -126,7 +152,7 @@ function assertLooksFirst(run, mineMs, theirsMs){
 }
 
 test('a word call answered while the other side looks wakes nothing, and one it sleeps through'
-    + ' wakes it', { timeout: 120_000 }, async()=>{
+    + ' wakes it', { timeout: 5_000 }, async()=>{
     // Both always asleep by the other's turn: every turn wakes the other, or
     // the hand-over would stop for good.
     const asleep = await handTurns(2000, 0, 0);

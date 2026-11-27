@@ -4,12 +4,39 @@
  * See LICENSE for details
  */
 
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { LinkClosed, createLinkMemory, openLink } from './link.js';
 
 const LINK = new URL('./link.js', import.meta.url).href;
+
+/**
+ * What a test left open - its workers, its sides of links - is ended after
+ * it: a test that fails or runs out of time then ends the file with its
+ * failure, rather than holding the file open for good.
+ *
+ * @type {Set<{ terminate?: () => any, close?: () => any }>}
+ */
+const left = new Set();
+afterEach(async()=>{
+    for (const each of left)
+    {
+        await (each.terminate?.() ?? each.close?.());
+    }
+    left.clear();
+});
+/** `openLink`, the side ended after the test. @type {typeof openLink} */
+const open = (end, handlers, options)=>{
+    const link = openLink(end, handlers, options);
+    left.add(link);
+    return link;
+};
+/** A worker, ended after the test. @param {Worker} worker */
+const kept = worker=>{
+    left.add(worker);
+    return worker;
+};
 
 /**
  * A thread that runs `body` with its side of a link open, and posts what it
@@ -21,7 +48,7 @@ const LINK = new URL('./link.js', import.meta.url).href;
  * @param {string} [options]  an expression for the options it opens with
  */
 const blockingThread = (end, body, handlers = '{}', options = '{}')=>new Promise((resolve, reject)=>{
-    const worker = new Worker(`
+    const worker = kept(new Worker(`
         const { workerData, parentPort } = require('node:worker_threads');
         import(workerData.module).then(({ openLink })=>{
             let link;
@@ -30,7 +57,7 @@ const blockingThread = (end, body, handlers = '{}', options = '{}')=>new Promise
             const run = ()=>{ ${body} };
             try { parentPort.postMessage({ value: run() }); }
             catch (e) { parentPort.postMessage({ error: String(e.message) }); }
-        });`, { eval: true, workerData: { module: LINK, end } });
+        });`, { eval: true, workerData: { module: LINK, end } }));
     worker.once('message', message=>{
         worker.terminate();
         if ('error' in message)
@@ -50,7 +77,7 @@ test('a blocked side is answered by the other, in order, failures and all', { ti
         const { a, b } = createLinkMemory();
         /** @type {Map<string, Uint8Array>} */
         const values = new Map();
-        const system = openLink(a, { registry: {
+        const system = open(a, { registry: {
             set: (/** @type {string} */ name, /** @type {Uint8Array} */ data)=>{
                 values.set(name, data);
                 return values.size;
@@ -85,7 +112,7 @@ test('the serving side asks a blocked side back while it waits, and is answered'
         const { a, b } = createLinkMemory();
         /** @type {ReturnType<typeof openLink>} */
         let system;
-        system = openLink(a, { windows: {
+        system = open(a, { windows: {
             find: async(/** @type {string} */ title)=>
                 [await system.call('endpoint', 'describe', [title]), 'found'],
         } });
@@ -107,8 +134,8 @@ test('two blocked sides: one\'s call needs the other, which is itself waiting on
             release = ()=>resolve('released');
         });
         // The second side waits here until the first's call is done.
-        const toTwo = openLink(two.a, { system: { hold: ()=>held } });
-        const toOne = openLink(one.a, { windows: {
+        const toTwo = open(two.a, { system: { hold: ()=>held } });
+        const toOne = open(one.a, { windows: {
             post: async(/** @type {number} */ value)=>{
                 const echoed = await toTwo.call('endpoint', 'take', [value]);
                 release();
@@ -132,7 +159,7 @@ test('calls back and forth nest forty deep, each answered at its own depth', { t
         const { a, b } = createLinkMemory({ capacity: 4096 });
         // Two blocking sides: each answers `down(n)` by asking the other for `down(n - 1)`.
         const handlers = `{ t: { down: n => n === 0 ? [] : [n, ...link.ask('t', 'down', [n - 1])] } }`;
-        const other = new Worker(`
+        const other = kept(new Worker(`
             const { workerData } = require('node:worker_threads');
             import(workerData.module).then(({ openLink })=>{
                 let link;
@@ -140,7 +167,7 @@ test('calls back and forth nest forty deep, each answered at its own depth', { t
                 // Serves until the link closes.
                 const seen = () => link.bell.seen();
                 for (;;) { const s = seen(); link.pump(); if (link.closed()) break; link.bell.wait(s); }
-            });`, { eval: true, workerData: { module: LINK, end: a } });
+            });`, { eval: true, workerData: { module: LINK, end: a } }));
         const answer = await blockingThread(b, 'const got = link.ask(\'t\', \'down\', [40]); link.close();'
             + ' return got;', handlers);
         assert.deepEqual(answer, Array.from({ length: 40 }, (_, i)=>40 - i));
@@ -161,14 +188,14 @@ test('two blocked sides call each other at once, each served while it waits', { 
             while (!globalThis.done) { const s = link.bell.seen(); link.pump(); if (!globalThis.done) link.bell.wait(s, 1000); }
             return got.every((v, i) => v === '${name}' + 2 * i);`;
         const run = (/** @type {any} */ end, /** @type {string} */ name)=>new Promise((resolve, reject)=>{
-            const worker = new Worker(`
+            const worker = kept(new Worker(`
                 const { workerData, parentPort } = require('node:worker_threads');
                 import(workerData.module).then(({ openLink })=>{
                     const link = openLink(workerData.end, { t: {
                         twice: n => '${name === 'a' ? 'b' : 'a'}' + 2 * n,
                         done: () => { globalThis.done = true; } } });
                     parentPort.postMessage((()=>{ ${body(name)} })());
-                });`, { eval: true, workerData: { module: LINK, end, gate } });
+                });`, { eval: true, workerData: { module: LINK, end, gate } }));
             worker.once('message', value=>{
                 worker.terminate();
                 resolve(value);
@@ -183,7 +210,7 @@ test('a side waiting on a call of its own handles the calls after it in their or
         const { a, b } = createLinkMemory();
         /** @type {any[]} */
         const read = [];
-        const system = openLink(a, {
+        const system = open(a, {
             processes: { start: ()=>{
                 read.push(system.call('parent', 'read', [1]), system.call('parent', 'read', [2]));
                 return true;
@@ -213,7 +240,7 @@ test('answers that come out of nesting order each reach the wait they are for', 
         let answerOuter = ()=>{};
         /** @type {ReturnType<typeof openLink>} */
         let system;
-        system = openLink(a, { t: {
+        system = open(a, { t: {
             // The outer call is answered only once the inner one is asked...
             outer: ()=>{
                 system.call('side', 'nest', []).catch(()=>{});
@@ -242,7 +269,7 @@ test('answers that come out of nesting order each reach the wait they are for', 
 test('a failure crosses with what it says of itself, not only its message', { timeout: 20000 },
     async()=>{
         const { a, b } = createLinkMemory();
-        const system = openLink(a, { volume: {
+        const system = open(a, { volume: {
             read: ()=>{
                 throw Object.assign(new Error('blocks are missing'),
                     { code: 'BLOCK_MISS', blocks: [{ index: 3, offset: 0, packed: 7 }], drop: ()=>0 });
@@ -255,7 +282,7 @@ test('a failure crosses with what it says of itself, not only its message', { ti
         assert.deepEqual(answer, { message: 'blocks are missing', code: 'BLOCK_MISS',
             blocks: [{ index: 3, offset: 0, packed: 7 }], drop: undefined });
         // And the other way, to a promise.
-        const back = openLink(b, { endpoint: { fail: ()=>{
+        const back = open(b, { endpoint: { fail: ()=>{
             throw Object.assign(new Error('no window'), { code: 1400 });
         } } });
         const asked = system.call('endpoint', 'fail');
@@ -269,7 +296,7 @@ test('a failure crosses with what it says of itself, not only its message', { ti
 test('an answer that cannot cross reaches the caller as a failure, and the link goes on',
     { timeout: 20000 }, async()=>{
         const { a, b } = createLinkMemory();
-        const system = openLink(a, { odd: { handler: ()=>()=>0, plain: ()=>42 } });
+        const system = open(a, { odd: { handler: ()=>()=>0, plain: ()=>42 } });
         const serving = system.serve();
         const answer = await blockingThread(b, `
             let failed = null;
@@ -286,7 +313,7 @@ test('calls that together overflow the ring all cross, the writer waiting for ro
     { timeout: 20000 }, async()=>{
         const { a, b } = createLinkMemory({ capacity: 4096 });
         let total = 0;
-        const system = openLink(a, { sink: { take: (/** @type {Uint8Array} */ bytes)=>{
+        const system = open(a, { sink: { take: (/** @type {Uint8Array} */ bytes)=>{
             total += bytes.length;
             return total;
         } } });
@@ -305,7 +332,7 @@ test('a call and an answer longer than a ring holds cross in parts, whole and in
         const { a, b } = createLinkMemory({ capacity: 64 * 1024 });
         const big = (/** @type {number} */ size, /** @type {number} */ seed)=>
             Uint8Array.from({ length: size }, (_, at)=>(at * 31 + seed) & 0xff);
-        const system = openLink(a, { volume: {
+        const system = open(a, { volume: {
             read: (/** @type {number} */ size)=>big(size, 7),
             sum: (/** @type {Uint8Array} */ bytes)=>bytes.reduce((sum, byte)=>(sum + byte) >>> 0, 0),
         } });
@@ -329,7 +356,7 @@ test('a call and an answer longer than a ring holds cross in parts, whole and in
 test('a side counts what it asked of the other and how long it waited, by target and method',
     { timeout: 20000 }, async()=>{
         const { a, b } = createLinkMemory();
-        const system = openLink(a, { registry: { get: ()=>1 }, ids: { take: ()=>2 } });
+        const system = open(a, { registry: { get: ()=>1 }, ids: { take: ()=>2 } });
         const serving = system.serve();
         const counted = await blockingThread(b, `
             for (let i = 0; i < 3; i++) link.ask('registry', 'get', []);
@@ -348,20 +375,20 @@ test('what a side said before the link closed is heard', { timeout: 20000 }, asy
     const { a, b } = createLinkMemory();
     /** @type {number[]} */
     const heard = [];
-    const system = openLink(a, { events: { emit: (/** @type {number} */ n)=>void heard.push(n) } });
+    const system = open(a, { events: { emit: (/** @type {number} */ n)=>void heard.push(n) } });
     const serving = system.serve();
     await new Promise(resolve=>setImmediate(resolve));
     // The other side tells and ends while this thread is held, and the link
     // is closed before the serving side had a turn to look.
     const done = new Int32Array(new SharedArrayBuffer(4));
-    const worker = new Worker(`
+    const worker = kept(new Worker(`
         const { workerData } = require('node:worker_threads');
         import(workerData.module).then(({ openLink })=>{
             const link = openLink(workerData.end, {});
             for (let i = 0; i < 20; i++) link.call('events', 'emit', [i]);
             Atomics.store(workerData.done, 0, 1);
             Atomics.notify(workerData.done, 0);
-        });`, { eval: true, workerData: { module: LINK, end: b, done } });
+        });`, { eval: true, workerData: { module: LINK, end: b, done } }));
     Atomics.wait(done, 0, 0, 10000);
     system.close();
     await serving;
@@ -372,10 +399,10 @@ test('what a side said before the link closed is heard', { timeout: 20000 }, asy
 test('a closed link fails the calls still waiting on it and every call after, on both sides',
     { timeout: 20000 }, async()=>{
         const { a, b } = createLinkMemory();
-        const system = openLink(a, {});
+        const system = open(a, {});
         const serving = system.serve();
         // The other side never answers: a thread that died.
-        const gone = openLink(b, {});
+        const gone = open(b, {});
         const asked = system.call('endpoint', 'find', [7]);
         const told = gone.call('events', 'emit', [1]);
         system.close();
@@ -393,8 +420,8 @@ test('a closed link fails the calls still waiting on it and every call after, on
 test('a side that closes the link closes it for the other, and a call in another thread waiting'
     + ' for room to write is let go', { timeout: 60000 }, async t=>{
     const memory = createLinkMemory({ capacity: 4096 });
-    const here = openLink(memory.a, {});
-    const there = openLink(memory.b, { echo: { back: (/** @type {any} */ value)=>value } });
+    const here = open(memory.a, {});
+    const there = open(memory.b, { echo: { back: (/** @type {any} */ value)=>value } });
     const serving = there.serve();
     here.close();
     await serving;
@@ -404,15 +431,15 @@ test('a side that closes the link closes it for the other, and a call in another
     // A call far longer than the ring, from a thread that may block: its parts
     // fill the ring nobody here reads, and it waits for room - until the close.
     const other = createLinkMemory({ capacity: 4096 });
-    const quiet = openLink(other.a, {});
-    const caller = new Worker(`
+    const quiet = open(other.a, {});
+    const caller = kept(new Worker(`
         const { parentPort, workerData } = require('node:worker_threads');
         import(workerData.module).then(({ openLink })=>{
             const link = openLink(workerData.end, {});
             parentPort.postMessage('calling');
             try { link.ask('nobody', 'home', [new Uint8Array(1 << 16)]); parentPort.postMessage('answered'); }
             catch (e) { parentPort.postMessage(e.message); }
-        });`, { eval: true, workerData: { module: LINK, end: other.b } });
+        });`, { eval: true, workerData: { module: LINK, end: other.b } }));
     caller.unref();
     t.after(()=>caller.terminate());
     /** @type {string[]} */
@@ -441,8 +468,8 @@ test('a record is decoded where it lies in the ring, not copied out of it first'
     const { a, b } = createLinkMemory();
     /** @type {number[][]} */
     const taken = [];
-    const system = openLink(a, {});
-    const other = openLink(b, { endpoint: {
+    const system = open(a, {});
+    const other = open(b, { endpoint: {
         take: (/** @type {number[]} */ values)=>void taken.push(values),
     } });
     const values = Array.from({ length: 200 }, (_, i)=>i * 7);
@@ -475,12 +502,12 @@ test('a record is decoded where it lies in the ring, not copied out of it first'
 
 test('a blocking call to a side of the same thread is served in place, values and words', ()=>{
     const { a, b } = createLinkMemory();
-    const served = openLink(a, { math: { double: (/** @type {number} */ n)=>n * 2 } }, {
+    const served = open(a, { math: { double: (/** @type {number} */ n)=>n * 2 } }, {
         words: (request, answer)=>{
             answer[0] = request[0] + request[1];
         },
     });
-    const asking = openLink(b, {});
+    const asking = open(b, {});
     // The serving side has no turn of its own: this thread is held by the asks.
     assert.equal(asking.ask('math', 'double', [21]), 42);
     asking.request[0] = 40;
@@ -490,8 +517,8 @@ test('a blocking call to a side of the same thread is served in place, values an
     assert.equal(asking.answer[0], 42);
     // One whose answer waits for this thread's event loop could never come.
     const { a: a2, b: b2 } = createLinkMemory();
-    openLink(a2, { slow: { one: async()=>1 } });
-    assert.throws(()=>openLink(b2, {}).ask('slow', 'one'), /in this thread and answered nothing/);
+    open(a2, { slow: { one: async()=>1 } });
+    assert.throws(()=>open(b2, {}).ask('slow', 'one'), /in this thread and answered nothing/);
     served.close();
 });
 
@@ -500,8 +527,8 @@ test('word calls go both ways at once, nested, and a failure crosses as a value'
     /** @type {ReturnType<typeof openLink>} */
     let process;
     // The executor of a slice: it calls back for each trap while the slice is out.
-    const executor = openLink(b, {});
-    process = openLink(a, {}, { words: (request, answer)=>{
+    const executor = open(b, {});
+    process = open(a, {}, { words: (request, answer)=>{
         if (request[0] < 0)
         {
             throw Object.assign(new Error('no handler'), { code: 5 });
@@ -540,6 +567,6 @@ test('word calls go both ways at once, nested, and a failure crosses as a value'
 
 test('memory that is no link is refused', ()=>{
     const { a } = createLinkMemory();
-    assert.throws(()=>openLink({ ...a, words: new SharedArrayBuffer(64) }), /not a link/);
+    assert.throws(()=>open({ ...a, words: new SharedArrayBuffer(64) }), /not a link/);
     assert.throws(()=>createLinkMemory({ words: -1 }), RangeError);
 });
