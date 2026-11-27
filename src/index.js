@@ -10,7 +10,8 @@
  * writer, any readers, the oldest written over), calls between two threads
  * (channels) and both ways with values (links), tables of numbers one
  * thread stores and any reads, and a cache of bodies in shared memory read
- * in place by name, under one budget, idle ones on the disk (OPFS).
+ * in place by name, under one budget, idle ones on the disk (OPFS), its
+ * keeper reached from any thread by one binary protocol (remote keeper).
  */
 
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
@@ -20,6 +21,7 @@ export { SPIN_MS, createDoorbell, createSpin, deadlineOf, mayWait, openDoorbell,
     waitFor, waitForAsync } from './bell.js';
 export { RingClosed, createRingMemory, openRing } from './ring.js';
 export { LinkClosed, createLinkMemory, openLink } from './link.js';
+export { answerKeeper, keeperHandlers, linkCarrier, openKeeperClient, serveKeeperChannel } from './remote.js';
 export { decodeValue, encodeValue, textOf } from './codec.js';
 export { createJournalMemory, openJournal } from './journal.js';
 export { createTableMemory, openTable } from './table.js';
@@ -30,6 +32,7 @@ export { createTableMemory, openTable } from './table.js';
 /** @typedef {import('./keeper.js').DiskFile} DiskFile */
 /** @typedef {import('./reader.js').Reader} Reader */
 /** @typedef {import('./reader.js').KeeperCalls} KeeperCalls */
+/** @typedef {import('./reader.js').Place} Place */
 /** @typedef {import('./shared.js').SharedIndex} SharedIndex */
 /** @typedef {import('./channel.js').ChannelOptions} ChannelOptions */
 /** @typedef {import('./channel.js').Handler} ChannelHandler */
@@ -44,5 +47,8 @@ export { createTableMemory, openTable } from './table.js';
 /** @typedef {import('./link.js').Link} Link */
 /** @typedef {import('./link.js').Handlers} LinkHandlers */
 /** @typedef {import('./link.js').WordsHandler} WordsHandler */
+/** @typedef {import('./remote.js').KeeperServed} KeeperServed */
+/** @typedef {import('./remote.js').Carrier} KeeperCarrier */
+/** @typedef {import('./remote.js').KeeperClient} KeeperClient */
 /** @typedef {import('./table.js').TableMemory} TableMemory */
 /** @typedef {import('./table.js').Table} Table */

@@ -95,3 +95,19 @@ Do not mix these measurements with earlier record-size microbenchmarks: the work
 | Collections, 1.8 M puts over the same names | 127 | 28-31 |
 
 What went: a `Map` entry per put (the `Map` shrinks its table on each delete), the reserved view, the buddy allocator's `Set` iterators and resized tables, the `{ segment, offset }` of each placement and a closure per reserve. What is left is the `Place` and the options a reserve sends, both part of the `KeeperCalls` contract. A put into names never written costs 2-3 µs, but most of that is the first touch of a new segment's pages and the segment's allocation, not Cellar's code. A hit allocates only its view.
+
+## Remote keeper
+
+`node --expose-gc --max-semi-space-size=128 scripts/bench-remote.mjs 9 3000` - a reserve of 256 bytes, 3,000 a round, nine rounds after a warm-up, the keeper on the main thread and the reader's calls from a worker. Node.js 22.23.5, four-core x86 VM (Xeon 2.1 GHz), other jobs running (load 2.8-3.0). Three processes; each cell is the range of their medians, µs a reserve; within one process the rounds spread up to tenfold, the slowest where the other jobs took a core. Bytes are the heap's growth over a round, a reserve, on each thread. The JSON arm is the protocol it replaced (each request `JSON.stringify` over the same channel, the answer `JSON.parse`d), measured beside it in the same minutes from a script outside the repository.
+
+| Work | µs a reserve | Bytes, worker / keeper's thread |
+| --- | ---: | ---: |
+| `keeper.reserve` on its own thread | 0.53-0.58 | - / 210-274 |
+| Remote keeper over a channel, blocking | 2.2-11 | 137 / 423-475 |
+| The same, the keeper's thread blocked in `serve` | 3.2-6.1 | 137-169 / 417-424 |
+| Remote keeper over a channel, each `reserveLater` awaited | 26-34 | 499-517 / 485-509 |
+| Remote keeper over a link, blocking | 28-32 | 211-815 / 294-317 |
+| JSON over a channel, blocking | 25-28 | 50 / 455-588 |
+| JSON over a channel, each call awaited | 58-60 | 290-383 / 581-605 |
+
+The blocking channel's best rounds are 1.5-2.4 µs, three to four times the keeper's own reserve; its median is the other jobs'. What a reserve allocates on the keeper's thread is its `Place` and options (as on its own thread) and the name read into a string; the worker's is the `Place` the reader is handed. An awaited call costs two turns of the event loops. Heap growth is not a sampling profile: the JSON arm's 50 bytes on the worker is lower than its strings should make, and not explained. The link carries the same bytes as a value (`codec.js`), which costs its record and promise a call: it is the carrier where the keeper's thread waits on the asking one, not the fast one.

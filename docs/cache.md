@@ -1,6 +1,6 @@
 # Cache - Keeper and Reader
 
-[Home](../README.md) · [Channel](channel.md) · [Benchmarks](benchmarks.md)
+[Home](../README.md) · [Remote keeper](remote.md) · [Channel](channel.md) · [Benchmarks](benchmarks.md)
 
 One Keeper places named byte bodies in shared segments, manages their memory budget, and optionally keeps cold bodies on disk. Each thread has a Reader. Hot reads need no call to the Keeper; reservation and promotion from disk do.
 
@@ -8,11 +8,11 @@ A body of up to a quarter of `segmentBytes` (a page at least) takes a block of a
 
 ## Page and worker
 
-Here the Keeper runs on the page without a disk. For OPFS synchronous handles, run the Keeper in a worker. The Channel is just one possible transport for KeeperCalls.
+Here the Keeper runs on the page without a disk. For OPFS synchronous handles, run the Keeper in a worker. A Reader on another thread reaches the Keeper through the [remote keeper](remote.md).
 
 ```js
 // page.js
-import { createChannel, openKeeper, openServer } from '@bottlify/cellar';
+import { answerKeeper, createChannel, openKeeper, serveKeeperChannel } from '@bottlify/cellar';
 
 let worker;
 const keeper = await openKeeper({
@@ -23,20 +23,7 @@ const keeper = await openKeeper({
 setInterval(()=>keeper.sweep(), 1000);
 
 const channel = createChannel();
-const server = openServer(channel);
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-(async()=>{
-    for (;;)
-    {
-        await server.serveAsync(request=>{
-            const { op, name, length, options } = JSON.parse(decoder.decode(request.slice())); // a browser decodes no shared view
-            const answer = op === 'reserve' ? keeper.reserve(name, length, options)
-                : op === 'raise' ? keeper.raise(name, options) : keeper.drop(name);
-            return encoder.encode(JSON.stringify(answer));
-        });
-    }
-})();
+serveKeeperChannel(channel, answerKeeper({ keeper }));
 
 worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 worker.postMessage({ shared: keeper.shared, segments: keeper.segmentBuffers(), channel });
@@ -44,10 +31,8 @@ worker.postMessage({ shared: keeper.shared, segments: keeper.segmentBuffers(), c
 
 ```js
 // worker.js
-import { createReader, openClient } from '@bottlify/cellar';
+import { createReader, openClient, openKeeperClient } from '@bottlify/cellar';
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 let cache = null;
 self.onmessage = ({ data })=>{
     if (data.shared === undefined)
@@ -55,15 +40,8 @@ self.onmessage = ({ data })=>{
         cache.adopt(data);
         return;
     }
-    const client = openClient(data.channel);
-    const send = call=>encoder.encode(JSON.stringify(call));
-    const ask = call=>JSON.parse(decoder.decode(client.ask(send(call))));
-    cache = createReader({ shared: data.shared, segments: data.segments, keeper: {
-        reserve: (name, length, options)=>ask({ op: 'reserve', name, length, options }),
-        raise: (name, options)=>ask({ op: 'raise', name, options }),
-        raiseLater: name=>{ client.call(send({ op: 'raise', name })).catch(()=>{}); },
-        drop: name=>{ client.call(send({ op: 'drop', name })).catch(()=>{}); },
-    } });
+    const { keeper } = openKeeperClient(openClient(data.channel));
+    cache = createReader({ shared: data.shared, segments: data.segments, keeper });
 
     if (cache.put('blocks/42', Uint8Array.of(1, 2, 3)))
     {
