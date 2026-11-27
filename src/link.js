@@ -37,7 +37,7 @@
  * of this thread serves that side in place, which only it can do then.
  */
 
-import { SPIN_MS, serveHere, servedHere } from './bell.js';
+import { SPIN_MS, mayWait, serveHere, servedHere } from './bell.js';
 import { decodeValue, encodeValue } from './codec.js';
 import { RingClosed, createRingMemory, openRing } from './ring.js';
 
@@ -216,8 +216,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      *     what: string }>}
      */
     const waiting = new Map();
-    /** Whether this thread may block: never the page's own. */
-    const canBlock = typeof Atomics.wait === 'function' && typeof globalThis.window === 'undefined';
+    const canBlock = mayWait();
 
     /**
      * Records not yet written whole, in order, and how far into the first its

@@ -8,9 +8,9 @@
  * @bottlify/cellar - shared-memory primitives for multithreaded JavaScript:
  * the bell two threads wait on each other by, byte rings, journals (one
  * writer, any readers, the oldest written over), calls between two threads
- * (channels) and both ways with values (links), and a cache of bodies in
- * shared memory read in place by name, under one budget, idle ones on the
- * disk (OPFS).
+ * (channels) and both ways with values (links), tables of numbers one
+ * thread stores and any reads, and a cache of bodies in shared memory read
+ * in place by name, under one budget, idle ones on the disk (OPFS).
  */
 
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
