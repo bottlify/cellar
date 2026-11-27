@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { BELLS, CLOSED_WORD, COUNTS, ChannelClosed, ChannelFailed, createChannel, openClient,
     openServer } from './channel.js';
+import { bytesPerCall } from './allocation.fixture.js';
 
 /** A handler answering each request with its bytes reversed. @param {Uint8Array} request */
 const reversed = request=>request.slice().reverse();
@@ -587,4 +588,58 @@ test('memory that is not a channel of this layout is refused at open, not read a
     assert.throws(()=>openServer(memory), /not a channel/, 'slots past the memory\'s end');
     words[7] = 4;
     assert.equal(openClient(memory).out(), 0);
+});
+
+test('a call answered makes its answer\'s promise and its one wait, not a pump a call', async()=>{
+    // An async call, its taker's record and closures, a pump started for it
+    // with its catch and finally, and a wait wrapped twice: 4.3 KB a call
+    // (node, whose async hooks count a promise dear), most of a graphics
+    // worker's garbage in a game. What is left is the answer's promise, the
+    // sleep on the answers' word and the one reaction to it.
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const client = openClient(memory);
+    const server = openServer(memory);
+    const message = new Uint8Array([1, 2, 3]);
+    const answer = new Uint8Array([4]);
+    const handler = ()=>answer;
+    const options = { read: (/** @type {Uint8Array} */ bytes)=>bytes[0] };
+    const pending = client.call(message, options);
+    server.serve(handler);
+    assert.equal(await pending, 4);
+    const bytes = await bytesPerCall(()=>{
+        const answered = client.call(message, options);
+        server.serve(handler);
+        return answered;
+    });
+    assert.ok(bytes < 1600, `${bytes.toFixed(0)} bytes a call`);
+    assert.equal(client.out(), 0);
+});
+
+test('a serve on the event loop with a request waiting makes its answer\'s promise alone',
+    async()=>{
+    // An async serve and a wait wrapped around the bell's: a call and
+    // its serve (node, 9 KB), where now the serve is one promise beside the call's.
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const client = openClient(memory);
+    const server = openServer(memory);
+    const message = new Uint8Array([1]);
+    const handler = ()=>message;
+    const options = { read: (/** @type {Uint8Array} */ bytes)=>bytes[0] };
+    const settled = Promise.resolve();
+    const bytes = await bytesPerCall(()=>Promise.all([client.call(message, options),
+        server.serveAsync(handler)]), { empty: ()=>Promise.all([settled, settled]) });
+    assert.ok(bytes < 3200, `${bytes.toFixed(0)} bytes a call served`);
+});
+
+test('calls failed by a close reject, and the pump of answers starts again for the next', async()=>{
+    const memory = createChannel({ slots: 4, slotBytes: 64 });
+    const client = openClient(memory);
+    const out = [client.call([1]), client.call([2])];
+    client.close();
+    for (const call of out)
+    {
+        await assert.rejects(call, ChannelClosed);
+    }
+    assert.equal(client.out(), 0, 'no taker left behind');
+    await assert.rejects(client.call([3]), ChannelClosed, 'a call after the close rejects');
 });

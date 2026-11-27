@@ -35,7 +35,7 @@
  * between that look and the wait is either seen by the look or rung for.
  */
 
-import { createSpin, deadlineOf, publish as publishWord, waitFor as waitWord,
+import { awake, createSpin, deadlineOf, lookAsync, publish as publishWord, waitFor as waitWord,
     waitForAsync as waitWordAsync } from './bell.js';
 import { bytesOf } from './bytes.js';
 
@@ -272,15 +272,8 @@ function endOver(memory, { spinMs }){
      * @param {number} counter @param {number} seen @param {number} sleeps @param {number} deadline
      * @returns {Promise<boolean>}
      */
-    const waitForAsync = async(counter, seen, sleeps, deadline)=>{
-        const end = await waitWordAsync(words, counter, seen, sleeps, deadline, CLOSED,
-            bellOf(counter));
-        if (end === 'closed')
-        {
-            throw new ChannelClosed();
-        }
-        return end !== 'timed-out';
-    };
+    const waitForAsync = (counter, seen, sleeps, deadline)=>waitWordAsync(words, counter, seen,
+        sleeps, deadline, CLOSED, bellOf(counter)).then(movedOrClosed);
 
     return {
         words, requests, answers, slots, slotAt, writeSlot, writeFailure, failureAt, publish,
@@ -323,14 +316,47 @@ export function openClient(memory, options = {}){
     let asked = Atomics.load(words, ASKED);
     let read = Atomics.load(words, READ);
     /**
-     * Who takes each answer still out, in the order the requests went.
+     * Who takes each answer still out, in the order the requests went: a
+     * ring of as many as there are slots (no more requests are out), from
+     * `first`, `takers` of them, each a reader and its promise's two ends.
+     * Kept for the channel's life, not a record a call: a dropped ask's
+     * reader is null.
      *
-     * @type {{ read: ReadAnswer<any>, resolve: (value: any) => void,
-     *     reject: (reason: any) => void }[]}
+     * @type {(ReadAnswer<any> | null)[]}
      */
-    const waiting = [];
-    /** @type {Promise<void> | null} */
-    let pumping = null;
+    const readers = new Array(slots).fill(null);
+    /** @type {((value: any) => void)[]} */
+    const resolves = new Array(slots).fill(IGNORED);
+    /** @type {((reason: any) => void)[]} */
+    const rejects = new Array(slots).fill(IGNORED);
+    let first = 0;
+    let takers = 0;
+    /** Whether the pump of answers runs (`pump`). */
+    let pumping = false;
+
+    /**
+     * A taker for the request just sent, last in the ring.
+     *
+     * @param {ReadAnswer<any> | null} reader
+     * @param {(value: any) => void} resolve @param {(reason: any) => void} reject
+     */
+    const addTaker = (reader, resolve, reject)=>{
+        const at = (first + takers) & (slots - 1);
+        readers[at] = reader;
+        resolves[at] = resolve;
+        rejects[at] = reject;
+        takers++;
+    };
+    /** The reader the next call's promise is made for (`parkCall`). @type {ReadAnswer<any>} */
+    let parking = copy;
+    /**
+     * The executor of every call's promise: one function, not a closure a call.
+     *
+     * @param {(value: any) => void} resolve @param {(reason: any) => void} reject
+     */
+    const parkCall = (resolve, reject)=>{
+        addTaker(parking, resolve, reject);
+    };
 
     /** An answer is being read: a request made from inside its reading would take its slot. */
     let reading = false;
@@ -362,17 +388,25 @@ export function openClient(memory, options = {}){
 
     /** Hands the next answer, read in place, to whoever asked for it. */
     const takeAnswer = ()=>{
-        const taker = /** @type {(typeof waiting)[number]} */ (waiting.shift());
+        const at = first;
+        const reader = readers[at] ?? DROPPED;
+        const resolve = resolves[at];
+        const reject = rejects[at];
+        readers[at] = null;
+        resolves[at] = IGNORED;
+        rejects[at] = IGNORED;
+        first = (first + 1) & (slots - 1);
+        takers--;
         let value;
         try
         {
-            value = readNext(taker.read);
+            value = readNext(reader);
         }
         catch (e){
-            taker.reject(e);
+            reject(e);
             return;
         }
-        taker.resolve(value);
+        resolve(value);
     };
 
     const notReading = ()=>{
@@ -404,33 +438,110 @@ export function openClient(memory, options = {}){
         end.publish(ASKED, asked, SERVER_SLEEPS);
     };
 
-    /** Answers already written, handed to their takers; then waits for more while any are out. */
-    const pump = async()=>{
-        while (waiting.length > 0)
+    /**
+     * Answers already written, handed to their takers; then a sleep on the
+     * answers' word while any are out, and the same again when it ends. A
+     * loop of callbacks made once, not an async function a call: a call made
+     * one, its catch and its finally, and each wait two more promises of its
+     * own, where now a wait is its sleep and the one reaction to it.
+     */
+    const pump = ()=>{
+        try
         {
-            while (waiting.length > 0 && Atomics.load(words, ANSWERED) !== read)
+            for (;;)
             {
-                takeAnswer();
+                while (takers > 0 && Atomics.load(words, ANSWERED) !== read)
+                {
+                    takeAnswer();
+                }
+                if (takers === 0)
+                {
+                    pumping = false;
+                    return;
+                }
+                const sleep = lookAsync(words, ANSWERED, read, CLIENT_SLEEPS, Infinity, CLOSED,
+                    CLIENT_BELL);
+                if (typeof sleep !== 'string')
+                {
+                    sleep.then(pumpWoke);
+                    return;
+                }
+                if (sleep === 'closed')
+                {
+                    throw new ChannelClosed();
+                }
             }
-            if (waiting.length > 0)
+        }
+        catch (reason){
+            // Every answer still out fails with the pump: a closed channel
+            // answers none of them.
+            pumping = false;
+            while (takers > 0)
             {
-                await end.waitForAsync(ANSWERED, read, CLIENT_SLEEPS, Infinity);
+                const reject = rejects[first];
+                readers[first] = null;
+                resolves[first] = IGNORED;
+                rejects[first] = IGNORED;
+                first = (first + 1) & (slots - 1);
+                takers--;
+                reject(reason);
             }
         }
     };
+    const pumpWoke = ()=>{
+        awake(words, CLIENT_SLEEPS);
+        pump();
+    };
     const startPump = ()=>{
-        pumping ??= pump().catch(reason=>{
-            for (const taker of waiting.splice(0))
+        if (!pumping)
+        {
+            pumping = true;
+            pump();
+        }
+    };
+
+    /**
+     * A call with room for its request: sent, and answered when its answer
+     * comes (`pump`).
+     *
+     * @template T @param {ArrayLike<number>} message @param {ReadAnswer<T>} readAnswer
+     * @returns {Promise<T>}
+     */
+    const callNow = (message, readAnswer)=>{
+        send(message);
+        parking = readAnswer;
+        const answered = new Promise(parkCall);
+        parking = copy;
+        startPump();
+        return answered;
+    };
+
+    /**
+     * A call that waits for room first: a slot frees with each answer.
+     *
+     * @template T @param {ArrayLike<number>} message @param {ReadAnswer<T>} readAnswer
+     * @returns {Promise<T>}
+     */
+    const callWhenRoom = async(message, readAnswer)=>{
+        while ((asked - read) >>> 0 >= slots)
+        {
+            // A close fails the calls out and frees no slot: waiting on
+            // would turn this loop for ever, the thread's timers with it.
+            if (end.closed())
             {
-                taker.reject(reason);
+                throw new ChannelClosed();
             }
-        }).finally(()=>{
-            pumping = null;
-            if (waiting.length > 0)
+            // One answer is waited for, not all.
+            if (Atomics.load(words, ANSWERED) === read)
             {
-                startPump();
+                await end.waitForAsync(ANSWERED, read, CLIENT_SLEEPS, Infinity);
             }
-        });
+            while (takers > 0 && Atomics.load(words, ANSWERED) !== read)
+            {
+                takeAnswer();
+            }
+        }
+        return callNow(message, readAnswer);
     };
 
     return {
@@ -461,7 +572,7 @@ export function openClient(memory, options = {}){
             try
             {
                 // Calls out before it are answered first: hand them theirs.
-                while (waiting.length > 0)
+                while (takers > 0)
                 {
                     if (Atomics.load(words, ANSWERED) === read
                         && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
@@ -482,7 +593,7 @@ export function openClient(memory, options = {}){
                 // serving side writes one (it answers what was asked before a
                 // close), goes to nobody. Every request out has a taker: one
                 // without would leave the next answer taken by nobody's reader.
-                waiting.push(DROPPED);
+                addTaker(null, IGNORED, IGNORED);
                 throw e;
             }
             return readNext(readAnswer);
@@ -498,37 +609,24 @@ export function openClient(memory, options = {}){
          * @param {{ read?: ReadAnswer<T> }} [options]
          * @returns {Promise<T>}
          */
-        async call(message, { read: readAnswer = /** @type {any} */ (copy) } = {}){
-            notReading();
-            while ((asked - read) >>> 0 >= slots)
+        call(message, options){
+            // What fails here rejects, as an async function's would: the
+            // call itself is not one, so that a call with room makes its
+            // answer's promise and nothing else.
+            try
             {
-                // A close fails the calls out and frees no slot: waiting on
-                // would turn this loop for ever, the thread's timers with it.
-                if (end.closed())
-                {
-                    throw new ChannelClosed();
-                }
-                // A slot frees with each answer: one is waited for, not all.
-                if (Atomics.load(words, ANSWERED) === read)
-                {
-                    await end.waitForAsync(ANSWERED, read, CLIENT_SLEEPS, Infinity);
-                }
-                while (waiting.length > 0 && Atomics.load(words, ANSWERED) !== read)
-                {
-                    takeAnswer();
-                }
+                notReading();
+                const readAnswer = /** @type {ReadAnswer<T>} */ (options?.read ?? copy);
+                return (asked - read) >>> 0 >= slots ? callWhenRoom(message, readAnswer)
+                    : callNow(message, readAnswer);
             }
-            send(message);
-            /** @type {Promise<T>} */
-            const answered = new Promise((resolve, reject)=>{
-                waiting.push({ read: readAnswer, resolve, reject });
-            });
-            startPump();
-            return answered;
+            catch (e){
+                return Promise.reject(e);
+            }
         },
 
         /** Requests out, not answered yet. */
-        out: ()=>waiting.length,
+        out: ()=>takers,
         /** What this side's blocking waits learnt of their spin, for diagnostics. */
         spin: end.spin,
         close: end.close,
@@ -539,8 +637,23 @@ export function openClient(memory, options = {}){
 /** @param {Uint8Array} bytes */
 const copy = bytes=>bytes.slice();
 
-/** Who takes the answer of an ask that gave up waiting for it. */
-const DROPPED = Object.freeze({ read: ()=>undefined, resolve: ()=>{}, reject: ()=>{} });
+/**
+ * Whether a wait on a channel's word saw it move: a close is ChannelClosed.
+ *
+ * @param {import('./bell.js').WaitEnd} end
+ */
+const movedOrClosed = end=>{
+    if (end === 'closed')
+    {
+        throw new ChannelClosed();
+    }
+    return end !== 'timed-out';
+};
+
+/** How the answer of an ask that gave up waiting for it is read: not at all. */
+const DROPPED = ()=>undefined;
+/** Where the answer of an ask that gave up waiting for it goes: nowhere. */
+const IGNORED = ()=>{};
 
 /**
  * @typedef {(request: Uint8Array) => ArrayLike<number> | undefined | void} Handler
@@ -624,13 +737,21 @@ export function openServer(memory, options = {}){
          * @param {Handler} handler @param {{ timeoutMs?: number }} [options]
          * @returns {Promise<number>}
          */
-        async serveAsync(handler, { timeoutMs } = {}){
-            if (Atomics.load(words, ASKED) === taken
-                && !await end.waitForAsync(ASKED, taken, SERVER_SLEEPS, deadlineOf(timeoutMs)))
+        serveAsync(handler, options){
+            // Not an async function, as `call`: a serve with requests waiting
+            // makes its answer's promise and nothing else.
+            try
             {
-                return 0;
+                if (Atomics.load(words, ASKED) !== taken)
+                {
+                    return Promise.resolve(answerAll(handler));
+                }
+                return end.waitForAsync(ASKED, taken, SERVER_SLEEPS, deadlineOf(options?.timeoutMs))
+                    .then(moved=>(moved ? answerAll(handler) : 0));
             }
-            return answerAll(handler);
+            catch (e){
+                return Promise.reject(e);
+            }
         },
 
         /** Requests written and not answered yet. */
