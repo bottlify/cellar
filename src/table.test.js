@@ -67,16 +67,68 @@ test('a ring of rows reads oldest first once it has lapped', ()=>{
     assert.deepEqual(openTable(table.memory).all().map(row=>row.index), [2, 3, 4]);
 });
 
-test('a cell is an integer: a value set is rounded, and one that is not finite throws', ()=>{
+test('a cell is an integer either way of zero: a value set is rounded, one not finite throws', ()=>{
     const table = openTable(createTableMemory({ rows: 1, columns: ['ns'] }));
     table.set(0, 0, 2.6);
     table.add(0, 0, -0.4);
     assert.equal(table.get(0, 0), 3);
-    table.set(0, 0, 2 ** 53);
-    table.add(0, 0, 2 ** 53);
-    assert.equal(table.get(0, 0), 2 ** 54, 'past 2^32 and 2^53 the count goes on');
+    table.add(0, 0, -5);
+    assert.equal(table.get(0, 0), -2, 'below zero');
+    table.set(0, 0, -1);
+    assert.equal(table.get(0, 0), -1);
+    table.add(0, 0, 2 ** 32 + 2);
+    assert.equal(table.get(0, 0), 2 ** 32 + 1, 'back past zero and past 2^32');
+    table.set(0, 0, 2 ** 52);
+    table.add(0, 0, 2 ** 52);
+    assert.equal(table.get(0, 0), 2 ** 53);
+    table.set(0, 0, -(2 ** 53));
+    assert.equal(table.get(0, 0), -(2 ** 53));
     assert.throws(()=>table.set(0, 0, NaN), RangeError);
     assert.throws(()=>table.add(0, 0, Infinity), RangeError);
+});
+
+test('a cell its writer left between its two words is said, not read as a number', ()=>{
+    const memory = createTableMemory({ rows: 1, columns: ['n'] });
+    const table = openTable(memory);
+    table.set(0, 0, 7);
+    // What a writer that stopped after marking the high word busy leaves.
+    new Uint32Array(memory.buffer, 8)[1] = 0x40000000;
+    assert.throws(()=>table.get(0, 0), /half-written/);
+});
+
+test('a reader on another thread sees a counter added to across the carry into its high word',
+    { timeout: 60_000 }, async()=>{
+    // Each add carries every other time: a read of the low word of one value
+    // and the high word of another is off the lattice `STEP * n`.
+    const STEP = 2 ** 31 + 1;
+    const LAST = 2_000_000;
+    const memory = createTableMemory({ rows: 1, columns: ['count'] });
+    const table = openTable(memory);
+    table.use(1);
+    const ready = new Int32Array(new SharedArrayBuffer(4));
+    const reader = onWorker(`
+        const table = openTable(data.memory);
+        Atomics.store(data.ready, 0, 1);
+        let last = 0;
+        let bad = null;
+        for (;;)
+        {
+            const value = table.get(0, 0);
+            const n = value / data.STEP;
+            if (!Number.isInteger(n) || n < last) { bad = value; break; }
+            last = n;
+            if (n === data.LAST) break;
+        }
+        parentPort.postMessage(bad);`, { memory, ready, STEP, LAST });
+    while (Atomics.load(ready, 0) === 0)
+    {
+        await new Promise(resolve=>setTimeout(resolve, 1));
+    }
+    for (let n = 1; n <= LAST; n++)
+    {
+        table.add(0, 0, STEP);
+    }
+    assert.equal(await reader, null);
 });
 
 test('a table of no rows or no columns is refused', ()=>{
