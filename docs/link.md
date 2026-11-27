@@ -29,11 +29,11 @@ await link.serve();                           // until either side closes the li
 | `serve()` | Pumps on the event loop until the link closes. |
 | `bell` | This side's doorbell, for a thread that waits on the link with other work. |
 | `close()`, `closed()` | Ends the link for both sides. |
-| `diagnostics()`, `counts` | What this side asked and how long it waited; what it sent, woke and slept. |
+| `diagnostics()` | What this side sent, woke and slept, and what it asked and how long it waited. |
 
 ## Values and failures
 
-Arguments and answers are values of `codec.js`: undefined, null, booleans, numbers, strings, byte arrays, and arrays and plain objects of them. Anything else is refused when written. A record is decoded where it lies in the ring; byte arrays and strings decoded from it are copies of their own. A record longer than the ring's longest goes in parts, one after another, and is decoded once the last is in. Large data is better not sent: name where it lies (a body in the [cache](cache.md), a range of a shared buffer) and send the name.
+Arguments and answers are values of `codec.js`: undefined, null, booleans, numbers, strings, byte arrays, and arrays and plain objects of them. Anything else is refused when written. A record is decoded where it lies in the ring; byte arrays and strings decoded from it are copies of their own. A record longer than the ring's longest goes in parts, one after another, each carrying the whole's length, and is decoded once that many bytes are in. Large data is better not sent: name where it lies (a body in the [cache](cache.md), a range of a shared buffer) and send the name.
 
 A handler that throws answers with its failure: the caller throws an `Error` with the same message and every own property that can cross (`code`, a list of what was missing). An answer that cannot cross is a failure too. A call to a target or method nobody answers fails with `link: nothing answers target.method`.
 
@@ -47,7 +47,7 @@ link.sendWords();                  // or: sendWords() then waitWords() to block
 if (link.answered()) use(link.answer[0]);
 ```
 
-The other side answers with a `words(request, answer)` handler run by `pump`, or takes the call itself with `takeWords()` (the request, or null) and answers it later with `reply` and `answerWords()`. The two sides' word calls nest: one side's call can be out while it answers the other's. A handler that throws fails the call; the asker's `answered` or `waitWords` throws the failure. Word calls and value calls are each in order, not in order with each other.
+The other side answers with a `words(request, answer)` handler run by `pump`, so also inside any wait, or takes the call itself with `takeWords()` (the request, or null) and answers it later with `reply` and `answerWords()`; both answer through `answerWords`. The two sides' word calls nest: one side's call can be out while it answers the other's. A handler that throws, or `answerWords(failure)`, fails the call; the asker's `answered` or `waitWords` throws the failure. Word calls and value calls are each in order, not in order with each other.
 
 `afterSend` runs after every send has rung the other side, for a side whose peer must also be told another way, such as a word its running loop polls.
 
@@ -55,6 +55,6 @@ The other side answers with a `words(request, answer)` handler run by `pump`, or
 
 Blocking waits look at the doorbell before they sleep: for `spinMs`, for what a function `spinMs` returns as each wait begins, or by default as long as the side's waits learnt to ([adaptive spin](bell.md#adaptive-spin)). A side that serves on its event loop looks briefly after it handled something, then waits asynchronously.
 
-When both sides are in one thread, a blocking `ask` or `waitWords` serves the other side in place, since the thread it would wait for is the one it blocks. An answer that would need the event loop (a handler returning a promise) cannot come then, and the call throws rather than wait for ever.
+When both sides are in one thread, a blocking `ask` or `waitWords` serves the other side in place, since the thread it would wait for is the one it blocks; it is the same mechanism a [channel](channel.md)'s blocking `ask` serves a `serveAsync` of its thread with. An answer that would need the event loop (a handler returning a promise) cannot come then, and the call throws rather than wait for ever.
 
-A thread that may block waits for room when the ring is full; one that may not keeps what it could not write for its next pump. `close()` closes both rings: calls waiting fail with `LinkClosed` (its `closed` is true), calls after fail at once, and a side waiting for room is let go. What the other side wrote before the close is still handled by `serve`.
+A thread that may block waits for room when the ring is full; one that may not keeps what it could not write for its next pump. `close()` closes both rings: calls waiting fail with `LinkClosed`, calls after fail at once, and a side waiting for room is let go. What the other side wrote before the close is still handled by `serve`.

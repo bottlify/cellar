@@ -37,7 +37,7 @@
  * of this thread serves that side in place, which only it can do then.
  */
 
-import { SPIN_MS } from './bell.js';
+import { SPIN_MS, serveHere, servedHere } from './bell.js';
 import { decodeValue, encodeValue } from './codec.js';
 import { RingClosed, createRingMemory, openRing } from './ring.js';
 
@@ -47,7 +47,8 @@ const ANSWER = 1;
 const WORDS_FAILED = 2;
 /**
  * A part of a record too long for the ring: no value's first byte (`codec.js`),
- * then whether it is the last, then the whole record's length, then its bytes.
+ * the whole record's length in the word after, then its bytes; the whole is in
+ * once that many have come.
  */
 const PART = 0xff;
 const PART_HEAD = 8;
@@ -69,7 +70,7 @@ const FAILED = 2;
 const CALL_HEAD = 3;
 
 /** A link's rings, each way, by default: what a call and its values fit in, many times over. */
-export const LINK_BYTES = 1 << 20;
+const LINK_BYTES = 1 << 20;
 
 /** Why a call ended without its answer: the link is closed, or closing, and nothing will answer it. */
 export class LinkClosed extends Error {
@@ -77,8 +78,6 @@ export class LinkClosed extends Error {
     constructor(what){
         super(`link: ${what}: the link is closed`);
         this.name = 'LinkClosed';
-        /** Tells it apart from the other side's own failure. */
-        this.closed = true;
     }
 }
 
@@ -111,8 +110,7 @@ const failureOf = e=>{
 };
 
 /** The failure `failureOf` made, an Error again. @param {any} failure */
-const errorOf = failure=>Object.assign(new Error(failure?.message ?? 'link: the call failed'),
-    { ...failure, message: undefined }, { message: failure?.message });
+const errorOf = ({ message, ...said })=>Object.assign(new Error(message), said);
 
 /**
  * One side of a link's memory: the ring it writes, the ring it reads (its
@@ -160,21 +158,14 @@ export function createLinkMemory({ capacity = LINK_BYTES, words = 4, bellA, bell
  */
 
 /**
- * What answers the other side's word calls in `pump`: the request's words and
- * the answer's, both where they lie; it writes the answer before it returns. A
- * throw is the call's failure. Without one, this side takes word calls itself
- * (`takeWords`, `answerWords`).
+ * What answers the other side's word calls in `pump`, so at any depth of a
+ * wait: the request's words and the answer's, both where they lie; it writes
+ * the answer before it returns, and a throw is the call's failure. A side
+ * whose answer cannot be made in one turn (a slice run between turns of its
+ * event loop) has none, and takes the call itself (`takeWords`, `answerWords`).
  *
  * @typedef {(request: Int32Array, answer: Int32Array) => void} WordsHandler
  */
-
-/**
- * The sides open in this thread, by the ring each reads: a side that waits for
- * an answer from one of them serves it in place, as nothing else would.
- *
- * @type {WeakMap<SharedArrayBuffer, { pump: () => number }>}
- */
-const openHere = new WeakMap();
 
 /**
  * One side of a link.
@@ -199,15 +190,11 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         throw new Error('link: the memory is not a link of this layout');
     }
     const stride = CALL_HEAD + 2 * size;
-    /** This side's word call, and the other side's. */
     const mine = HEAD_WORDS + end.side * stride;
     const theirs = HEAD_WORDS + (1 - end.side) * stride;
     /** Waits look this long, or as the side's waits learnt to (undefined). */
     const look = typeof spinMs === 'function' ? spinMs : ()=>spinMs;
-    /**
-     * What this side sent (records and word calls and their answers), the
-     * word sends that woke the other side asleep, and this side's waits that slept.
-     */
+    /** Its records and word sends, the word sends that woke the other side, its waits that slept. */
     const counts = { sent: 0, woke: 0, slept: 0 };
     /** A word send, and whether it woke the other side. @param {boolean} notified */
     const sent = notified=>{
@@ -220,21 +207,17 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     };
 
     let nextId = 1;
-    /** Answers to calls a wait here is for, by id. @type {Map<number, { ok: boolean, value: any }>} */
-    const arrived = new Map();
     /**
-     * Calls this side was handed a promise for.
+     * The calls not answered yet, by id, whether a promise or a wait is
+     * handed their answer: each answer settles its own, in whatever order
+     * the answers come.
      *
      * @type {Map<number, { resolve: (value: any) => void, reject: (error: Error) => void,
      *     what: string }>}
      */
-    const promised = new Map();
-    /** The ids of the calls a wait here is for: an answer to one goes to `arrived`. */
-    const awaited = new Set();
+    const waiting = new Map();
     /** Whether this thread may block: never the page's own. */
     const canBlock = typeof Atomics.wait === 'function' && typeof globalThis.window === 'undefined';
-    /** The step of a part: the record's room less the part's head. */
-    const step = outbound.maxRecord - PART_HEAD;
 
     /**
      * Records not yet written whole, in order, and how far into the first its
@@ -247,46 +230,6 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     const unsent = [];
     let unsentAt = 0;
     const partWords = new DataView(outbound.bytes.buffer);
-    /** @param {boolean} block */
-    const writeUnsent = block=>{
-        while (unsent.length > 0)
-        {
-            const record = unsent[0];
-            if (unsentAt === 0 && record.length <= outbound.maxRecord)
-            {
-                if (!outbound.write(record) && !(block && outbound.writeWaiting(record)))
-                {
-                    return;
-                }
-                counts.sent++;
-            }
-            else
-            {
-                while (unsentAt < record.length)
-                {
-                    const length = Math.min(step, record.length - unsentAt);
-                    let at = outbound.reserve(PART_HEAD + length);
-                    if (at < 0)
-                    {
-                        if (!block)
-                        {
-                            return;
-                        }
-                        at = outbound.reserveWaiting(PART_HEAD + length);
-                    }
-                    outbound.bytes[at] = PART;
-                    outbound.bytes[at + 1] = unsentAt + length === record.length ? 1 : 0;
-                    partWords.setUint32(at + 4, record.length, true);
-                    outbound.bytes.set(record.subarray(unsentAt, unsentAt + length), at + PART_HEAD);
-                    outbound.commit();
-                    counts.sent++;
-                    unsentAt += length;
-                }
-                unsentAt = 0;
-            }
-            unsent.shift();
-        }
-    };
     /**
      * Writes what waits to be written; a ring the other side closed takes
      * nothing more, and what waited goes to nobody.
@@ -296,7 +239,33 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     const flush = block=>{
         try
         {
-            writeUnsent(block);
+            for (; unsent.length > 0; unsent.shift(), unsentAt = 0)
+            {
+                const record = unsent[0];
+                const head = record.length > outbound.maxRecord ? PART_HEAD : 0;
+                do
+                {
+                    const length = Math.min(outbound.maxRecord - head, record.length - unsentAt);
+                    let at = outbound.reserve(head + length);
+                    if (at < 0)
+                    {
+                        if (!block)
+                        {
+                            return;
+                        }
+                        at = outbound.reserveWaiting(head + length);
+                    }
+                    if (head > 0)
+                    {
+                        outbound.bytes[at] = PART;
+                        partWords.setUint32(at + 4, record.length, true);
+                    }
+                    outbound.bytes.set(record.subarray(unsentAt, unsentAt + length), at + head);
+                    outbound.commit();
+                    counts.sent++;
+                    unsentAt += length;
+                } while (unsentAt < record.length);
+            }
         }
         catch (e){
             if (e instanceof RingClosed)
@@ -328,9 +297,10 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     };
 
     /**
-     * An answer that cannot cross - a handler that returned what the codec
-     * does not carry - goes as the failure it is: the caller is told, and the
-     * side answering, which serves every call, goes on.
+     * Answers call `id` with a value, or (`ok` false) the failure thrown. An
+     * answer that cannot cross - a handler that returned what the codec does
+     * not carry - goes as the failure it is: the caller is told, and the side
+     * answering, which serves every call, goes on.
      *
      * @param {number} id @param {boolean} ok @param {any} value
      */
@@ -338,7 +308,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         let record;
         try
         {
-            record = encodeValue([ANSWER, id, ok, value]);
+            record = encodeValue([ANSWER, id, ok, ok ? value : failureOf(value)]);
         }
         catch (e){
             record = encodeValue([ANSWER, id, false, failureOf(e)]);
@@ -348,25 +318,24 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
 
     /** @param {number} id @param {string} target @param {string} method @param {any[]} args */
     const dispatch = (id, target, method, args)=>{
-        const handler = handlers[target]?.[method];
-        if (!handler)
-        {
-            answer(id, false, failureOf(new Error(`link: nothing answers ${target}.${method}`)));
-            return;
-        }
         let result;
         try
         {
+            const handler = handlers[target]?.[method];
+            if (!handler)
+            {
+                throw new Error(`link: nothing answers ${target}.${method}`);
+            }
             result = handler(...args);
         }
         catch (e){
-            answer(id, false, failureOf(e));
+            answer(id, false, e);
             return;
         }
         if (typeof result?.then === 'function')
         {
             result.then((/** @type {any} */ value)=>answer(id, true, value),
-                (/** @type {any} */ e)=>answer(id, false, failureOf(e)));
+                (/** @type {any} */ e)=>answer(id, false, e));
             return;
         }
         answer(id, true, result);
@@ -403,7 +372,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             }
             whole.set(bytes.subarray(PART_HEAD), wholeAt);
             wholeAt += bytes.length - PART_HEAD;
-            if (bytes[1] === 1)
+            if (wholeAt === whole.length)
             {
                 const record = whole;
                 whole = null;
@@ -431,23 +400,18 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             return;
         }
         const [, id, ok, value] = record;
-        const waiting = promised.get(id);
-        if (waiting)
+        const call = waiting.get(id);
+        if (call)
         {
-            promised.delete(id);
+            waiting.delete(id);
             if (ok)
             {
-                waiting.resolve(value);
+                call.resolve(value);
             }
             else
             {
-                waiting.reject(errorOf(value));
+                call.reject(errorOf(value));
             }
-            return;
-        }
-        if (awaited.has(id))
-        {
-            arrived.set(id, { ok, value });
         }
     };
 
@@ -461,11 +425,25 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     let wordsAsked = Atomics.load(words, mine + ASKED);
     let wordsOut = false;
 
-    /** Publishes the answer to the word call taken. @param {boolean} failed */
-    const publishAnswer = failed=>{
+    /**
+     * Answers the word call taken with what `reply` holds, or with `failure`,
+     * sent as a value before the answer's count: the asking side has it when
+     * it sees the answer.
+     *
+     * @param {unknown} [failure]
+     */
+    const answerWords = failure=>{
+        if (!holding)
+        {
+            throw new Error('link: an answer with no word call taken');
+        }
+        if (failure !== undefined)
+        {
+            unlessClosed(()=>send(encodeValue([WORDS_FAILED, failureOf(failure)])));
+        }
         holding = false;
         wordsTaken = (wordsTaken + 1) | 0;
-        words[theirs + FAILED] = failed ? 1 : 0;
+        words[theirs + FAILED] = failure === undefined ? 0 : 1;
         Atomics.store(words, theirs + ANSWERED, wordsTaken);
         sent(outbound.bell.ring());
     };
@@ -484,17 +462,15 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         {
             return 0;
         }
+        let failure;
         try
         {
             /** @type {WordsHandler} */ (wordsHandler)(asked, reply);
         }
         catch (e){
-            // Sent before the answer's count: the asking side has it when it sees the answer.
-            unlessClosed(()=>send(encodeValue([WORDS_FAILED, failureOf(e)])));
-            publishAnswer(true);
-            return 1;
+            failure = e ?? new Error('link: a word call failed');
         }
-        publishAnswer(false);
+        answerWords(failure);
         return 1;
     };
 
@@ -504,10 +480,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      * How many there were.
      */
     const pump = ()=>{
-        if (unsent.length > 0)
-        {
-            unlessClosed(()=>flush(false));
-        }
+        unlessClosed(()=>flush(false));
         let count = inbound.drain(take);
         while (taken.length > 0)
         {
@@ -559,7 +532,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         {
             const seen = bell.seen();
             pump();
-            if (id < 0 ? wordsIn() : arrived.has(id))
+            if (id < 0 ? wordsIn() : !waiting.has(id))
             {
                 return;
             }
@@ -569,15 +542,15 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             {
                 throw new LinkClosed(what);
             }
-            const peer = openHere.get(end.out.control);
-            if (peer !== undefined)
+            // The other side is in this thread, which this wait holds: it
+            // answers here, or never.
+            const served = servedHere(end.out.control);
+            if (served > 0)
             {
-                // The other side is in this thread, which this wait holds: it
-                // answers here, or never.
-                if (peer.pump() > 0)
-                {
-                    continue;
-                }
+                continue;
+            }
+            if (served === 0)
+            {
                 throw new Error(`link: ${what}: the other side is in this thread and answered`
                     + ' nothing in place');
             }
@@ -598,18 +571,40 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      * now, and a caller left waiting would hold whatever it holds for good.
      */
     const failWaiting = ()=>{
-        for (const [id, waiting] of [...promised])
+        for (const [id, call] of [...waiting])
         {
-            promised.delete(id);
-            waiting.reject(new LinkClosed(waiting.what));
+            waiting.delete(id);
+            call.reject(new LinkClosed(call.what));
+        }
+    };
+
+    /**
+     * Sends call `id`, its answer to `resolve` or `reject`; a link closed
+     * fails it with `LinkClosed`, which it throws.
+     *
+     * @param {number} id @param {string} target @param {string} method @param {any[]} args
+     * @param {(value: any) => void} resolve @param {(error: Error) => void} reject
+     */
+    const sendCall = (id, target, method, args, resolve, reject)=>{
+        const what = `${target}.${method}`;
+        try
+        {
+            if (state.closed)
+            {
+                throw new RingClosed();
+            }
+            waiting.set(id, { resolve, reject, what });
+            send(encodeValue([CALL, id, target, method, args]));
+        }
+        catch (e){
+            waiting.delete(id);
+            throw e instanceof RingClosed ? new LinkClosed(what) : e;
         }
     };
 
     const self = {
         bell,
         pump,
-        /** What this side sent, the sends that woke the other side, and its waits that slept. */
-        counts,
 
         /**
          * Calls the other side and hands back a promise of its answer, which
@@ -619,23 +614,9 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
          * @returns {Promise<any>}
          */
         call(target, method, args = []){
-            if (state.closed)
-            {
-                return Promise.reject(new LinkClosed(`${target}.${method}`));
-            }
             note(target, method, 0);
             const id = nextId++;
-            return new Promise((resolve, reject)=>{
-                promised.set(id, { resolve, reject, what: `${target}.${method}` });
-                try
-                {
-                    send(encodeValue([CALL, id, target, method, args]));
-                }
-                catch (e){
-                    promised.delete(id);
-                    reject(e instanceof RingClosed ? new LinkClosed(`${target}.${method}`) : e);
-                }
-            });
+            return new Promise((resolve, reject)=>sendCall(id, target, method, args, resolve, reject));
         },
 
         /**
@@ -648,35 +629,27 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
          * @returns {any}
          */
         ask(target, method, args = [], timeoutMs = Infinity){
-            const what = `${target}.${method}`;
-            if (state.closed)
-            {
-                throw new LinkClosed(what);
-            }
             const id = nextId++;
             const started = performance.now();
-            awaited.add(id);
+            /** @type {{ value?: any, error?: Error }} */
+            const got = {};
+            sendCall(id, target, method, args, value=>{
+                got.value = value;
+            }, error=>{
+                got.error = error;
+            });
             try
             {
-                try
-                {
-                    send(encodeValue([CALL, id, target, method, args]));
-                }
-                catch (e){
-                    throw e instanceof RingClosed ? new LinkClosed(what) : e;
-                }
-                waitFor(id, started + timeoutMs, what, timeoutMs);
+                waitFor(id, started + timeoutMs, `${target}.${method}`, timeoutMs);
             }
             finally
             {
-                awaited.delete(id);
+                waiting.delete(id);
             }
             note(target, method, performance.now() - started);
-            const got = /** @type {{ ok: boolean, value: any }} */ (arrived.get(id));
-            arrived.delete(id);
-            if (!got.ok)
+            if (got.error !== undefined)
             {
-                throw errorOf(got.value);
+                throw got.error;
             }
             return got.value;
         },
@@ -784,39 +757,31 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             self.answered();
         },
 
-        /** The other side's word call taken by `takeWords`: its request's words, where they lie. */
-        asked,
-        /** Where this side writes its answer to that call before `answerWords`. */
+        /** Where this side writes its answer to the word call taken before `answerWords`. */
         reply,
 
         /**
          * The other side's word call, for a side with no handler of them: its
-         * request (`asked`) once one waits and this side has not taken it, or
+         * request's words once one waits and this side has not taken it, or
          * null. Answered by `answerWords`.
          *
          * @returns {Int32Array | null}
          */
         takeWords,
-
-        /** Answers the word call taken with what `reply` holds. */
-        answerWords(){
-            if (!holding)
-            {
-                throw new Error('link: an answer with no word call taken');
-            }
-            publishAnswer(false);
-        },
+        answerWords,
 
         /**
-         * What this side asked with values, the most waited on first.
+         * What this side sent, woke and slept (`counts`), and what it asked with
+         * values, the most waited on first.
          *
-         * @returns {{ calls: number, waitedMs: number,
+         * @returns {{ sent: number, woke: number, slept: number, calls: number, waitedMs: number,
          *     asked: { name: string, count: number, waitedMs: number }[] }}
          */
         diagnostics(){
             const rows = [...askedOf].map(([name, entry])=>({ name, ...entry }))
                 .sort((x, y)=>y.waitedMs - x.waitedMs || y.count - x.count);
             return {
+                ...counts,
                 calls: rows.reduce((sum, row)=>sum + row.count, 0),
                 waitedMs: rows.reduce((sum, row)=>sum + row.waitedMs, 0),
                 asked: rows.slice(0, 16),
@@ -835,10 +800,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         close(){
             state.serving = false;
             state.closed = true;
-            if (openHere.get(end.in.control) === self)
-            {
-                openHere.delete(end.in.control);
-            }
+            withdraw();
             // Both rings: a side waiting for room to write to this one, or
             // for its answer, ends now rather than at its own time. Closing
             // what this side reads rings its own doorbell, so its `serve` ends.
@@ -850,7 +812,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             }
         },
     };
-    openHere.set(end.in.control, self);
+    const withdraw = serveHere(end.in.control, pump);
     return self;
 }
 

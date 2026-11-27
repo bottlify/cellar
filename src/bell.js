@@ -546,3 +546,38 @@ export function openDoorbell(memory){
 }
 
 /** @typedef {ReturnType<typeof openDoorbell>} Doorbell */
+
+/**
+ * The servers of this thread a blocking wait of the same thread would wait
+ * for, by the memory their requests are written to: the loop that would
+ * answer them is the one the wait blocks, so the wait serves them in place.
+ * One for every kind of server (a channel's, a link's side).
+ *
+ * @type {WeakMap<object, () => number>}
+ */
+const servers = new WeakMap();
+
+/**
+ * Has a blocking wait of this thread for `memory` run `serve` (which says how
+ * many requests it answered) until the function returned is called.
+ *
+ * @param {object} memory @param {() => number} serve
+ * @returns {() => void}
+ */
+export function serveHere(memory, serve){
+    servers.set(memory, serve);
+    return ()=>{
+        if (servers.get(memory) === serve)
+        {
+            servers.delete(memory);
+        }
+    };
+}
+
+/**
+ * Serves `memory` in place where its server is in this thread: how many it
+ * answered, or -1 where it is not here.
+ *
+ * @param {object} memory
+ */
+export const servedHere = memory=>servers.get(memory)?.() ?? -1;

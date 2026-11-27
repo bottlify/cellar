@@ -25,19 +25,20 @@ if (role === 'words')
     let slept = 0;
     for (let round = 0; round < rounds; round++)
     {
-        while (link.takeWords() === null)
+        let asked = link.takeWords();
+        while (asked === null)
         {
             const seen = link.bell.seen();
-            if (link.takeWords() !== null)
+            asked = link.takeWords();
+            if (asked === null)
             {
-                break;
+                slept += link.bell.wait(seen, Infinity, spinMs) === 'woke' ? 1 : 0;
             }
-            slept += link.bell.wait(seen, Infinity, spinMs) === 'woke' ? 1 : 0;
         }
-        link.reply[0] = link.asked[0] + 1;
+        link.reply[0] = asked[0] + 1;
         link.answerWords();
     }
-    parentPort?.postMessage({ ...link.counts, slept });
+    parentPort?.postMessage({ ...link.diagnostics(), slept });
 }
 else
 {

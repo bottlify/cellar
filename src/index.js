@@ -19,7 +19,7 @@ export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } f
 export { SPIN_MS, createDoorbell, createSpin, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
     waitForAsync } from './bell.js';
 export { RingClosed, createRingMemory, openRing } from './ring.js';
-export { LINK_BYTES, LinkClosed, createLinkMemory, openLink } from './link.js';
+export { LinkClosed, createLinkMemory, openLink } from './link.js';
 export { decodeValue, encodeValue, textOf } from './codec.js';
 export { createJournalMemory, openJournal } from './journal.js';
 

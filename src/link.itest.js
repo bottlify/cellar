@@ -101,7 +101,7 @@ async function handTurns(rounds, mineMs, theirsMs){
     await worker.terminate();
     const sleeps = new Int32Array(a.in.bell.buffer)[a.in.bell.index + 1];
     assert.equal(sleeps, 0, 'no sleeper left counted');
-    return { mine: { ...link.counts }, theirs: counts, elapsedMs };
+    return { mine: link.diagnostics(), theirs: counts, elapsedMs };
 }
 
 /**

@@ -206,6 +206,39 @@ test('a side waiting on a call of its own handles the calls after it in their or
         await serving;
     });
 
+test('answers that come out of nesting order each reach the wait they are for', { timeout: 20000 },
+    async()=>{
+        const { a, b } = createLinkMemory();
+        /** @type {(value: string) => void} */
+        let answerOuter = ()=>{};
+        /** @type {ReturnType<typeof openLink>} */
+        let system;
+        system = openLink(a, { t: {
+            // The outer call is answered only once the inner one is asked...
+            outer: ()=>{
+                system.call('side', 'nest', []).catch(()=>{});
+                return new Promise(resolve=>{
+                    answerOuter = resolve;
+                });
+            },
+            // ... and before it: the blocked side's outer wait has its
+            // answer while its inner wait still waits.
+            inner: ()=>{
+                answerOuter('outer');
+                return new Promise(resolve=>setTimeout(()=>resolve('inner'), 20));
+            },
+        } });
+        const serving = system.serve();
+        const got = await blockingThread(b, `
+            const outer = link.ask('t', 'outer', []);
+            return { outer, inner: globalThis.inner };`, `{ side: { nest: ()=>{
+                globalThis.inner = link.ask('t', 'inner', []);
+            } } }`);
+        assert.deepEqual(got, { outer: 'outer', inner: 'inner' });
+        system.close();
+        await serving;
+    });
+
 test('a failure crosses with what it says of itself, not only its message', { timeout: 20000 },
     async()=>{
         const { a, b } = createLinkMemory();
@@ -348,13 +381,13 @@ test('a closed link fails the calls still waiting on it and every call after, on
         system.close();
         await serving;
         await assert.rejects(asked, (/** @type {any} */ e)=>e instanceof LinkClosed
-            && e.closed === true && /endpoint\.find/.test(e.message), 'the waiting call fails');
-        await assert.rejects(system.call('endpoint', 'find', [8]), { closed: true },
+            && /endpoint\.find/.test(e.message), 'the waiting call fails');
+        await assert.rejects(system.call('endpoint', 'find', [8]), LinkClosed,
             'and a call after the close fails at once');
-        assert.throws(()=>system.ask('endpoint', 'find', [9]), { closed: true },
+        assert.throws(()=>system.ask('endpoint', 'find', [9]), LinkClosed,
             'a blocking one too, rather than waiting for good');
         gone.close();
-        await assert.rejects(told, { closed: true }, 'the side that serves nothing fails its own');
+        await assert.rejects(told, LinkClosed, 'the side that serves nothing fails its own');
     });
 
 test('a side that closes the link closes it for the other, and a call in another thread waiting'
