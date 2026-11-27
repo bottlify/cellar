@@ -15,6 +15,7 @@
  */
 
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
+export { grainsOf } from './buddy.js';
 export { createReader } from './reader.js';
 export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } from './channel.js';
 export { SPIN_MS, createDoorbell, createSpin, deadlineOf, mayWait, openDoorbell, publish, ring, wake,
