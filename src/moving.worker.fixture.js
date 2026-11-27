@@ -11,12 +11,13 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { caller } from './channel.fixture.js';
+import { openClient } from './channel.js';
+import { openKeeperClient } from './remote.js';
 import { createReader } from './reader.js';
 
 const { channel, shared, segments, phase: phaseBuffer, waits } = workerData;
 const phase = new Int32Array(phaseBuffer);
-const keeper = caller(channel);
+const keeper = openKeeperClient(openClient(channel)).keeper;
 let asked = false;
 const reader = createReader({
     shared, segments,
@@ -26,7 +27,7 @@ const reader = createReader({
             asked = Atomics.load(phase, 0) === 1;
             Atomics.store(phase, 0, 2);
             Atomics.notify(phase, 0);
-            return keeper.call('raise', name, options);
+            return keeper.raise(name, options);
         },
         raiseLater: ()=>{},
         drop: ()=>{},

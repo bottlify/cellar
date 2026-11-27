@@ -16,7 +16,8 @@ import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
 import { UNIT } from './buddy.js';
 import { cacheOf } from './cache.fixture.js';
-import { channelMemory, serve } from './channel.fixture.js';
+import { createChannel } from './channel.js';
+import { answerKeeper, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
 
 const MIB = 1024 * 1024;
@@ -50,11 +51,8 @@ const summed = body=>{
  * @param {Awaited<ReturnType<typeof runCache>>} cache
  */
 const thread = cache=>{
-    const memory = channelMemory();
-    const link = serve(memory, {
-        reserve: (name, length, options)=>cache.keeper.reserve(name, length, options ?? {}),
-        raise: (name, options)=>cache.keeper.raise(name, options ?? {}),
-    });
+    const memory = createChannel();
+    const link = serveKeeperChannel(memory, answerKeeper({ keeper: cache.keeper }));
     const worker = new Worker(new URL('./large.worker.fixture.js', import.meta.url), {
         workerData: { channel: memory, shared: cache.keeper.shared, segments: cache.keeper.segmentBuffers() },
     });
@@ -67,7 +65,7 @@ const thread = cache=>{
             worker.postMessage({ read: name, wait });
         }),
         end: async()=>{
-            link.stop();
+            link.close();
             await worker.terminate();
         },
     };

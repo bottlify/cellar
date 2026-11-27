@@ -16,14 +16,15 @@
  * - a channel (`serveKeeperChannel`, `openClient` as the carrier): requests
  *   out at once up to its slots, served on the keeper's event loop. For a
  *   thread the keeper's thread never waits on.
- * - a link (`keeperHandlers`, `linkCarrier`): a call the keeper's thread
- *   answers inside any wait of its own on that link, and one the asking side
- *   answers the keeper's calls while it waits for. For a thread the keeper's
- *   thread calls and waits on: over a channel the two waits would hold each
- *   other for good.
+ * - a link's calls in place (`keeperWords`, `linkCarrier`): a call the
+ *   keeper's thread answers inside any wait of its own on that link, and one
+ *   the asking side answers the keeper's calls while it waits for. For a
+ *   thread the keeper's thread calls and waits on: over a channel the two
+ *   waits would hold each other for good.
  *
  * A request: five little-endian words, then the name's bytes (UTF-8), as many
- * as its fifth word says, and nothing after.
+ * as its fifth word says, and nothing after; it and its answer lie on a
+ * four-byte boundary, as both carriers' slots do.
  *
  *     op | a | b | c | name bytes | name...
  *
@@ -49,6 +50,7 @@
 import { SPIN_MS, mayWait } from './bell.js';
 import { ChannelClosed, openServer } from './channel.js';
 import { LinkClosed } from './link.js';
+import { readText, writeText } from './text.js';
 
 /** The ops. */
 export const RESERVE = 1;
@@ -64,9 +66,9 @@ const UNKNOWN = -1;
 const MALFORMED = -2;
 const FAILED = -3;
 
-/** The bytes of a request's words, and of an answer's. */
-const HEAD = 20;
-const ANSWER = 20;
+/** The words before a request's name, and of an answer before its text. */
+const HEAD_WORDS = 5;
+const HEAD = HEAD_WORDS * 4;
 
 /** A reservation's flags. */
 const ONLY_COPY = 1;
@@ -76,56 +78,27 @@ const DISK_SHIFT = 3;
 /** @type {readonly import('./keeper.js').DiskPolicy[]} */
 const DISKS = ['kept', 'run', 'never'];
 
-/** @param {Uint8Array} bytes @param {number} at */
-const wordAt = (bytes, at)=>bytes[at] | bytes[at + 1] << 8 | bytes[at + 2] << 16 | bytes[at + 3] << 24;
-
-/** @param {Uint8Array} bytes @param {number} at @param {number} value */
-const setWord = (bytes, at, value)=>{
-    bytes[at] = value;
-    bytes[at + 1] = value >>> 8;
-    bytes[at + 2] = value >>> 16;
-    bytes[at + 3] = value >>> 24;
-};
-
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+/** @typedef {{ words: Int32Array, bytes: Uint8Array }} Lying */
 
 /**
- * Writes `text` at `at` of `bytes`, which has room for it as UTF-8: its byte
- * count. A name of ASCII, as names are, makes nothing on the heap.
+ * A view's memory as words and as bytes, from where it begins: made once a
+ * view, as a carrier hands the same view of a slot every time it holds as
+ * much. Null where it does not begin on a word.
  *
- * @param {Uint8Array} bytes @param {number} at @param {string} text
+ * @type {WeakMap<ArrayBufferView, Lying | null>}
  */
-const writeText = (bytes, at, text)=>{
-    for (let n = 0; n < text.length; n++)
+const lyings = new WeakMap();
+/** @param {Uint8Array | Int32Array} view @returns {Lying | null} */
+const lyingOf = view=>{
+    let lying = lyings.get(view);
+    if (lying === undefined)
     {
-        const code = text.charCodeAt(n);
-        if (code >= 0x80)
-        {
-            return encoder.encodeInto(text, bytes.subarray(at)).written;
-        }
-        bytes[at + n] = code;
+        lying = view.byteOffset % 4 !== 0 ? null : {
+            words: new Int32Array(view.buffer, view.byteOffset, view.byteLength >> 2),
+            bytes: new Uint8Array(view.buffer, view.byteOffset, view.byteLength) };
+        lyings.set(view, lying);
     }
-    return text.length;
-};
-
-/**
- * The text of `length` bytes at `at` of `bytes`, which may be shared: a
- * decoder reads no shared memory, so anything but ASCII is copied first.
- *
- * @param {Uint8Array} bytes @param {number} at @param {number} length
- */
-const readText = (bytes, at, length)=>{
-    const end = at + length;
-    for (let n = at; n < end; n++)
-    {
-        if (bytes[n] >= 0x80)
-        {
-            return decoder.decode(bytes.slice(at, end));
-        }
-    }
-    return length <= 4096 ? String.fromCharCode.apply(null, /** @type {any} */ (bytes.subarray(at, end)))
-        : decoder.decode(bytes.slice(at, end));
+    return lying;
 };
 
 /**
@@ -141,50 +114,48 @@ const readText = (bytes, at, length)=>{
  */
 
 /**
- * The keeper's thread's side: a request's answer, written into memory of its
- * own that the next request writes over; a carrier copies it out before then.
- * A request refused, or a call that threw, is answered with its failure.
+ * The keeper's thread's side: answers a request of `length` bytes lying in
+ * `request` into `answer`, which has room for `room` bytes (`HEAD` at least):
+ * the answer's bytes. A request refused, or a call that threw, is answered
+ * with its failure, as much of what is said of it as there is room for.
  *
  * @param {KeeperServed} served
- * @returns {(request: Uint8Array) => Uint8Array}
+ * @returns {(request: Lying, length: number, answer: Lying, room: number) => number}
  */
 export function answerKeeper({ keeper, owners }){
-    let out = new Uint8Array(256);
-    /** The fixed answer, one view for every one. */
-    let fixed = out.subarray(0, ANSWER);
+    /** @type {Lying} */
+    let out;
     /** @param {number} status @param {number} [a] @param {number} [b] @param {number} [c] @param {number} [d] */
     const say = (status, a = 0, b = 0, c = 0, d = 0)=>{
-        setWord(out, 0, status);
-        setWord(out, 4, a);
-        setWord(out, 8, b);
-        setWord(out, 12, c);
-        setWord(out, 16, d);
-        return fixed;
+        const words = out.words;
+        words[0] = status;
+        words[1] = a;
+        words[2] = b;
+        words[3] = c;
+        words[4] = d;
+        return HEAD;
     };
-    /** An answer of the fixed words and `text` after them. @param {number} status @param {string} text */
+    let room = 0;
+    /** The fixed words and `text` after them. @param {number} status @param {string} text */
     const sayText = (status, text)=>{
-        const room = ANSWER + text.length * 3;
-        if (out.length < room)
-        {
-            out = new Uint8Array(room);
-            fixed = out.subarray(0, ANSWER);
-        }
-        const length = writeText(out, ANSWER, text);
+        const length = writeText(out.bytes, HEAD, text, room);
         say(status, length);
-        return out.subarray(0, ANSWER + length);
+        return HEAD + length;
     };
     /** @param {number} known */
     const knownOf = known=>(known < 0 ? Infinity : known);
-    return request=>{
-        if (request.length < HEAD || request.length !== HEAD + (wordAt(request, 16) >>> 0))
+    return (request, length, answer, answerRoom)=>{
+        out = answer;
+        room = answerRoom;
+        const words = request.words;
+        if (length < HEAD || length > request.bytes.length || length !== HEAD + (words[4] >>> 0))
         {
-            return sayText(MALFORMED, `remote keeper: a request of ${request.length} bytes is not of`
-                + ' its layout');
+            return sayText(MALFORMED, `remote keeper: a request of ${length} bytes is not of its layout`);
         }
-        const op = wordAt(request, 0);
-        const a = wordAt(request, 4);
-        const b = wordAt(request, 8);
-        const c = wordAt(request, 12);
+        const op = words[0];
+        const a = words[1];
+        const b = words[2];
+        const c = words[3];
         if (op < RESERVE || op > RELEASE)
         {
             return sayText(UNKNOWN, `remote keeper: no op ${op}`);
@@ -196,7 +167,7 @@ export function answerKeeper({ keeper, owners }){
         }
         try
         {
-            const name = readText(request, HEAD, request.length - HEAD);
+            const name = readText(request.bytes, HEAD, length - HEAD);
             if (op === RESERVE)
             {
                 const place = keeper.reserve(name, a >>> 0, { onlyCopy: (c & ONLY_COPY) !== 0,
@@ -233,17 +204,31 @@ export function answerKeeper({ keeper, owners }){
     };
 }
 
+/** @typedef {ReturnType<typeof answerKeeper>} KeeperAnswer */
+
 /**
  * Serves a remote keeper's channel on this thread's event loop, one wait at a
  * time, until either side closes it: `ended` once it is, every request sent
- * before the close answered.
+ * before the close answered. Its answers are written in memory of its own,
+ * which the channel copies into its slot.
  *
- * @param {SharedArrayBuffer} memory @param {(request: Uint8Array) => Uint8Array} answer
+ * @param {SharedArrayBuffer} memory @param {KeeperAnswer} answer
  * @returns {{ close: () => void, ended: Promise<void> }}
  */
 export function serveKeeperChannel(memory, answer){
     const server = openServer(memory);
     const canBlock = mayWait();
+    const room = 4096;
+    const out = /** @type {Lying} */ (lyingOf(new Uint8Array(room)));
+    /** The answers' views, by length. @type {Uint8Array[]} */
+    const answers = [];
+    /** @param {Uint8Array} request */
+    const handle = request=>{
+        // A request off a word's boundary is refused like any other not of the layout.
+        const lying = lyingOf(request) ?? /** @type {Lying} */ (lyingOf(request.slice()));
+        const length = answer(lying, request.length, out, room);
+        return answers[length] ??= out.bytes.subarray(0, length);
+    };
     const ended = (async()=>{
         while (!server.closed())
         {
@@ -252,9 +237,9 @@ export function serveKeeperChannel(memory, answer){
                 // A reader that asked one thing asks the next straight after:
                 // looked for briefly, as a link's serving does, where this
                 // thread may block; then waited for on the event loop.
-                if (await server.serveAsync(answer) > 0 && canBlock)
+                if (await server.serveAsync(handle) > 0 && canBlock)
                 {
-                    while (server.serve(answer, { timeoutMs: SPIN_MS }) > 0)
+                    while (server.serve(handle, { timeoutMs: SPIN_MS }) > 0)
                     {
                         // Answering.
                     }
@@ -270,72 +255,81 @@ export function serveKeeperChannel(memory, answer){
         // What was asked before the close is still answered.
         if (server.waiting() > 0)
         {
-            server.serve(answer);
+            server.serve(handle);
         }
     })();
     return { close: server.close, ended };
 }
 
-/** The link target a remote keeper's calls go to (`keeperHandlers`). */
-const TARGET = 'cellar.keeper';
-
 /**
- * The handlers the keeper's side of a link answers a remote keeper with,
- * among its own.
+ * The handler of a link's calls in place (`openLink`'s `words`) that answers
+ * a remote keeper: its answer written in the slot where the asking side reads it.
  *
- * @param {(request: Uint8Array) => Uint8Array} answer
+ * @param {KeeperAnswer} answer @returns {import('./link.js').WordsHandler}
  */
-export const keeperHandlers = answer=>({ [TARGET]: { call: answer } });
+export const keeperWords = answer=>(request, reply, length)=>{
+    const lying = /** @type {Lying} */ (lyingOf(request));
+    return answer(lying, length, /** @type {Lying} */ (lyingOf(reply)), reply.byteLength);
+};
 
 /**
- * A link's asking side as a remote keeper's carrier: a call blocks in `ask`,
- * answering the keeper's side's calls meanwhile.
+ * A link's asking side as a remote keeper's carrier: its calls in place, a
+ * call that blocks answering the keeper's side's calls meanwhile.
  *
  * @param {import('./link.js').Link} link @returns {Carrier}
  */
 export const linkCarrier = link=>({
-    ask: (request, { read })=>read(link.ask(TARGET, 'call', [request])),
-    call: (request, { read })=>link.call(TARGET, 'call', [request]).then(read),
+    ask: (request, { read })=>link.askBytes(request, read),
+    call: (request, { read })=>link.callBytes(request, read),
 });
 
 /**
  * What carries a remote keeper's requests and answers: a channel's client
  * (`openClient`) or a link (`linkCarrier`). `ask` blocks for the answer;
- * `call` does not. Both copy the request before they return.
+ * `call` does not. Both are done with the request before they return, and
+ * keep the calls in the order they were made.
  *
  * @typedef {{ ask: <T>(request: Uint8Array, options: { read: (answer: Uint8Array) => T }) => T,
  *     call: <T>(request: Uint8Array, options: { read: (answer: Uint8Array) => T }) => Promise<T> }} Carrier
  */
 
 /**
- * The failure an answer says, thrown; or nothing where it is an answer.
+ * The words of an answer, its failure thrown; null where it holds less than its words.
  *
  * @param {Uint8Array} answer
  */
-const failed = answer=>{
-    if (answer.length < ANSWER)
+const answered = answer=>{
+    const lying = answer.length < HEAD ? null : lyingOf(answer);
+    if (lying === null)
     {
         throw new Error(`remote keeper: an answer of ${answer.length} bytes`);
     }
-    const status = wordAt(answer, 0);
-    if (status < 0)
+    const words = lying.words;
+    if (words[0] < 0)
     {
-        throw new Error(readText(answer, ANSWER, wordAt(answer, 4)));
+        throw new Error(readText(answer, HEAD, words[1]));
     }
-    return status;
+    return words;
 };
 
 /** @param {Uint8Array} answer @returns {import('./reader.js').Place | null} */
-const readPlace = answer=>(failed(answer) === NONE ? null : { id: wordAt(answer, 4),
-    segment: wordAt(answer, 8), offset: wordAt(answer, 12) >>> 0, mark: wordAt(answer, 16) });
+const readPlace = answer=>{
+    const words = answered(answer);
+    return words[0] === NONE ? null : { id: words[1], segment: words[2], offset: words[3] >>> 0, mark: words[4] };
+};
 /** @param {Uint8Array} answer */
-const readYes = answer=>failed(answer) === OK;
+const readYes = answer=>answered(answer)[0] === OK;
 /** @param {Uint8Array} answer */
-const readPrefix = answer=>(failed(answer) === NONE ? null : readText(answer, ANSWER, wordAt(answer, 4)));
+const readPrefix = answer=>{
+    const words = answered(answer);
+    return words[0] === NONE ? null : readText(answer, HEAD, words[1]);
+};
 /** @param {Uint8Array} answer */
-const readLeft = answer=>(failed(answer) === NONE ? null : { bodies: wordAt(answer, 4) >>> 0,
-    bytes: (wordAt(answer, 8) >>> 0) + (wordAt(answer, 12) >>> 0) * 0x1_0000_0000,
-    waiting: wordAt(answer, 16) >>> 0 });
+const readLeft = answer=>{
+    const words = answered(answer);
+    return words[0] === NONE ? null : { bodies: words[1] >>> 0,
+        bytes: (words[2] >>> 0) + (words[3] >>> 0) * 0x1_0000_0000, waiting: words[4] >>> 0 };
+};
 
 /** Whether a failure is the carrier closed: the keeper's side gone, or this one. @param {unknown} e */
 const closedBy = e=>e instanceof ChannelClosed || e instanceof LinkClosed;
@@ -355,7 +349,10 @@ export function openKeeperClient(carrier, { onFailure = e=>{
         throw e;
     });
 } } = {}){
-    let request = new Uint8Array(256);
+    let room = 256;
+    let request = /** @type {Lying} */ (lyingOf(new Uint8Array(room)));
+    /** The requests' views, by length. @type {Uint8Array[]} */
+    let views = [];
     /**
      * The request for `op` written into this side's memory: a view of it, valid
      * until the next request is written.
@@ -367,17 +364,20 @@ export function openKeeperClient(carrier, { onFailure = e=>{
         {
             throw new TypeError(`remote keeper: a name is a string, not ${name === null ? 'null' : typeof name}`);
         }
-        if (request.length < HEAD + name.length * 3)
+        if (room < HEAD + name.length * 3)
         {
-            request = new Uint8Array(HEAD + name.length * 3);
+            room = HEAD + name.length * 3;
+            request = /** @type {Lying} */ (lyingOf(new Uint8Array(room)));
+            views = [];
         }
-        const length = writeText(request, HEAD, name);
-        setWord(request, 0, op);
-        setWord(request, 4, a);
-        setWord(request, 8, b);
-        setWord(request, 12, c);
-        setWord(request, 16, length);
-        return request.subarray(0, HEAD + length);
+        const length = writeText(request.bytes, HEAD, name);
+        const words = request.words;
+        words[0] = op;
+        words[1] = a;
+        words[2] = b;
+        words[3] = c;
+        words[4] = length;
+        return views[HEAD + length] ??= request.bytes.subarray(0, HEAD + length);
     };
     /** @param {number | undefined} known */
     const knownOf = known=>(known === undefined || known === Infinity ? -1 : known);
@@ -401,7 +401,7 @@ export function openKeeperClient(carrier, { onFailure = e=>{
     };
     /** Sent and not waited on. @param {Uint8Array} sent */
     const unwaited = sent=>{
-        carrier.call(sent.slice(), { read: failed }).catch(e=>{
+        carrier.call(sent, { read: answered }).catch(e=>{
             if (!closedBy(e))
             {
                 onFailure(e);
@@ -425,7 +425,7 @@ export function openKeeperClient(carrier, { onFailure = e=>{
          * @param {Parameters<typeof reserveOf>[2]} options
          * @returns {Promise<import('./reader.js').Place | null>}
          */
-        reserveLater: (name, length, options)=>carrier.call(reserveOf(name, length, options).slice(),
+        reserveLater: (name, length, options)=>carrier.call(reserveOf(name, length, options),
             { read: readPlace }),
 
         /**
@@ -451,7 +451,7 @@ export function openKeeperClient(carrier, { onFailure = e=>{
          * @param {string} prefix @param {number} held
          * @returns {Promise<{ bodies: number, bytes: number, waiting: number } | null>}
          */
-        releaseLater: (prefix, held)=>carrier.call(write(RELEASE, prefix, held, 0, 0).slice(),
+        releaseLater: (prefix, held)=>carrier.call(write(RELEASE, prefix, held, 0, 0),
             { read: readLeft }),
     };
 }

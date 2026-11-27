@@ -6,7 +6,7 @@
 
 /**
  * One thread of the cache's concurrency gate (`concurrency.itest.js`): reads,
- * writes and drops names of a shared pool by a seed, through a link to the
+ * writes and drops names of a shared pool by a seed, through the remote
  * keeper, and checks every body it reads, in place, twice.
  *
  * A body says whose it is: its first words are its name's hash, a version and
@@ -21,25 +21,13 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { caller } from './channel.fixture.js';
+import { openClient } from './channel.js';
+import { openKeeperClient } from './remote.js';
 import { createReader } from './reader.js';
 import { hashName } from './shared.js';
 
 const { channel, shared, segments, seed, operations, least, pool, thread, threads, owned } = workerData;
-const keeper = caller(channel);
-const reader = createReader({
-    shared, segments,
-    keeper: {
-        reserve: (name, length, options)=>keeper.call('reserve', name, length, options),
-        raise: (name, options)=>keeper.call('raise', name, options),
-        raiseLater: name=>{
-            keeper.call('raise', name);
-        },
-        drop: name=>{
-            keeper.call('drop', name);
-        },
-    },
-});
+const reader = createReader({ shared, segments, keeper: openKeeperClient(openClient(channel)).keeper });
 parentPort?.on('message', message=>reader.adopt(message));
 
 let state = seed >>> 0 || 1;

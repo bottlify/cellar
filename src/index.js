@@ -21,8 +21,9 @@ export { SPIN_MS, createDoorbell, createSpin, deadlineOf, mayWait, openDoorbell,
     waitFor, waitForAsync } from './bell.js';
 export { RingClosed, createRingMemory, openRing } from './ring.js';
 export { LinkClosed, createLinkMemory, openLink } from './link.js';
-export { answerKeeper, keeperHandlers, linkCarrier, openKeeperClient, serveKeeperChannel } from './remote.js';
-export { decodeValue, encodeValue, textOf } from './codec.js';
+export { answerKeeper, keeperWords, linkCarrier, openKeeperClient, serveKeeperChannel } from './remote.js';
+export { decodeValue, encodeValue } from './codec.js';
+export { textOf } from './text.js';
 export { createJournalMemory, openJournal } from './journal.js';
 export { createTableMemory, openTable } from './table.js';
 

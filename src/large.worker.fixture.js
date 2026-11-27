@@ -8,24 +8,19 @@
  * A thread reading the cache for `large.test.js`: it joins over the index and
  * the segments it is handed, hears of segments made and let go after, and
  * reads a body on each `{ read, wait }` asked of it, answering what it found
- * there, its calls to the keeper across a channel.
+ * there, its calls to the keeper the remote keeper's, across a channel.
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { caller } from './channel.fixture.js';
+import { openClient } from './channel.js';
+import { openKeeperClient } from './remote.js';
 import { createReader } from './reader.js';
 
 const { channel, shared, segments } = workerData;
-const keeper = caller(channel);
-const reader = createReader({
-    shared, segments,
-    keeper: {
-        reserve: (name, length, options)=>keeper.call('reserve', name, length, options),
-        raise: (name, options)=>keeper.call('raise', name, options),
-        raiseLater: ()=>{},
-        drop: ()=>{},
-    },
-});
+// A reader that asks the keeper only what it waits for: a read that misses
+// raises nothing behind it, so each raise the tests count is one they asked.
+const { reserve, raise } = openKeeperClient(openClient(channel)).keeper;
+const reader = createReader({ shared, segments, keeper: { reserve, raise, raiseLater: ()=>{}, drop: ()=>{} } });
 
 parentPort?.on('message', message=>{
     if (message.read === undefined)

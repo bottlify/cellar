@@ -148,3 +148,42 @@ test('an ask makes no garbage, answered at once or after its handler worked: a c
     const worked = await collectionsOf(50_000, 0.1);
     assert.ok(worked <= 2, `${worked} collections in 50 000 asks answered after 0.1 ms`);
 });
+
+test('a call that waits for room is sent before every request made after it, a blocking ask '
+    + 'included', { timeout: 60_000 }, async()=>{
+    const memory = createChannel({ slots: 2, slotBytes: 8 });
+    // A server slow enough that the channel is full: it answers each request
+    // with the order it came in.
+    const server = new Worker(`
+        const { workerData } = require('node:worker_threads');
+        import(workerData.url).then(({ openServer, ChannelClosed })=>{
+            const server = openServer(workerData.memory);
+            let n = 0;
+            try
+            {
+                for (;;)
+                {
+                    server.serve(request=>{
+                        const until = performance.now() + 2;
+                        while (performance.now() < until) {}
+                        return [request[0], n++];
+                    });
+                }
+            }
+            catch (e) { if (!(e instanceof ChannelClosed)) throw e; }
+        });`, { eval: true, workerData: { memory, url: new URL('./channel.js', import.meta.url).href } });
+    const client = openClient(memory);
+    try
+    {
+        const read = (/** @type {Uint8Array} */ answer)=>[answer[0], answer[1]];
+        const calls = Array.from({ length: 6 }, (_, tag)=>client.call([tag], { read }));
+        const asked = client.ask([6], { read });
+        assert.deepEqual(asked, [6, 6], 'the ask went after the six calls before it');
+        assert.deepEqual(await Promise.all(calls), Array.from({ length: 6 }, (_, tag)=>[tag, tag]));
+    }
+    finally
+    {
+        client.close();
+        await server.terminate();
+    }
+});

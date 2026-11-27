@@ -38,6 +38,7 @@
 import { awake, createSpin, deadlineOf, lookAsync, publish as publishWord, serveHere, servedHere,
     waitFor as waitWord, waitForAsync as waitWordAsync } from './bell.js';
 import { bytesOf } from './bytes.js';
+import { readText, writeText } from './text.js';
 
 /** The header, in 32-bit words. */
 const HEADER_WORDS = 16;
@@ -223,10 +224,8 @@ function endOver(memory, { spinMs }){
      * @param {number} n @param {unknown} failure
      */
     const writeFailure = (n, failure)=>{
-        const said = new TextEncoder().encode(sayFailure(failure)).subarray(0, slotBytes);
         const at = answers + (n & (slots - 1)) * stride;
-        bytes.set(said, at + 4);
-        words[at >> 2] = ~said.length;
+        words[at >> 2] = ~writeText(bytes, at + 4, sayFailure(failure), at + 4 + slotBytes);
     };
 
     /**
@@ -237,8 +236,7 @@ function endOver(memory, { spinMs }){
     const failureAt = n=>{
         const at = answers + (n & (slots - 1)) * stride;
         const word = words[at >> 2];
-        // Copied out: a decoder does not read shared memory.
-        return word < 0 ? new TextDecoder().decode(bytes.slice(at + 4, at + 4 + ~word)) : null;
+        return word < 0 ? readText(bytes, at + 4, ~word) : null;
     };
 
     /**
@@ -276,7 +274,7 @@ function endOver(memory, { spinMs }){
         sleeps, deadline, CLOSED, bellOf(counter)).then(movedOrClosed);
 
     return {
-        words, requests, answers, slots, slotAt, writeSlot, writeFailure, failureAt, publish,
+        words, requests, answers, slots, slotBytes, slotAt, writeSlot, writeFailure, failureAt, publish,
         waitFor, waitForAsync,
         /** What this end's blocking waits learnt of their spin; null for a `spinMs` of its own. */
         spin: typeof spin === 'object' ? spin : null,
@@ -454,6 +452,7 @@ export function openClient(memory, options = {}){
                 {
                     takeAnswer();
                 }
+                sendQueued();
                 if (takers === 0)
                 {
                     pumping = false;
@@ -476,6 +475,10 @@ export function openClient(memory, options = {}){
             // Every answer still out fails with the pump: a closed channel
             // answers none of them.
             pumping = false;
+            for (const { reject } of queued.splice(0))
+            {
+                reject(reason);
+            }
             while (takers > 0)
             {
                 const reject = rejects[first];
@@ -517,31 +520,23 @@ export function openClient(memory, options = {}){
     };
 
     /**
-     * A call that waits for room first: a slot frees with each answer.
+     * Calls that came with no room for them, in order, each with a copy of
+     * its request: sent as answers free slots, before any request made after
+     * them, so a call is never overtaken by a later call or ask.
      *
-     * @template T @param {ArrayLike<number>} message @param {ReadAnswer<T>} readAnswer
-     * @returns {Promise<T>}
+     * @type {{ message: Uint8Array, reader: ReadAnswer<any>, resolve: (value: any) => void,
+     *     reject: (reason: any) => void }[]}
      */
-    const callWhenRoom = async(message, readAnswer)=>{
-        while ((asked - read) >>> 0 >= slots)
+    const queued = [];
+    const sendQueued = ()=>{
+        while (queued.length > 0 && (asked - read) >>> 0 < slots)
         {
-            // A close fails the calls out and frees no slot: waiting on
-            // would turn this loop for ever, the thread's timers with it.
-            if (end.closed())
-            {
-                throw new ChannelClosed();
-            }
-            // One answer is waited for, not all.
-            if (Atomics.load(words, ANSWERED) === read)
-            {
-                await end.waitForAsync(ANSWERED, read, CLIENT_SLEEPS, Infinity);
-            }
-            while (takers > 0 && Atomics.load(words, ANSWERED) !== read)
-            {
-                takeAnswer();
-            }
+            // Taken off the queue once sent: one the channel refused stays to be failed with the rest.
+            const { message, reader, resolve, reject } = queued[0];
+            send(message);
+            queued.shift();
+            addTaker(reader, resolve, reject);
         }
-        return callNow(message, readAnswer);
     };
 
     return {
@@ -559,9 +554,10 @@ export function openClient(memory, options = {}){
         ask(message, { read: readAnswer = /** @type {any} */ (copy), timeoutMs } = {}){
             notReading();
             const deadline = deadlineOf(timeoutMs);
-            while ((asked - read) >>> 0 >= slots)
+            for (sendQueued(); queued.length > 0 || (asked - read) >>> 0 >= slots; sendQueued())
             {
-                if (!end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
+                if (Atomics.load(words, ANSWERED) === read
+                    && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
                 {
                     throw new Error(`channel: no room in ${timeoutMs} ms`);
                 }
@@ -619,8 +615,28 @@ export function openClient(memory, options = {}){
             {
                 notReading();
                 const readAnswer = /** @type {ReadAnswer<T>} */ (options?.read ?? copy);
-                return (asked - read) >>> 0 >= slots ? callWhenRoom(message, readAnswer)
-                    : callNow(message, readAnswer);
+                if (queued.length === 0 && (asked - read) >>> 0 < slots)
+                {
+                    return callNow(message, readAnswer);
+                }
+                if (end.closed())
+                {
+                    throw new ChannelClosed();
+                }
+                const copied = Uint8Array.from(bytesOf(message, 'channel'));
+                if (copied.length > end.slotBytes)
+                {
+                    throw new RangeError(`channel: ${copied.length} bytes, a slot holds ${end.slotBytes}`);
+                }
+                /** @type {typeof queued[0]} */
+                const waiting = { message: copied, reader: readAnswer, resolve: IGNORED, reject: IGNORED };
+                const answered = new Promise((resolve, reject)=>{
+                    waiting.resolve = resolve;
+                    waiting.reject = reject;
+                });
+                queued.push(waiting);
+                startPump();
+                return answered;
             }
             catch (e){
                 return Promise.reject(e);

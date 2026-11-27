@@ -21,10 +21,11 @@ await link.serve();                           // until either side closes the li
 
 | API | Behaviour |
 | --- | --- |
-| `createLinkMemory({ capacity, words, bellA, bellB })` | Two rings of `capacity` bytes (1 MiB) and word calls of `words` words (4); a side's doorbell may be shared with whatever else its thread waits on. |
+| `createLinkMemory({ capacity, words, slots, bellA, bellB })` | Two rings of `capacity` bytes (1 MiB), and `slots` calls in place a side (1, a power of two) of `words` words each way (4); a side's doorbell may be shared with whatever else its thread waits on. |
 | `openLink(end, handlers, { words, spinMs, afterSend })` | Opens one side. `handlers[target][method]` answer the other side, a promise when it settles. |
 | `ask(target, method, args, timeoutMs)` | Calls and blocks until answered, handling every call sent meanwhile. |
 | `call(target, method, args)` | Calls and returns a promise, settled by `pump` or `serve`. |
+| `askBytes(request, read, timeoutMs)`, `callBytes(request, read)` | A call in place: blocks for its answer, or returns a promise of it; `read` reads the answer where it lies. |
 | `pump()` | Handles everything sent so far: calls, word calls, answers. |
 | `serve()` | Pumps on the event loop until the link closes. |
 | `bell` | This side's doorbell, for a thread that waits on the link with other work. |
@@ -37,9 +38,13 @@ Arguments and answers are values of `codec.js`: undefined, null, booleans, numbe
 
 A handler that throws answers with its failure: the caller throws an `Error` with the same message and every own property that can cross (`code`, a list of what was missing). An answer that cannot cross is a failure too. A call to a target or method nobody answers fails with `link: nothing answers target.method`.
 
-## Word calls
+## Calls in place
 
-Each side may have one call of a few 32-bit words out at a time: the request is written into shared words in place (`request`), published by an atomic count, and answered the same way back (`answer`). No record, value or promise is made. This is the path for a protocol that takes turns millions of times, such as a slice asked for and each trap it raises answered.
+Each side has `slots` calls in place: the request's bytes are written into the link's own shared memory, published by an atomic count, and answered the same way back, the answer read where it lies. No record or value is made, and a blocking one makes no promise either. This is the path for a protocol that takes turns millions of times, such as a slice asked for and each trap it raised answered, or a cache's keeper asked for room.
+
+`askBytes(request, read)` copies the request into the next slot and blocks for the answer, handling everything the other side sends meanwhile; `callBytes(request, read)` hands back a promise that `pump` or `serve` settles. They go out in the order they were made and are answered in that order. A call made inside the wait for another takes the next slot; with every slot out and its answer a promise's, a thread that may block waits for one, and otherwise, or where a wait is to take it, the call is refused with an error that says so.
+
+A word call is a call in place of the slot's whole size, its request and answer read as 32-bit words, one out at a time:
 
 ```js
 link.request[0] = budget;
@@ -47,7 +52,7 @@ link.sendWords();                  // or: sendWords() then waitWords() to block
 if (link.answered()) use(link.answer[0]);
 ```
 
-The other side answers with a `words(request, answer)` handler run by `pump`, so also inside any wait, or takes the call itself with `takeWords()` (the request, or null) and answers it later with `reply` and `answerWords()`; both answer through `answerWords`. The two sides' word calls nest: one side's call can be out while it answers the other's. A handler that throws, or `answerWords(failure)`, fails the call; the asker's `answered` or `waitWords` throws the failure. Word calls and value calls are each in order, not in order with each other.
+The other side answers every call in place with a `words(request, answer, length)` handler run by `pump`, so also inside any wait: the slot's words, and the request's byte count; it returns the answer's byte count (the whole slot where it returns nothing). Or it takes the call itself with `takeWords()` (the request, or null) and answers it later with `reply` and `answerWords(failure, length)`. The two sides' calls nest: one side's call can be out while it answers the other's. A handler that throws, or `answerWords(failure)`, fails the call; the asker's `askBytes`, its promise, `answered` or `waitWords` throws the failure. Calls in place and value calls are each in order, not in order with each other.
 
 `afterSend` runs after every send has rung the other side, for a side whose peer must also be told another way, such as a word its running loop polls.
 

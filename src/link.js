@@ -25,13 +25,15 @@
  * sent at all: a call names where it lies (a body in the cache, a range of a
  * shared buffer).
  *
- * Beside the values, each side has one call of a few words at a time (`words`):
- * the request written into shared words in place, an atomic count published
- * after it, the answer the same way back, no record and no value made. It is
- * the path of a protocol that takes turns millions of times - a slice asked
- * for, a trap answered - for which the value path would be a record, a decode
- * and an object a turn. Word calls and value calls are not ordered with each
- * other; each is in order with itself.
+ * Beside the values, each side has calls in place (`slots` of them out at
+ * once): the request's bytes written into the link's shared memory where the
+ * other side reads them, an atomic count published after it, the answer the
+ * same way back, no record and no value made. It is the path of a protocol
+ * that takes turns millions of times - a slice asked for, a trap answered, a
+ * keeper's room - for which the value path would be a record, a decode and an
+ * object a turn. A word call is such a call of the slot's whole size, its
+ * request and answer read as words. Calls in place and value calls are not
+ * ordered with each other; each is in order with itself.
  *
  * Both sides may be in one thread: a side that waits for an answer from a side
  * of this thread serves that side in place, which only it can do then.
@@ -39,7 +41,11 @@
 
 import { SPIN_MS, mayWait, serveHere, servedHere } from './bell.js';
 import { decodeValue, encodeValue } from './codec.js';
+import { bytesOf } from './bytes.js';
 import { RingClosed, createRingMemory, openRing } from './ring.js';
+
+/** How a word call's answer is read: in `answer`, by whoever asked. */
+const NO_READ = ()=>undefined;
 
 /** The records on a link's rings: a call, an answer, a word call's failure. */
 const CALL = 0;
@@ -53,21 +59,32 @@ const WORDS_FAILED = 2;
 const PART = 0xff;
 const PART_HEAD = 8;
 
-/** The words of a link's word calls: its layout, then the words of each call. */
+/** The words of a link's calls in place: its layout, the words of a slot's request, its slots. */
 const LAYOUT = 0;
 const WORDS = 1;
-const HEAD_WORDS = 2;
+const SLOTS = 2;
+const HEAD_WORDS = 3;
 /** A word that no zeroed or foreign memory holds: "LNK" and the layout's version. */
-const LINK_LAYOUT = 0x4c4e4b01;
+const LINK_LAYOUT = 0x4c4e4b02;
 /**
- * A side's word call: the calls it made and the answers the other side wrote,
- * counts that wrap at 2^32; whether the last answer is a failure (then sent
- * as a value before the answer's count); the request's words, the answer's.
+ * A side's calls in place: the calls it made and those the other side
+ * answered, counts that wrap at 2^32, then its slots, call `n` in slot `n`
+ * modulo their count. A slot: whether its answer is a failure (then sent as
+ * a value before the answer's count), the bytes of the request and of the
+ * answer, then the request's words and the answer's.
  */
 const ASKED = 0;
 const ANSWERED = 1;
-const FAILED = 2;
-const CALL_HEAD = 3;
+const CALLS_HEAD = 2;
+const FAILED = 0;
+const REQUEST_BYTES = 1;
+const ANSWER_BYTES = 2;
+const SLOT_HEAD = 3;
+/** Who takes a slot's answer: nobody (free), a wait, a promise, the word call. */
+const FREE = 0;
+const WAITED = 1;
+const LATER = 2;
+const WORD_CALL = 3;
 
 /** A link's rings, each way, by default: what a call and its values fit in, many times over. */
 const LINK_BYTES = 1 << 20;
@@ -129,26 +146,34 @@ const errorOf = ({ message, ...said })=>Object.assign(new Error(message), said);
  * doorbell is what it waits on; one handed in may be shared with whatever else
  * the same thread waits for, so one wait serves them all.
  *
- * @param {{ capacity?: number, words?: number,
+ * @param {{ capacity?: number, words?: number, slots?: number,
  *     bellA?: import('./bell.js').DoorbellMemory, bellB?: import('./bell.js').DoorbellMemory }} [options]
- *     capacity: each ring's bytes (`LINK_BYTES`); words: of a word call's request, and of its
- *     answer (4)
+ *     capacity: each ring's bytes (`LINK_BYTES`); words: of a call in place's request, and of
+ *     its answer (4); slots: such calls a side has out at once, a power of two (1)
  * @returns {{ a: LinkEnd, b: LinkEnd }}
  */
-export function createLinkMemory({ capacity = LINK_BYTES, words = 4, bellA, bellB } = {}){
+export function createLinkMemory({ capacity = LINK_BYTES, words = 4, slots = 1, bellA, bellB } = {}){
     if (!Number.isInteger(words) || words < 0 || words > 256)
     {
-        throw new RangeError(`link: word calls of ${words} words`);
+        throw new RangeError(`link: calls in place of ${words} words`);
+    }
+    if (!Number.isInteger(slots) || slots < 1 || slots > 256 || (slots & (slots - 1)) !== 0)
+    {
+        throw new RangeError(`link: ${slots} slots of calls in place`);
     }
     const toA = createRingMemory(capacity, bellA);
     const toB = createRingMemory(capacity, bellB);
-    const shared = new SharedArrayBuffer((HEAD_WORDS + 2 * (CALL_HEAD + 2 * words)) * 4);
+    const shared = new SharedArrayBuffer((HEAD_WORDS + 2 * sideWords(words, slots)) * 4);
     const head = new Int32Array(shared);
     head[LAYOUT] = LINK_LAYOUT;
     head[WORDS] = words;
+    head[SLOTS] = slots;
     return { a: { out: toB, in: toA, words: shared, side: 0 },
         b: { out: toA, in: toB, words: shared, side: 1 } };
 }
+
+/** A side's words of calls in place. @param {number} size @param {number} slots */
+const sideWords = (size, slots)=>CALLS_HEAD + slots * (SLOT_HEAD + 2 * size);
 
 /**
  * What a side answers the other's value calls with: a handler per target and
@@ -158,13 +183,15 @@ export function createLinkMemory({ capacity = LINK_BYTES, words = 4, bellA, bell
  */
 
 /**
- * What answers the other side's word calls in `pump`, so at any depth of a
- * wait: the request's words and the answer's, both where they lie; it writes
- * the answer before it returns, and a throw is the call's failure. A side
- * whose answer cannot be made in one turn (a slice run between turns of its
- * event loop) has none, and takes the call itself (`takeWords`, `answerWords`).
+ * What answers the other side's calls in place in `pump`, so at any depth of
+ * a wait: the request's words and the answer's, both where they lie, and the
+ * bytes of the request; it writes the answer before it returns, and returns
+ * its bytes (the slot's whole size where it returns nothing, as a word call's
+ * answer is). A throw is the call's failure. A side whose answer cannot be
+ * made in one turn (a slice run between turns of its event loop) has none,
+ * and takes the call itself (`takeWords`, `answerWords`).
  *
- * @typedef {(request: Int32Array, answer: Int32Array) => void} WordsHandler
+ * @typedef {(request: Int32Array, answer: Int32Array, length: number) => number | void} WordsHandler
  */
 
 /**
@@ -184,12 +211,14 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     const bell = inbound.bell;
     const words = new Int32Array(end.words);
     const size = words[WORDS];
-    if (words.length < HEAD_WORDS || words[LAYOUT] !== LINK_LAYOUT || !(size >= 0)
-        || words.length < HEAD_WORDS + 2 * (CALL_HEAD + 2 * size) || (end.side !== 0 && end.side !== 1))
+    const slots = words[SLOTS];
+    if (words.length < HEAD_WORDS || words[LAYOUT] !== LINK_LAYOUT || !(size >= 0) || !(slots >= 1)
+        || (slots & (slots - 1)) !== 0 || words.length < HEAD_WORDS + 2 * sideWords(size, slots)
+        || (end.side !== 0 && end.side !== 1))
     {
         throw new Error('link: the memory is not a link of this layout');
     }
-    const stride = CALL_HEAD + 2 * size;
+    const stride = sideWords(size, slots);
     const mine = HEAD_WORDS + end.side * stride;
     const theirs = HEAD_WORDS + (1 - end.side) * stride;
     /** Waits look this long, or as the side's waits learnt to (undefined). */
@@ -343,8 +372,8 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     /** The whole of a record coming in parts, and how much of it is in. @type {Uint8Array | null} */
     let whole = null;
     let wholeAt = 0;
-    /** The failure of this side's word call, come before its answer. @type {any} */
-    let wordsFailure = null;
+    /** The failures of this side's calls in place, by number, come before their answers. @type {Map<number, any>} */
+    const failures = new Map();
     /**
      * Records taken off the ring and not handled yet, in the order they came,
      * decoded where they lay: a handler that waits for a call of its own pumps
@@ -395,7 +424,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         }
         if (record[0] === WORDS_FAILED)
         {
-            wordsFailure = record[1];
+            failures.set(record[1], record[2]);
             return;
         }
         const [, id, ok, value] = record;
@@ -414,63 +443,163 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         }
     };
 
-    /** The other side's word call and its answer, where they lie. */
-    const asked = words.subarray(theirs + CALL_HEAD, theirs + CALL_HEAD + size);
-    const reply = words.subarray(theirs + CALL_HEAD + size, theirs + stride);
-    /** The other side's word calls this side took, and whether one taken is not answered yet. */
-    let wordsTaken = Atomics.load(words, theirs + ANSWERED);
+    /**
+     * A side's slots where they lie: each one's words and bytes, request and
+     * answer, made once.
+     *
+     * @param {number} side
+     */
+    const slotsOf = side=>Array.from({ length: slots }, (_, slot)=>{
+        const at = side + CALLS_HEAD + slot * (SLOT_HEAD + 2 * size);
+        return { at, request: words.subarray(at + SLOT_HEAD, at + SLOT_HEAD + size),
+            answer: words.subarray(at + SLOT_HEAD + size, at + SLOT_HEAD + 2 * size),
+            requestBytes: new Uint8Array(end.words, (at + SLOT_HEAD) * 4, size * 4),
+            answerBytes: new Uint8Array(end.words, (at + SLOT_HEAD + size) * 4, size * 4),
+            /** The answer's bytes as last read, made again only when their length changes. */
+            answered: /** @type {Uint8Array} */ (new Uint8Array(0)) };
+    });
+    const mySlots = slotsOf(mine);
+    const theirSlots = slotsOf(theirs);
+    /** @param {number} n */
+    const slotOf = n=>n & (slots - 1);
+
+    /** The other side's calls this side took, and whether one taken is not answered yet. */
+    let callsTaken = Atomics.load(words, theirs + ANSWERED);
     let holding = false;
-    /** This side's word calls, and whether one is out. */
-    let wordsAsked = Atomics.load(words, mine + ASKED);
-    let wordsOut = false;
 
     /**
-     * Answers the word call taken with what `reply` holds, or with `failure`,
-     * sent as a value before the answer's count: the asking side has it when
-     * it sees the answer.
+     * Answers the call taken with the `length` bytes its answer holds, or
+     * with `failure`, sent as a value before the answer's count: the asking
+     * side has it when it sees the answer.
      *
-     * @param {unknown} [failure]
+     * @param {unknown} [failure] @param {number} [length]
      */
-    const answerWords = failure=>{
+    const answerWords = (failure, length = size * 4)=>{
         if (!holding)
         {
-            throw new Error('link: an answer with no word call taken');
+            throw new Error('link: an answer with no call taken');
         }
         if (failure !== undefined)
         {
-            unlessClosed(()=>send(encodeValue([WORDS_FAILED, failureOf(failure)])));
+            unlessClosed(()=>send(encodeValue([WORDS_FAILED, callsTaken, failureOf(failure)])));
         }
+        const at = theirSlots[slotOf(callsTaken)].at;
         holding = false;
-        wordsTaken = (wordsTaken + 1) | 0;
-        words[theirs + FAILED] = failure === undefined ? 0 : 1;
-        Atomics.store(words, theirs + ANSWERED, wordsTaken);
+        words[at + FAILED] = failure === undefined ? 0 : 1;
+        words[at + ANSWER_BYTES] = failure === undefined ? length : 0;
+        callsTaken = (callsTaken + 1) | 0;
+        Atomics.store(words, theirs + ANSWERED, callsTaken);
         sent(outbound.bell.ring());
     };
-    /** The other side's word call, once one waits and is not taken yet: its request. */
+    /** The other side's next call, once one waits and is not taken yet: its request. */
     const takeWords = ()=>{
-        if (holding || Atomics.load(words, theirs + ASKED) === wordsTaken)
+        if (holding || Atomics.load(words, theirs + ASKED) === callsTaken)
         {
             return null;
         }
         holding = true;
-        return asked;
+        return theirSlots[slotOf(callsTaken)].request;
     };
-    /** Answers the word call waiting with the handler: 1 where there was one. */
+    /** Answers every call waiting with the handler: how many. */
     const serveWords = ()=>{
-        if (takeWords() === null)
+        let count = 0;
+        while (takeWords() !== null)
         {
-            return 0;
+            const slot = theirSlots[slotOf(callsTaken)];
+            let failure;
+            let length = size * 4;
+            try
+            {
+                const said = /** @type {WordsHandler} */ (wordsHandler)(slot.request, slot.answer,
+                    words[slot.at + REQUEST_BYTES]);
+                if (said !== undefined)
+                {
+                    if (!(said >= 0 && said <= size * 4))
+                    {
+                        throw new RangeError(`link: an answer of ${said} bytes, a slot holds ${size * 4}`);
+                    }
+                    length = said;
+                }
+            }
+            catch (e){
+                failure = e ?? new Error('link: a call in place failed');
+            }
+            answerWords(failure, length);
+            count++;
         }
-        let failure;
-        try
+        return count;
+    };
+
+    /** This side's calls in place: how many it sent; whose each slot's answer is, and its call's number. */
+    let callsSent = Atomics.load(words, mine + ASKED);
+    const owners = new Uint8Array(slots);
+    const numbers = new Int32Array(slots);
+    /** For a slot whose answer a promise takes: its reader and its promise's ends. */
+    const laterReads = /** @type {((answer: Uint8Array) => any)[]} */ (new Array(slots).fill(null));
+    const laterResolves = /** @type {((value: any) => void)[]} */ (new Array(slots).fill(null));
+    const laterRejects = /** @type {((reason: any) => void)[]} */ (new Array(slots).fill(null));
+    let later = 0;
+    /** Whether the word call is out, and its number. */
+    let wordsOut = false;
+    let wordsNumber = 0;
+
+    /** Whether this side's call `n` is answered. @param {number} n */
+    const callIn = n=>((Atomics.load(words, mine + ANSWERED) - n) | 0) > 0;
+
+    /**
+     * The answer of call `n`, in slot `slot`, read by `read` where it lies,
+     * the slot free again; its failure thrown.
+     *
+     * @template T @param {number} slot @param {number} n @param {(answer: Uint8Array) => T} read
+     * @returns {T}
+     */
+    const finish = (slot, n, read)=>{
+        const one = mySlots[slot];
+        owners[slot] = FREE;
+        if (words[one.at + FAILED] !== 0)
         {
-            /** @type {WordsHandler} */ (wordsHandler)(asked, reply);
+            // Its failure was sent before its answer: with the answer seen, it is in.
+            if (!failures.has(n))
+            {
+                pump();
+            }
+            const failure = failures.get(n) ?? { message: 'link: a call in place failed' };
+            failures.delete(n);
+            throw errorOf(failure);
         }
-        catch (e){
-            failure = e ?? new Error('link: a word call failed');
+        const length = words[one.at + ANSWER_BYTES];
+        if (one.answered.length !== length)
+        {
+            one.answered = one.answerBytes.subarray(0, length);
         }
-        answerWords(failure);
-        return 1;
+        return read(one.answered);
+    };
+
+    /** Answers come for calls whose promise takes them: settled, oldest first. */
+    const settleLater = ()=>{
+        for (let k = 0; k < slots && later > 0; k++)
+        {
+            const slot = slotOf(callsSent + k);
+            if (owners[slot] !== LATER || !callIn(numbers[slot]))
+            {
+                continue;
+            }
+            later--;
+            const read = laterReads[slot];
+            const resolve = laterResolves[slot];
+            const reject = laterRejects[slot];
+            laterReads[slot] = laterResolves[slot] = laterRejects[slot] = /** @type {any} */ (null);
+            let value;
+            try
+            {
+                value = finish(slot, numbers[slot], read);
+            }
+            catch (e){
+                reject(e);
+                continue;
+            }
+            resolve(value);
+        }
     };
 
     /**
@@ -488,6 +617,10 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         if (wordsHandler !== undefined)
         {
             count += serveWords();
+        }
+        if (later > 0)
+        {
+            settleLater();
         }
         return count;
     };
@@ -515,23 +648,21 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     const state = { serving: false, looping: false, closed: false };
     const closed = ()=>state.closed || inbound.closed();
 
-    /** Whether the word call out is answered. */
-    const wordsIn = ()=>Atomics.load(words, mine + ANSWERED) === wordsAsked;
-
     /**
-     * Blocks until the value call `id` is answered, or with `id` -1 this side's
-     * word call, handling everything the other side sends meanwhile; past
-     * `until` it throws. One loop for both, made with no closure: the word
-     * call's is the hot path.
+     * Blocks until the value call `id` is answered, or with `id` 0 this side's
+     * call in place `n`, handling everything the other side sends meanwhile;
+     * past `until` it throws. One loop for both, made with no closure: the
+     * call in place's is the hot path.
      *
      * @param {number} id @param {number} until @param {string} what @param {number} timeoutMs
+     * @param {number} [n]
      */
-    const waitFor = (id, until, what, timeoutMs)=>{
+    const waitFor = (id, until, what, timeoutMs, n = 0)=>{
         for (;;)
         {
             const seen = bell.seen();
             pump();
-            if (id < 0 ? wordsIn() : !waiting.has(id))
+            if (id === 0 ? callIn(n) : !waiting.has(id))
             {
                 return;
             }
@@ -575,6 +706,81 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             waiting.delete(id);
             call.reject(new LinkClosed(call.what));
         }
+        for (let slot = 0; slot < slots; slot++)
+        {
+            if (owners[slot] === LATER)
+            {
+                owners[slot] = FREE;
+                later--;
+                laterRejects[slot](new LinkClosed('a call in place'));
+            }
+        }
+    };
+
+    /**
+     * The slot of this side's next call in place, once it is free: an answer
+     * a promise takes is settled, and one not in yet waited for where this
+     * thread may block. A slot whose answer a wait or the word call is to
+     * take - a wait this call is made inside of - is not freed by waiting:
+     * every slot out is said.
+     *
+     * @param {string} what
+     */
+    const claim = what=>{
+        if (closed())
+        {
+            throw new LinkClosed(what);
+        }
+        const slot = slotOf(callsSent);
+        while (owners[slot] !== FREE)
+        {
+            if (owners[slot] !== LATER || !canBlock)
+            {
+                throw new Error(`link: ${what}: every call in place is out (${slots})`);
+            }
+            if (callIn(numbers[slot]))
+            {
+                settleLater();
+            }
+            else
+            {
+                waitFor(0, Infinity, what, Infinity, numbers[slot]);
+            }
+        }
+        return slot;
+    };
+
+    /**
+     * Sends the request written into `slot`, `length` bytes, its answer taken
+     * by `owner`: the call's number.
+     *
+     * @param {number} slot @param {number} length @param {number} owner
+     */
+    const sendInPlace = (slot, length, owner)=>{
+        const n = callsSent;
+        words[mySlots[slot].at + REQUEST_BYTES] = length;
+        owners[slot] = owner;
+        numbers[slot] = n;
+        callsSent = (callsSent + 1) | 0;
+        Atomics.store(words, mine + ASKED, callsSent);
+        sent(outbound.bell.ring());
+        return n;
+    };
+
+    /**
+     * Writes `request` into the next slot, once it is free: the slot.
+     *
+     * @param {ArrayLike<number>} request @param {string} what
+     */
+    const writeRequest = (request, what)=>{
+        const bytes = bytesOf(request, 'link');
+        if (bytes.length > size * 4)
+        {
+            throw new RangeError(`link: ${what} of ${bytes.length} bytes, a slot holds ${size * 4}`);
+        }
+        const slot = claim(what);
+        mySlots[slot].requestBytes.set(bytes);
+        return { slot, length: bytes.length };
     };
 
     /**
@@ -688,10 +894,74 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             failWaiting();
         },
 
-        /** This side's word call's request words: written before `sendWords`. */
-        request: words.subarray(mine + CALL_HEAD, mine + CALL_HEAD + size),
-        /** Its answer's words, once `answered` says it came: read before the next word call. */
-        answer: words.subarray(mine + CALL_HEAD + size, mine + stride),
+        /**
+         * Calls the other side in place and blocks until it answers, handling
+         * every call it is sent meanwhile: what `read` makes of the answer,
+         * read where it lies (valid only inside `read`). The request's bytes
+         * are copied into the link's memory. Only where the thread may block.
+         *
+         * @template T
+         * @param {ArrayLike<number>} request @param {(answer: Uint8Array) => T} read
+         * @param {number} [timeoutMs]
+         * @returns {T}
+         */
+        askBytes(request, read, timeoutMs = Infinity){
+            const { slot, length } = writeRequest(request, 'a call in place');
+            const n = sendInPlace(slot, length, WAITED);
+            if (!callIn(n))
+            {
+                try
+                {
+                    waitFor(0, performance.now() + timeoutMs, 'a call in place', timeoutMs, n);
+                }
+                catch (e){
+                    // Its answer, if one comes, goes to nobody.
+                    owners[slot] = LATER;
+                    later++;
+                    laterReads[slot] = ()=>undefined;
+                    laterResolves[slot] = laterRejects[slot] = ()=>{};
+                    throw e;
+                }
+            }
+            return finish(slot, n, read);
+        },
+
+        /**
+         * Calls the other side in place and hands back a promise of what
+         * `read` makes of the answer, which `pump` - or `serve` - settles.
+         * With every slot out, a thread that may block waits for one; one
+         * that may not is refused.
+         *
+         * @template T
+         * @param {ArrayLike<number>} request @param {(answer: Uint8Array) => T} read
+         * @returns {Promise<T>}
+         */
+        callBytes(request, read){
+            try
+            {
+                const { slot, length } = writeRequest(request, 'a call in place');
+                const answered = new Promise((resolve, reject)=>{
+                    laterReads[slot] = read;
+                    laterResolves[slot] = resolve;
+                    laterRejects[slot] = reject;
+                });
+                later++;
+                sendInPlace(slot, length, LATER);
+                return answered;
+            }
+            catch (e){
+                return Promise.reject(e);
+            }
+        },
+
+        /** This side's next word call's request words: written before `sendWords`. */
+        get request(){
+            return mySlots[slotOf(callsSent)].request;
+        },
+        /** The word call's answer words, once `answered` says it came: read before the next call. */
+        get answer(){
+            return mySlots[slotOf(wordsNumber)].answer;
+        },
 
         /**
          * Sends this side's word call, its words written into `request`, and
@@ -703,14 +973,9 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             {
                 throw new Error('link: a word call while another is out');
             }
-            if (closed())
-            {
-                throw new LinkClosed('a word call');
-            }
+            const slot = claim('a word call');
+            wordsNumber = sendInPlace(slot, size * 4, WORD_CALL);
             wordsOut = true;
-            wordsAsked = (wordsAsked + 1) | 0;
-            Atomics.store(words, mine + ASKED, wordsAsked);
-            sent(outbound.bell.ring());
         },
 
         /**
@@ -719,22 +984,12 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
          * where its handler threw.
          */
         answered(){
-            if (!wordsOut || !wordsIn())
+            if (!wordsOut || !callIn(wordsNumber))
             {
                 return false;
             }
             wordsOut = false;
-            if (words[mine + FAILED] !== 0)
-            {
-                // Its failure was sent before its answer: with the answer seen, it is in.
-                if (wordsFailure === null)
-                {
-                    pump();
-                }
-                const failure = wordsFailure;
-                wordsFailure = null;
-                throw errorOf(failure);
-            }
+            finish(slotOf(wordsNumber), wordsNumber, NO_READ);
             return true;
         },
 
@@ -749,20 +1004,22 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             {
                 throw new Error('link: no word call out to wait for');
             }
-            if (!wordsIn())
+            if (!callIn(wordsNumber))
             {
-                waitFor(-1, performance.now() + timeoutMs, 'a word call', timeoutMs);
+                waitFor(0, performance.now() + timeoutMs, 'a word call', timeoutMs, wordsNumber);
             }
             self.answered();
         },
 
-        /** Where this side writes its answer to the word call taken before `answerWords`. */
-        reply,
+        /** Where this side writes its answer to the call taken before `answerWords`. */
+        get reply(){
+            return theirSlots[slotOf(callsTaken)].answer;
+        },
 
         /**
-         * The other side's word call, for a side with no handler of them: its
-         * request's words once one waits and this side has not taken it, or
-         * null. Answered by `answerWords`.
+         * The other side's next call in place, for a side with no handler of
+         * them: its request's words once one waits and this side has not taken
+         * it, or null. Answered by `answerWords`.
          *
          * @returns {Int32Array | null}
          */

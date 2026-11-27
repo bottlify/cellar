@@ -7,7 +7,7 @@ A Reader on a thread that is not the Keeper's asks the Keeper for room and for c
 ```js
 // the Keeper's thread
 const answer = answerKeeper({ keeper, owners: { own: kind=>`${kind}/${++n}/`, release: (prefix, held)=>keeper.release(prefix) } });
-serveKeeperChannel(channel, answer);                 // or: openLink(end, { ...keeperHandlers(answer), ...mine })
+serveKeeperChannel(channel, answer);                 // or: openLink(end, mine, { words: keeperWords(answer) })
 
 // the Reader's thread
 const client = openKeeperClient(openClient(channel)); // or: openKeeperClient(linkCarrier(link))
@@ -17,16 +17,16 @@ const place = await client.reserveLater('texels/1/a', 4096, { onlyCopy: true, di
 
 | API | Behaviour |
 | --- | --- |
-| `answerKeeper({ keeper, owners })` | The Keeper's side: a request's answer, in memory it writes over at the next request. `owners` (`own`, `release`) is optional; without it an owner's request is a failure. |
+| `answerKeeper({ keeper, owners })` | The Keeper's side: answers a request where it lies into the memory it is handed. `owners` (`own`, `release`) is optional; without it an owner's request is a failure. |
 | `serveKeeperChannel(memory, answer)` | Serves a channel on the event loop until either side closes it; `ended` once it is, every request sent before the close answered. Where the thread may block, it looks for the next request briefly before it waits on the event loop. |
-| `keeperHandlers(answer)` | The handlers a link's Keeper side adds to its own. |
-| `linkCarrier(link)` | A link's asking side as the client's carrier. |
+| `keeperWords(answer)` | The handler of a link's calls in place (`openLink`'s `words`) on the Keeper's side. |
+| `linkCarrier(link)` | A link's asking side as the client's carrier: its calls in place (`askBytes`, `callBytes`). |
 | `openKeeperClient(carrier, { onFailure })` | `keeper` (`KeeperCalls` for `createReader`), `reserveLater`, `own`, `release`, `releaseLater`. |
 
 ## Which carrier
 
 - **Channel** for a thread the Keeper's thread never waits on (a worker writing the cache on its own). Requests are out at once up to the channel's slots, more wait for room, and they are served on the Keeper's event loop.
-- **Link** for a thread the Keeper's thread calls and waits on. A link's waiting side answers the other's calls inside its wait, so the Keeper's thread answers a reserve while it waits on that thread, and that thread answers the Keeper's calls while it waits for its reserve. Over a channel the two waits would hold each other for good.
+- **Link** (its [calls in place](link.md#calls-in-place), sized for the longest name with `words`, and `slots` for the calls out at once) for a thread the Keeper's thread calls and waits on. A link's waiting side answers the other's calls inside its wait, so the Keeper's thread answers a reserve while it waits on that thread, and that thread answers the Keeper's calls while it waits for its reserve. Over a channel the two waits would hold each other for good.
 
 Both carry the same bytes, and blocking and asynchronous calls use the same format.
 
@@ -56,7 +56,7 @@ An answer is five words, the first its status:
 
 An unknown op or a malformed request is refused and nothing is done for it; the client throws the failure where it asked. A call not waited on (`raiseLater`, `drop`) that fails goes to `onFailure`, by default thrown where nothing catches it; one that fails because the carrier closed is not a failure, since nothing is left to answer.
 
-A name of ASCII is written and read without an object of its own; a fixed answer is read where it lies. A reserve makes its `Place`, which `KeeperCalls` hands back. A request sent without waiting is copied first, since a channel full of requests writes it only when a slot frees. A name longer than the carrier holds (a channel's `slotBytes`, less the five words) is refused by the carrier when it is sent.
+A name of ASCII is written and read without an object of its own; a fixed answer is read where it lies. A reserve makes its `Place`, which `KeeperCalls` hands back. A request and its answer lie on a four-byte boundary, as both carriers' slots do. Calls keep the order they were made in over both carriers: a channel full of requests copies a call and sends it when a slot frees, before anything asked after it. A name longer than the carrier holds (a channel's `slotBytes`, or a link's `words` times four, less the five words) is refused by the carrier when it is sent.
 
 ## Closing
 

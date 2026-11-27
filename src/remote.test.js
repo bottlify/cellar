@@ -17,7 +17,7 @@ import { cacheOf } from './cache.fixture.js';
 import { createChannel, openClient } from './channel.js';
 import { createLinkMemory, openLink } from './link.js';
 import { createReader } from './reader.js';
-import { answerKeeper, keeperHandlers, linkCarrier, openKeeperClient, serveKeeperChannel } from './remote.js';
+import { answerKeeper, keeperWords, linkCarrier, openKeeperClient, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
 
 /** A reservation of no options, in any segment. */
@@ -71,8 +71,8 @@ async function served(carrier){
     }
     else
     {
-        const { a, b } = createLinkMemory({ capacity: 1 << 16 });
-        const keeperSide = openLink(a, keeperHandlers(answer));
+        const { a, b } = createLinkMemory({ capacity: 1 << 16, words: 64, slots: 4 });
+        const keeperSide = openLink(a, {}, { words: keeperWords(answer) });
         const asking = openLink(b);
         // Calls not waited on are answered on each side's event loop.
         keeperSide.serve();

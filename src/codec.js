@@ -20,6 +20,8 @@
  * with no partner, which UTF-8 cannot say, its UTF-16 units.
  */
 
+import { readText, readUnits, wellFormed, writeText } from './text.js';
+
 const UNDEFINED = 0;
 const NULL = 1;
 const FALSE = 2;
@@ -31,24 +33,6 @@ const BYTES = 7;
 const ARRAY = 8;
 const OBJECT = 9;
 const UNITS = 10;
-
-/** A surrogate with no partner: what UTF-8 cannot carry. */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-/** Whether shared memory exists here: a browser's decoder refuses a view of it. */
-const SHARED = typeof SharedArrayBuffer === 'function';
-
-/**
- * UTF-8 bytes as text, wherever they lie: a view of shared memory, a ring's
- * record, is copied out first, as every browser refuses to decode one in place.
- *
- * @param {Uint8Array} bytes
- * @returns {string}
- */
-export const textOf = bytes=>decoder.decode(SHARED && bytes.buffer instanceof SharedArrayBuffer
-    ? bytes.slice() : bytes);
 
 /**
  * A growing buffer the encoder writes into.
@@ -96,6 +80,13 @@ function createWriter(){
             room(8);
             view.setFloat64(length, value, true);
             length += 8;
+        },
+        /** Its UTF-8 bytes after their count. @param {string} value */
+        text(value){
+            room(4 + value.length * 3);
+            const written = writeText(bytes, length + 4, value);
+            view.setUint32(length, written, true);
+            length += 4 + written;
         },
         /** @param {Uint8Array} value */
         raw(value){
@@ -146,12 +137,10 @@ function put(out, value, depth){
     }
     else if (typeof value === 'string')
     {
-        if (!LONE_SURROGATE.test(value))
+        if (wellFormed(value))
         {
-            const text = encoder.encode(value);
             out.u8(STRING);
-            out.u32(text.length);
-            out.raw(text);
+            out.text(value);
         }
         else
         {
@@ -242,17 +231,14 @@ export function decodeValue(bytes){
             }
             case STRING: {
                 const length = u32();
-                const text = textOf(bytes.subarray(at, at + length));
+                const text = readText(bytes, at, length);
                 at += length;
                 return text;
             }
             case UNITS: {
                 const length = u32();
-                let text = '';
-                for (let i = 0; i < length; i++, at += 2)
-                {
-                    text += String.fromCharCode(bytes[at] | bytes[at + 1] << 8);
-                }
+                const text = readUnits(bytes, at, length, true);
+                at += length * 2;
                 return text;
             }
             case BYTES: {

@@ -10,7 +10,6 @@
  *
  *   local           `keeper.reserve` on the keeper's thread
  *   channel         a blocking ask over a channel served on the event loop
- *   channel spin    the same, the keeper's thread blocked in `serve`
  *   channel async   `reserveLater`, each awaited before the next
  *   link            a blocking ask over a link served on the event loop
  *
@@ -24,10 +23,10 @@
  */
 
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
-import { createChannel, openClient, openServer } from '../src/channel.js';
+import { createChannel, openClient } from '../src/channel.js';
 import { openKeeper } from '../src/keeper.js';
 import { createLinkMemory, openLink } from '../src/link.js';
-import { answerKeeper, keeperHandlers, linkCarrier, openKeeperClient, serveKeeperChannel } from '../src/remote.js';
+import { answerKeeper, keeperWords, linkCarrier, openKeeperClient, serveKeeperChannel } from '../src/remote.js';
 
 const BODY = 256;
 
@@ -78,23 +77,22 @@ if (isMainThread)
             return { us, worker: [], keeper: bytes };
         },
         channel: ()=>across('channel'),
-        'channel spin': ()=>across('channel', true),
         'channel async': ()=>across('async'),
         link: ()=>across('link'),
     };
     /**
-     * @param {'channel' | 'async' | 'link'} carrier @param {boolean} [spin]
+     * @param {'channel' | 'async' | 'link'} carrier
      */
-    async function across(carrier, spin = false){
-        const memory = carrier === 'link' ? createLinkMemory({ capacity: 1 << 16 }) : createChannel();
+    async function across(carrier){
+        const memory = carrier === 'link' ? createLinkMemory({ capacity: 1 << 16, words: 64, slots: 4 }) : createChannel();
         /** @type {any} */
         let serving;
         if (carrier === 'link')
         {
-            serving = openLink(/** @type {any} */ (memory).a, keeperHandlers(answer));
+            serving = openLink(/** @type {any} */ (memory).a, {}, { words: keeperWords(answer) });
             serving.serve();
         }
-        else if (!spin)
+        else
         {
             serving = serveKeeperChannel(/** @type {SharedArrayBuffer} */ (memory), answer);
         }
@@ -107,21 +105,11 @@ if (isMainThread)
             worker.once('message', resolve);
             worker.once('error', reject);
         }));
-        const server = spin ? openServer(/** @type {SharedArrayBuffer} */ (memory)) : null;
         for (let round = 0; round <= ROUNDS; round++)
         {
             const before = heap();
             const done = next();
             worker.postMessage('go');
-            if (server)
-            {
-                // Blocked serving until the round's last answer.
-                let served = 0;
-                while (served < OPS)
-                {
-                    served += server.serve(answer);
-                }
-            }
             const said = await done;
             const grew = process.memoryUsage().heapUsed - before;
             keeper.release('r/');
@@ -133,7 +121,7 @@ if (isMainThread)
             }
         }
         await worker.terminate();
-        (serving ?? server)?.close();
+        serving.close();
         return { us, worker: workerBytes, keeper: keeperBytes };
     }
     console.log(`reserve of ${BODY} B, ${OPS} a round, ${ROUNDS} rounds after a warm-up; node ${process.version}`);

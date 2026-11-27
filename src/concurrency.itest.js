@@ -19,7 +19,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { channelMemory, serve } from './channel.fixture.js';
+import { createChannel } from './channel.js';
+import { answerKeeper, serveKeeperChannel } from './remote.js';
 import { openKeeper } from './keeper.js';
 import { memoryDisk } from './disk.fixture.js';
 
@@ -55,12 +56,8 @@ async function gate(options){
     const done = [];
     for (let t = 0; t < THREADS; t++)
     {
-        const memory = channelMemory();
-        links.push(serve(memory, {
-            reserve: (name, length, options)=>keeper.reserve(name, length, options ?? {}),
-            raise: (name, options)=>keeper.raise(name, options ?? {}),
-            drop: name=>keeper.drop(name),
-        }));
+        const memory = createChannel();
+        links.push(serveKeeperChannel(memory, answerKeeper({ keeper })));
         const worker = new Worker(new URL('./concurrency.worker.fixture.js', import.meta.url), {
             workerData: { channel: memory, shared: keeper.shared, segments: keeper.segmentBuffers(),
                 seed: 0x9e3779b9 + t * 7919, operations: 6000, least: LEAST, pool: POOL, thread: t,
@@ -87,7 +84,7 @@ async function gate(options){
         clearInterval(sweeping);
         for (const link of links)
         {
-            link.stop();
+            link.close();
         }
         await Promise.all(workers.map(worker=>worker.terminate()));
     }

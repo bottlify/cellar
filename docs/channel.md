@@ -19,7 +19,7 @@ const valueLater = await client.call(request, { read: answer=>answer[0] });
 | `openClient(memory)` | Opens the asking side. |
 | `openServer(memory)` | Opens the serving side. |
 | `ask(request, options)` | Blocking request; optional timeout and in-place read callback. |
-| `call(request, options)` | Asynchronous request; waits for room when full. |
+| `call(request, options)` | Asynchronous request; with no room, copied and sent once a slot frees, before any request made after it. |
 | `serve(handler, options)` | Answers pending requests; blocks for work if needed. |
 | `serveAsync(handler, options)` | Asynchronous serving. |
 | `close()` | Ends the channel on both sides. |

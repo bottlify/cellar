@@ -557,12 +557,80 @@ test('word calls go both ways at once, nested, and a failure crosses as a value'
         && e.message === 'no handler');
     executor.reply[0] = traps.reduce((x, y)=>x + y, 0);
     executor.answerWords();
-    assert.throws(()=>executor.answerWords(), /no word call taken/);
+    assert.throws(()=>executor.answerWords(), /no call taken/);
     assert.equal(process.answered(), true);
     assert.equal(process.answer[0], 60);
     assert.equal(process.answered(), false, 'taken once');
     executor.close();
     assert.throws(()=>process.sendWords(), LinkClosed);
+});
+
+test('calls in place: bytes each way, several out at once, answers read where they lie, in order',
+    async()=>{
+        const { a, b } = createLinkMemory({ words: 4, slots: 4 });
+        /** @type {number[]} */
+        const seen = [];
+        // The answer: the request's bytes doubled, as long as the request says.
+        const server = open(a, {}, { words: (request, answer, length)=>{
+            const bytes = new Uint8Array(request.buffer, request.byteOffset, length);
+            const out = new Uint8Array(answer.buffer, answer.byteOffset, length);
+            seen.push(bytes[0]);
+            for (let n = 0; n < length; n++)
+            {
+                out[n] = bytes[n] * 2;
+            }
+            if (bytes[0] === 99)
+            {
+                throw Object.assign(new Error('refused'), { code: 7 });
+            }
+            return bytes[0] === 98 ? 17 : length;
+        } });
+        const asking = open(b, {});
+        const later = [1, 2, 3].map(tag=>asking.callBytes([tag, tag], answer=>[...answer]));
+        assert.deepEqual(asking.askBytes([4, 5, 6], answer=>[...answer]), [8, 10, 12],
+            'its own answer, read in place, after the calls before it');
+        assert.deepEqual(await Promise.all(later), [[2, 2], [4, 4], [6, 6]]);
+        assert.deepEqual(seen, [1, 2, 3, 4], 'answered in the order they went');
+        assert.throws(()=>asking.askBytes([99], ()=>null), (/** @type {any} */ e)=>e.code === 7
+            && e.message === 'refused');
+        assert.throws(()=>asking.askBytes([98], ()=>null), /an answer of 17 bytes, a slot holds 16/);
+        assert.throws(()=>asking.askBytes(new Uint8Array(17), ()=>null), /a slot holds 16/);
+        assert.deepEqual(asking.askBytes([], answer=>answer.length), 0, 'no bytes either way');
+        server.close();
+        await assert.rejects(asking.callBytes([1], ()=>null), LinkClosed);
+    });
+
+test('a call in place made inside the wait for another takes the next slot; with none left it '
+    + 'is refused, said', async()=>{
+    for (const slots of [2, 1])
+    {
+        const { a, b } = createLinkMemory({ words: 2, slots });
+        /** @type {ReturnType<typeof openLink>} */
+        let asking;
+        // The side asked calls back with a value before it answers: the asking
+        // side answers that inside its wait, with a call in place of its own.
+        const server = open(a, {}, { words: (request, answer)=>{
+            answer[0] = request[0] + 1;
+        } });
+        let inner = /** @type {any} */ (null);
+        asking = open(b, { back: { now: ()=>{
+            try
+            {
+                inner = asking.askBytes([7, 0, 0, 0], answer=>answer[0]);
+            }
+            catch (e){
+                inner = String(e);
+            }
+            return null;
+        } } });
+        const back = server.call('back', 'now');
+        // The value call is in before the call in place's answer.
+        assert.equal(asking.askBytes([1, 0, 0, 0], answer=>answer[0]), 2);
+        server.pump();
+        assert.equal(await back, null, 'the value call answered too');
+        assert.equal(inner, slots === 2 ? 8 : 'Error: link: a call in place: every call in place is out (1)');
+        server.close();
+    }
 });
 
 test('memory that is no link is refused', ()=>{

@@ -32,6 +32,8 @@
  * base, so the bodies it names are not lost to the change of layout.
  */
 
+import { readUnits, textOf } from './text.js';
+
 const MAGIC = 0x32584943;
 export const BASE = 1;
 export const DELTA = 2;
@@ -227,19 +229,7 @@ export function readChunk(bytes, at, maxPacks){
         {
             return null;
         }
-        let name = '';
-        // In pieces: a name passed whole as arguments can be longer than a
-        // call may take.
-        for (let from = 0; from < units; from += 8192)
-        {
-            const piece = Math.min(8192, units - from);
-            const codes = new Array(piece);
-            for (let i2 = 0; i2 < piece; i2++)
-            {
-                codes[i2] = narrow ? bytes[top + from + i2] : view.getUint16(top + (from + i2) * 2, true);
-            }
-            name += String.fromCharCode(...codes);
-        }
+        const name = readUnits(bytes, top, units, !narrow);
         top += span;
         entries.push([name, { pack, offset, length: bodyLength, flags }]);
     }
@@ -339,7 +329,7 @@ function readVersion1(bytes, maxPacks, onlyCopy){
     let saved;
     try
     {
-        saved = JSON.parse(new TextDecoder().decode(bytes));
+        saved = JSON.parse(textOf(bytes));
     }
     catch {
         // Torn mid-write: the other file is the index.

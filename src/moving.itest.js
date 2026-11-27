@@ -15,7 +15,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { channelMemory, serve } from './channel.fixture.js';
+import { createChannel } from './channel.js';
+import { answerKeeper, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
 import { openKeeper } from './keeper.js';
 import { createReader } from './reader.js';
@@ -64,10 +65,8 @@ test('a thread waiting on a body the keeper is moving to the disk reads it once 
         } });
         const body = Uint8Array.from({ length: 30_000 }, (_, i)=>(i * 7 + 3) & 255);
         assert.equal(reader.put('doc', body, { onlyCopy: true }), true);
-        const channel = channelMemory();
-        const link = serve(channel, {
-            raise: (name, options)=>keeper.raise(name, options ?? {}),
-        });
+        const channel = createChannel();
+        const link = serveKeeperChannel(channel, answerKeeper({ keeper }));
         worker = new Worker(new URL('./moving.worker.fixture.js', import.meta.url), {
             workerData: { channel, shared: keeper.shared, segments: keeper.segmentBuffers(),
                 phase: phase.buffer, waits: WAITS },
@@ -106,7 +105,7 @@ test('a thread waiting on a body the keeper is moving to the disk reads it once 
         }
         finally
         {
-            link.stop();
+            link.close();
             await worker.terminate();
         }
     });

@@ -19,7 +19,7 @@ import { Worker } from 'node:worker_threads';
 import { cacheOf } from './cache.fixture.js';
 import { createChannel } from './channel.js';
 import { createLinkMemory, openLink } from './link.js';
-import { answerKeeper, keeperHandlers, serveKeeperChannel } from './remote.js';
+import { answerKeeper, keeperWords, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
 
 const MIB = 1024 * 1024;
@@ -49,12 +49,13 @@ async function across(carrier, { cache: options = {}, slots = 16, closeAfter = I
         release: prefix=>cache.keeper.release(prefix),
     } });
     let answered = 0;
-    const answer = (/** @type {Uint8Array} */ request)=>{
+    /** @type {typeof plain} */
+    const answer = (...args)=>{
         if (++answered === closeAfter)
         {
             serving.close();
         }
-        return plain(request);
+        return plain(...args);
     };
     /** @type {any} */
     let memory;
@@ -69,9 +70,9 @@ async function across(carrier, { cache: options = {}, slots = 16, closeAfter = I
     }
     else
     {
-        const ends = createLinkMemory({ capacity: 1 << 16 });
+        const ends = createLinkMemory({ capacity: 1 << 16, words: 64, slots: 4 });
         memory = ends.b;
-        link = openLink(ends.a, keeperHandlers(answer));
+        link = openLink(ends.a, {}, { words: keeperWords(answer) });
         link.serve();
         serving = link;
     }
