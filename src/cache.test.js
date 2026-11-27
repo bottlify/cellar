@@ -13,6 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { UNIT } from './buddy.js';
 import { bodyOf, cacheOf } from './cache.fixture.js';
+import { bytesPerCall } from './allocation.fixture.js';
 import { crashDisk } from './disk.fixture.js';
 import { createReader } from './reader.js';
 import { HEADER_WORDS, HOT, H_NAMES, H_TICK, MOVING, RECORD_WORDS, R_STATE, stateWord, viewIndex } from './shared.js';
@@ -258,6 +259,38 @@ test('memory held is never taken back: written and read in place by its holder f
     step(1);
     assert.equal(reader.put('c', bodyOf(2 * UNIT, 3)), true, 'its room given back');
     assert.deepEqual(keeper.under('sound/').bodies, 0);
+});
+
+test('a hot body read again is read through the same view, made anew only where the body moved'
+    + ' or the name was written again', async()=>{
+    const { reader } = await cacheOf({ coldAfterMs: 1e6, goneAfterMs: 1e6 });
+    assert.ok(reader.put('glyphs', bodyOf(300, 3)));
+    const first = reader.with('glyphs', body=>body);
+    const second = reader.with('glyphs', body=>body);
+    assert.equal(second, first, 'one view, not one a read');
+    assert.deepEqual([.../** @type {Uint8Array} */ (second)], [...bodyOf(300, 3)]);
+    assert.ok(reader.put('glyphs', bodyOf(500, 7)), 'written again, elsewhere');
+    const third = reader.with('glyphs', body=>body);
+    assert.notEqual(third, first);
+    assert.deepEqual([.../** @type {Uint8Array} */ (third)], [...bodyOf(500, 7)],
+        'the new body, not the old view');
+    // A read of a hot body makes nothing of its own: a view a read was about
+    // 96 bytes, garbage on every per-item read (a glyph, a table entry).
+    let sum = 0;
+    /** @param {Uint8Array} body */
+    const first8 = body=>body[0];
+    let around = 0;
+    // Against the same loop with an empty synchronous body: the fixture
+    // awaits each call, which a synchronous body's undefined pays for too.
+    const bytes = await bytesPerCall(()=>{
+        sum += reader.with('glyphs', first8) ?? 0;
+        return undefined;
+    }, { calls: 4000, empty: ()=>{
+        around++;
+        return undefined;
+    } });
+    assert.ok(sum > 0 && around > 0);
+    assert.ok(bytes < 16, `${bytes.toFixed(1)} bytes a read`);
 });
 
 test('an owner released takes its held memory with it: the room is the next body\'s at once, its'

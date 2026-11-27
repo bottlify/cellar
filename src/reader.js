@@ -135,6 +135,18 @@ export function createReader({ shared, segments = [], keeper }){
     let readValue;
 
     /**
+     * The view each record's hot body was last read through, by record id:
+     * handed again while the record's segment, offset and length are what
+     * they were, so a read of a hot body makes no view of its own - a body
+     * read item by item (a glyph, a table entry) makes no garbage a read.
+     * Dropped with the segment it is over (`adopt`), so it keeps no segment
+     * let go of alive.
+     *
+     * @type {(Uint8Array | undefined)[]}
+     */
+    const bodyViews = [];
+
+    /**
      * Reads the body of the name `found`, `length` units long, inside `read`,
      * where it is hot here: DONE with the value in `readValue`, or why not. A
      * hit makes no object of its own.
@@ -169,7 +181,15 @@ export function createReader({ shared, segments = [], keeper }){
                 return UNSEEN;
             }
             const offset = words[base + R_OFFSET];
-            readValue = read(view.subarray(offset, offset + words[base + R_LENGTH]));
+            const bodyLength = words[base + R_LENGTH];
+            let body = bodyViews[id];
+            if (body === undefined || body.buffer !== view.buffer
+                || body.byteOffset !== view.byteOffset + offset || body.length !== bodyLength)
+            {
+                body = view.subarray(offset, offset + bodyLength);
+                bodyViews[id] = body;
+            }
+            readValue = read(body);
             index.stamp(id);
             return DONE;
         }
@@ -328,7 +348,18 @@ export function createReader({ shared, segments = [], keeper }){
                 {
                     views.push(undefined);
                 }
+                const before = views[message.segment];
                 views[message.segment] = message.buffer ? new Uint8Array(message.buffer) : null;
+                if (before)
+                {
+                    for (let id = 0; id < bodyViews.length; id++)
+                    {
+                        if (bodyViews[id]?.buffer === before.buffer)
+                        {
+                            bodyViews[id] = undefined;
+                        }
+                    }
+                }
                 while (heard < views.length && views[heard] !== undefined)
                 {
                     heard++;

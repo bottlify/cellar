@@ -76,6 +76,7 @@ The example omits application shutdown and error reporting. The Keeper must be a
 ## Reading
 
 - `with(name, read, { wait })` calls `read` with an in-place view, or returns `undefined` on a miss. The body is pinned during the synchronous callback only. Do not keep the view or mutate it.
+- `with(name, read)` hands `read` a view of the body where it lies, valid only inside `read`. A hot body read again is read through the same view while it stays where it is, so a read makes no object of its own and a body read item by item (a glyph, a table entry) makes no garbage per read.
 - `hold(name, length)` returns memory the reader writes and reads in place for as long as it holds it: a reservation the Keeper never takes back (`abandonAfterMs` does not apply), never cools, moves or writes to disk, and no one reads through `with`. It counts under its name (`under`) and against the budget like a body. `abandon(name)` lets it go; its room returns at the next sweep. Use it for working memory with an owner, such as a ring a realtime thread reads, not for values.
 - A moving body is reported as cold by `look`; a normal `with` misses and asks for it back. With `wait: true`, a blocking promotion is attempted and the body is read once the move is over, if available.
 - A terminated thread inside `with` leaves its reader count held for the run. The count is not associated with a thread; time-based reclamation would also reclaim bodies from merely slow readers.
