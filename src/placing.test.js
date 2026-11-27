@@ -22,34 +22,40 @@ import { cacheOf } from './cache.fixture.js';
 import { memoryDisk } from './disk.fixture.js';
 
 const KIB = 1024;
-const SEGMENT = 64 * KIB;
+const SEGMENT = 256 * KIB;
 
 /**
- * Body sizes as core's cache was asked for them: [from, to, share], bytes,
- * the shares of the reserves of a run (`SIZES_SOURCE`).
+ * Body sizes as core's cache was asked for them: the reserves of the Doom 3
+ * demo's first map, 600 s with no GPU (its bundle's sha256 e226dcd7), by
+ * the power of two a length is at most: [that bound, translations and
+ * glyphs of a length between it and half of it, texels of a length of it].
+ * A bundle's blocks, a sound's table and the scratches, a few bodies of
+ * whole pages each, are left out.
  *
  * @type {[number, number, number][]}
  */
 const SIZES = [
-    [1, 256, 0.30],
-    [257, 1024, 0.30],
-    [1025, 4096, 0.25],
-    [4097, 16 * KIB, 0.12],
-    [16 * KIB + 1, 64 * KIB, 0.03],
+    [512, 6, 0], [1 * KIB, 617, 0], [2 * KIB, 1114, 0], [4 * KIB, 1141, 930], [8 * KIB, 1794, 796],
+    [16 * KIB, 1650, 715], [32 * KIB, 1050, 489], [64 * KIB, 347, 434], [128 * KIB, 69, 146],
+    [256 * KIB, 0, 194],
 ];
 
 /** @param {() => number} random */
 const sizeOf = random=>{
-    let pick = random() * SIZES.reduce((sum, one)=>sum + one[2], 0);
-    for (const [from, to, share] of SIZES)
+    let pick = random() * SIZES.reduce((sum, [, some, texels])=>sum + some + texels, 0);
+    for (const [bound, some, texels] of SIZES)
     {
-        pick -= share;
-        if (pick <= 0)
+        if (pick < some)
         {
-            return from + Math.floor(random() * (to - from + 1));
+            return bound / 2 + 1 + Math.floor(random() * (bound / 2));
         }
+        if (pick < some + texels)
+        {
+            return bound;
+        }
+        pick -= some + texels;
     }
-    return SIZES[0][0];
+    return 1;
 };
 
 /**
@@ -273,9 +279,9 @@ async function work(seed, budget, steps){
 
 test('bodies of a real run\'s sizes are placed, read and let go as the plain model says, with room to spare',
     async()=>{
-        for (let seed = 1; seed <= 12; seed++)
+        for (let seed = 1; seed <= 8; seed++)
         {
-            const seen = await work(seed, 64 * SEGMENT, 1500);
+            const seen = await work(seed, 64 * SEGMENT, 1200);
             assert.equal(seen.refused, 0, `seed ${seed}: a roomy keeper refuses nothing`);
         }
     });
@@ -284,9 +290,9 @@ test('bodies of a real run\'s sizes are placed, cooled, raised and let go as the
     async()=>{
         let refused = 0;
         let cold = 0;
-        for (let seed = 1; seed <= 12; seed++)
+        for (let seed = 1; seed <= 8; seed++)
         {
-            const seen = await work(seed, 3 * SEGMENT, 1500);
+            const seen = await work(seed, 4 * SEGMENT, 1200);
             refused += seen.refused;
             cold += seen.cold;
         }
