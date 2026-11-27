@@ -7,8 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { createDoorbell, createSpin, deadlineOf, learnt, nextLooks, openDoorbell, publish, waitFor,
-    waitForAsync, wake } from './bell.js';
+import { createDoorbell, createSpin, deadlineOf, learnt, mayWait, nextLooks, openDoorbell, publish,
+    waitFor, waitForAsync, wake } from './bell.js';
 import { bytesPerCall } from './allocation.fixture.js';
 
 const WORD = 0;
@@ -399,5 +399,42 @@ test('waits on the event loop asleep at once hold a node thread with one timer, 
     finally
     {
         globalThis.setInterval = made;
+    }
+});
+
+test('a thread says whether it may block: a worker may, one whose Atomics.wait throws may not',
+    async()=>{
+    assert.equal(mayWait(), true);
+    const there = await new Promise((resolve, reject)=>{
+        const worker = new Worker(`
+            const { parentPort, workerData } = require('node:worker_threads');
+            import(workerData).then(({ mayWait })=>parentPort.postMessage(mayWait()));`,
+        { eval: true, workerData: new URL('./bell.js', import.meta.url).href });
+        worker.once('message', resolve);
+        worker.once('error', reject);
+    });
+    assert.equal(there, true);
+    const wait = Atomics.wait;
+    Atomics.wait = ()=>{
+        throw new TypeError('Atomics.wait cannot be called in this context');
+    };
+    try
+    {
+        assert.equal(mayWait(), false, 'a page\'s own thread, cross-origin isolated');
+    }
+    finally
+    {
+        Atomics.wait = wait;
+    }
+    const shared = globalThis.SharedArrayBuffer;
+    // @ts-ignore - removed for the test, put back below
+    delete globalThis.SharedArrayBuffer;
+    try
+    {
+        assert.equal(mayWait(), false, 'a thread without shared memory');
+    }
+    finally
+    {
+        globalThis.SharedArrayBuffer = shared;
     }
 });

@@ -4,7 +4,7 @@
 
 Bell is the synchronization primitive under Channel and Ring. A waiting thread looks at a shared word, registers its wait in a separate counter, looks again, and sleeps when needed. A publishing thread changes the word and only notifies when a wait is registered. The final check closes the window between looking and sleeping.
 
-`waitFor`, `waitForAsync`, `wake`, `publish` and `ring` can also be used over an Int32Array for a custom protocol. A closed word ends a wait with `closed` unless the watched word has moved first. `deadlineOf(timeoutMs)` makes an absolute deadline on the clock used by the wait. Without `Atomics.waitAsync`, async waits poll at approximately one millisecond. A blocking wait must not run on the browser main thread.
+`waitFor`, `waitForAsync`, `wake`, `publish` and `ring` can also be used over an Int32Array for a custom protocol. A closed word ends a wait with `closed` unless the watched word has moved first. `deadlineOf(timeoutMs)` makes an absolute deadline on the clock used by the wait. Without `Atomics.waitAsync`, async waits poll at approximately one millisecond. A blocking wait must not run on the browser main thread; `mayWait()` answers whether the calling thread may block (a worker may; a page's own thread, or one without `SharedArrayBuffer`, may not).
 
 A registered wait is not necessarily physically asleep. A worker terminated during a registered wait leaves its count behind; subsequent moves notify unnecessarily (the project measured about 50 ns per move on x86).
 

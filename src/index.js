@@ -16,12 +16,13 @@
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
 export { createReader } from './reader.js';
 export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } from './channel.js';
-export { SPIN_MS, createDoorbell, createSpin, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
-    waitForAsync } from './bell.js';
+export { SPIN_MS, createDoorbell, createSpin, deadlineOf, mayWait, openDoorbell, publish, ring, wake,
+    waitFor, waitForAsync } from './bell.js';
 export { RingClosed, createRingMemory, openRing } from './ring.js';
 export { LinkClosed, createLinkMemory, openLink } from './link.js';
 export { decodeValue, encodeValue, textOf } from './codec.js';
 export { createJournalMemory, openJournal } from './journal.js';
+export { createTableMemory, openTable } from './table.js';
 
 /** @typedef {import('./keeper.js').Keeper} Keeper */
 /** @typedef {import('./keeper.js').KeeperOptions} KeeperOptions */
@@ -43,3 +44,5 @@ export { createJournalMemory, openJournal } from './journal.js';
 /** @typedef {import('./link.js').Link} Link */
 /** @typedef {import('./link.js').Handlers} LinkHandlers */
 /** @typedef {import('./link.js').WordsHandler} WordsHandler */
+/** @typedef {import('./table.js').TableMemory} TableMemory */
+/** @typedef {import('./table.js').Table} Table */

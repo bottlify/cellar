@@ -159,8 +159,31 @@ const checkTimes = (deadline, spinMs)=>{
 };
 
 /**
+ * Whether this thread may block on a shared word (`waitFor`): a worker may;
+ * a page's own thread may not, even cross-origin isolated, where it has
+ * `SharedArrayBuffer` but `Atomics.wait` throws. Asked of the thread by a
+ * wait that ends at once.
+ *
+ * @returns {boolean}
+ */
+export function mayWait(){
+    if (typeof SharedArrayBuffer !== 'function')
+    {
+        return false;
+    }
+    try
+    {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 1, 0);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+
+/**
  * Blocks until `words[index]` is no longer `seen`: for a thread that may
- * block (a worker, never a page's own thread).
+ * block (`mayWait`: a worker, never a page's own thread).
  *
  * @param {Int32Array} words @param {number} index @param {number} seen
  * @param {number} sleeps  the word counting the waits asleep on `index`
