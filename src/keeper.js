@@ -11,11 +11,12 @@
  * to be brought back (`raise`) and to drop a name.
  *
  * The hot part is segments of shared memory, as many as the budget holds. A
- * segment of `segmentBytes` is shared by bodies, its room handed out in powers
- * of two (`buddy.js`); a body over a quarter of that (`large`) has a segment of
- * its own instead, of its length rounded to a page, made for it and let go of
- * when it goes: a block of half a segment or more is where the rounding costs
- * the most bytes, and a body past a segment has no block at all. A thread
+ * segment of `segmentBytes` is shared by bodies, each placed in a block of a
+ * power of two and taking its length rounded to a grain of it (`buddy.js`); a
+ * body over a quarter of that (`large`) has a segment of its own instead, of
+ * its length rounded to a page, made for it and let go of when it goes: a
+ * block of half a segment or more is a half no other body can share, and a
+ * body past a segment has no block at all. A thread
  * learns of a segment by a message (`announce`), and a message reaches a
  * thread only between its turns, so the keeper keeps segments announced
  * before they are needed - a shared one with no body in it, own ones with no
@@ -36,7 +37,7 @@
  * only once the disk holds it.
  */
 
-import { UNIT, blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
+import { UNIT, blockOf, checkSegmentBytes, createBuddy, grainsOf } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_FOR_ROOM, F_HELD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
@@ -567,11 +568,11 @@ export async function openKeeper(options){
 
     /**
      * A body over this many bytes has a segment of its own (`placeOwn`); one
-     * of this many or fewer a block of a shared segment. A block of half a
-     * segment or more rounds the most bytes away, up to half of it, and holds
-     * a whole half; above a quarter, the rounding of a power-of-two body (a
-     * 1024 x 1024 texture) is none either way. A page at least: a body of one
-     * takes one either way.
+     * of this many or fewer is placed in a block of a shared segment. A body
+     * of half a segment or more needs a whole half free to be placed in, and
+     * is let go of only when every body of that half can go; above a quarter,
+     * a power-of-two body (a 1024 x 1024 texture) needs its whole block
+     * either way. A page at least: a body of one takes one either way.
      */
     const large = Math.max(UNIT, segmentBytes / 4);
     /**
@@ -583,8 +584,8 @@ export async function openKeeper(options){
         * UNIT, 2 ** 31 - UNIT);
     /** @param {number} length */
     const pageOf = length=>Math.ceil(length / UNIT) * UNIT;
-    /** The bytes a body of `length` takes in memory: its block, or its own segment. @param {number} length */
-    const placedOf = length=>(length > large ? pageOf(length) : blockOf(length));
+    /** The bytes a body of `length` takes in memory: its grains, or its own segment. @param {number} length */
+    const placedOf = length=>(length > large ? pageOf(length) : grainsOf(length));
     /** Whether a segment can hold a body of `length`. @param {number} length */
     const fits = length=>length > 0 && (length <= large || pageOf(length) <= ownMost);
 
@@ -735,16 +736,15 @@ export async function openKeeper(options){
     };
 
     /*
-     * Where a block lies, as one number: its segment and the unit it starts
-     * at there (`segment * unitsPerSegment + unit`), exact in a double for
+     * Where a block lies, as one number: its segment and the byte it starts
+     * at there (`segment * segmentBytes + offset`), exact in a double for
      * any segment number a run reaches. A reserve finds room on every call,
      * and a number is no object made for it.
      */
-    const unitsPerSegment = segmentBytes / UNIT;
     /** @param {number} place */
-    const segmentOf = place=>Math.floor(place / unitsPerSegment);
+    const segmentOf = place=>Math.floor(place / segmentBytes);
     /** @param {number} place */
-    const offsetOf = place=>(place % unitsPerSegment) * UNIT;
+    const offsetOf = place=>place % segmentBytes;
 
     /**
      * Room for `length` bytes in a segment below `limit`: where it is (a
@@ -763,7 +763,7 @@ export async function openKeeper(options){
             const offset = buddyOf(at).place(length);
             if (offset >= 0)
             {
-                return at * unitsPerSegment + offset / UNIT;
+                return at * segmentBytes + offset;
             }
         }
         return -1;
@@ -798,7 +798,7 @@ export async function openKeeper(options){
         one.length = length;
         spares.shift();
         keepSpareOwn();
-        return at * unitsPerSegment;
+        return at * segmentBytes;
     };
 
     /**

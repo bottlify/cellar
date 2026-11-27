@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createBuddy, UNIT } from './buddy.js';
+import { createBuddy, grainsOf, UNIT } from './buddy.js';
 import { INDEX_FILES, openKeeper, readSaved } from './keeper.js';
 import { createReader } from './reader.js';
 import { crashDisk, memoryDisk } from './disk.fixture.js';
@@ -46,8 +46,8 @@ test('a buddy block given back joins its twin, and a segment emptied is one bloc
     const a = buddy.place(5000);
     const b = buddy.place(UNIT);
     assert.equal(a, 0);
-    assert.equal(buddy.used(), 3 * UNIT);
-    assert.equal(buddy.wasted(), 3 * UNIT - 5000 - UNIT);
+    assert.equal(buddy.used(), grainsOf(5000) + UNIT);
+    assert.equal(buddy.wasted(), grainsOf(5000) - 5000);
     assert.equal(buddy.place(64 * KIB), -1);
     buddy.give(a, 5000);
     buddy.give(b, UNIT);
@@ -321,7 +321,7 @@ test('a drop asked while read, then the name written anew while still read, give
         });
         step(1);
         const figures = keeper.figures();
-        assert.equal(figures.placedBytes, UNIT);
+        assert.equal(figures.placedBytes, grainsOf(100));
         assert.equal(figures.hotBytes, 100);
         assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(100, 2)], 'the write after the drop');
     });
@@ -339,7 +339,7 @@ test('a reservation let go of, or reserved again before its commit, gives its ro
     reader.commit('b');
     step(1);
     const figures = keeper.figures();
-    assert.equal(figures.placedBytes, 2 * UNIT, 'the second b alone');
+    assert.equal(figures.placedBytes, grainsOf(5000), 'the second b alone');
     assert.equal(reader.figures().abandoned, 2);
 });
 
@@ -351,7 +351,7 @@ test('a put lets go of the name\'s reservation not committed yet and holds none 
     reader.abandon('a');
     assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(100, 1)]);
     step(1);
-    assert.equal(keeper.figures().placedBytes, UNIT, 'the put\'s body alone');
+    assert.equal(keeper.figures().placedBytes, grainsOf(100), 'the put\'s body alone');
     assert.deepEqual([reader.figures().abandoned, reader.figures().reserved], [1, 2]);
 });
 
@@ -782,7 +782,7 @@ test('a budget that is not a number of bytes, and a body of a fraction of a byte
         const { keeper, reader } = await cacheOf();
         assert.throws(()=>keeper.reserve('a', 100.5), RangeError);
         assert.equal(reader.put('a', bodyOf(100, 1)), true);
-        assert.equal(keeper.figures().placedBytes, UNIT);
+        assert.equal(keeper.figures().placedBytes, grainsOf(100));
     });
 
 test('a disk that fails to open a file as the keeper opens has every file it opened let go',
@@ -1076,7 +1076,7 @@ test('a put whose bytes cannot be copied lets its reservation go', async()=>{
         Uint8Array.prototype.set = set;
     }
     keeper.sweep();
-    assert.equal(keeper.figures().placedBytes, UNIT, 'only a');
+    assert.equal(keeper.figures().placedBytes, grainsOf(100), 'only a');
     assert.equal(reader.figures().abandoned, 1);
 });
 

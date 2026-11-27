@@ -11,7 +11,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { UNIT } from './buddy.js';
+import { UNIT, grainsOf } from './buddy.js';
 import { bodyOf, cacheOf } from './cache.fixture.js';
 import { bytesPerCall } from './allocation.fixture.js';
 import { crashDisk } from './disk.fixture.js';
@@ -337,11 +337,11 @@ test('a reservation never committed is taken back after abandonAfterMs, and its 
         reader.put('kept', bodyOf(100, 1));
         // Its writer gone: terminated, or its answer lost on the way.
         assert.ok(reader.reserve('frame', 9000));
-        assert.equal(keeper.figures().placedBytes, 5 * UNIT);
+        assert.equal(keeper.figures().placedBytes, grainsOf(9000) + grainsOf(100));
         step(999);
-        assert.equal(keeper.figures().placedBytes, 5 * UNIT, 'not yet');
+        assert.equal(keeper.figures().placedBytes, grainsOf(9000) + grainsOf(100), 'not yet');
         step(1);
-        assert.equal(keeper.figures().placedBytes, UNIT, 'its room back');
+        assert.equal(keeper.figures().placedBytes, grainsOf(100), 'its room back');
         assert.equal(keeper.figures().takenBack, 1);
         assert.equal(reader.commit('frame'), false, 'too late');
         assert.equal(reader.figures().late, 1);
@@ -357,7 +357,8 @@ test('a reservation never committed is taken back after abandonAfterMs, and its 
         assert.equal(reader.commit('late'), false, 'the next reservation\'s mark is not this one\'s');
         assert.equal(reader.look('late'), null, 'the next one is not written yet');
         step(1);
-        assert.equal(keeper.figures().placedBytes, UNIT + 4 * UNIT + UNIT, 'kept, frame, the next late');
+        assert.equal(keeper.figures().placedBytes, grainsOf(100) + grainsOf(9000) + grainsOf(200),
+            'kept, frame, the next late');
     });
 
 test('a place granted ahead and handed to the writer after it was taken back is refused, not'
@@ -386,10 +387,10 @@ test('a reservation written anew before its commit, its writer gone, gives its r
         assert.ok(keeper.reserve('frame', 9000), 'a writer that never commits');
         assert.equal(reader.put('frame', bodyOf(100, 1)), true, 'the next writer');
         step(1);
-        assert.equal(keeper.figures().placedBytes, 5 * UNIT, 'the first held for its writer');
+        assert.equal(keeper.figures().placedBytes, grainsOf(9000) + grainsOf(100), 'the first held for its writer');
         step(1000);
         const figures = keeper.figures();
-        assert.equal(figures.placedBytes, UNIT, 'the first one\'s room back');
+        assert.equal(figures.placedBytes, grainsOf(100), 'the first one\'s room back');
         assert.equal(figures.takenBack, 1);
         assert.equal(figures.freeRecords, 1, 'its record kept for another name');
         assert.deepEqual(reader.with('frame', body=>[...body]), [...bodyOf(100, 1)]);
@@ -416,7 +417,7 @@ test('a drop that reaches a name being written takes the body written, once comm
     assert.equal(reader.commit('v'), true, 'written, and written anew since');
     step(1);
     assert.deepEqual(reader.with('v', body=>[...body]), [...bodyOf(300, 3)]);
-    assert.equal(keeper.figures().placedBytes, UNIT, 'the first one\'s room went');
+    assert.equal(keeper.figures().placedBytes, grainsOf(300), 'the first one\'s room went');
 });
 
 test('a reserve no block can be formed for cools nothing', async()=>{
@@ -894,8 +895,9 @@ test('an owner\'s names are let go together: what was under its prefix, and what
     }
     // One being written, one being read, as the owner goes.
     assert.ok(reader.reserve('texels/1/c', 500, { onlyCopy: true }));
-    // Each body of 1000 or 500 bytes takes a block of 4096 in memory.
-    assert.deepEqual(keeper.under('texels/1/'), { bodies: 3, bytes: 2500, hotBytes: 2500, placedBytes: 3 * 4096 });
+    // Each body of 1000 or 500 bytes takes its length rounded to a grain in memory.
+    assert.deepEqual(keeper.under('texels/1/'), { bodies: 3, bytes: 2500, hotBytes: 2500,
+        placedBytes: 2 * grainsOf(1000) + grainsOf(500) });
     let released = null;
     reader.with('texels/1/a', ()=>{
         released = keeper.release('texels/1/');
@@ -930,5 +932,5 @@ test('memory let go of gives its room back at the next reserve of any name, not 
         reader.abandon(name);
     }
     assert.ok(reader.reserve('frame/3', 1000), 'a reserve too');
-    assert.equal(keeper.figures().placedBytes, UNIT, 'frame/3 alone is placed');
+    assert.equal(keeper.figures().placedBytes, grainsOf(1000), 'frame/3 alone is placed');
 });

@@ -6,31 +6,49 @@
 
 /**
  * Room in one segment of the cache's hot part, in blocks of a power of two
- * from `UNIT` to the segment's size: a block given back joins its twin when
+ * from `GRAIN` to the segment's size: a body is placed in the smallest free
+ * block that holds it, split from a larger one where none is free, and the
+ * end of the block it leaves is free again at once, as the blocks of a power
+ * of two that make it up: a body takes its length rounded to a grain, and
+ * small bodies lie several to a page. A block given back joins its twin when
  * the twin is free too, so a segment whose bodies all went is one free block
- * again and can be let go whole. The price is the rounding: a body takes the
- * block of the next power of two (`wasted` counts it).
+ * again and can be let go whole. `wasted` counts what the rounding to a grain
+ * costs.
  *
  * Only the keeper places and frees; nothing here is shared between threads.
- * Each block handed out says whose body it holds, so the keeper can tell what
- * would have to leave for a larger block to form (`ownersWithin`).
+ * Each body placed says whose it is, so the keeper can tell what would have
+ * to leave for a larger block to form (`ownersWithin`).
  */
 
-/** The smallest block: one page. */
+/** A page: a segment's size is whole pages. */
 export const UNIT = 4096;
+/**
+ * The smallest block, where a body's length is rounded to. The lists cost 9
+ * bytes a grain of every segment (`createBuddy`): a smaller grain saves less
+ * rounding than its lists take on the sizes a run asks for.
+ */
+export const GRAIN = 512;
 
 /** @param {number} n */
 const log2 = n=>31 - Math.clz32(n);
+/** By the grain a block starts at (`orders`): a free block, its order below this bit. */
+const FREE = 0x40;
+/** By the grain a body starts at (`orders`). */
+const BODY = 0x20;
+
+/** @param {number} grains */
+const orderOf = grains=>(grains <= 1 ? 0 : log2(grains - 1) + 1);
 
 /**
- * The bytes of the block a body of `length` bytes takes.
+ * The bytes of the free block a body of `length` bytes is placed in: what
+ * must be free, or made free, for it.
  *
  * @param {number} length
  */
-export const blockOf = length=>{
-    const units = Math.ceil(length / UNIT);
-    return units <= 1 ? UNIT : UNIT << (log2(units - 1) + 1);
-};
+export const blockOf = length=>GRAIN << orderOf(Math.ceil(length / GRAIN));
+
+/** The bytes a body of `length` takes once placed. @param {number} length */
+export const grainsOf = length=>Math.ceil(length / GRAIN) * GRAIN;
 
 /**
  * Throws where `bytes` is no segment's size: a power of two from `UNIT` to
@@ -52,81 +70,93 @@ export const checkSegmentBytes = bytes=>{
  */
 export function createBuddy(bytes){
     checkSegmentBytes(bytes);
-    const top = log2(bytes / UNIT);
-    const units = bytes / UNIT;
+    const top = log2(bytes / GRAIN);
+    const grains = bytes / GRAIN;
     /*
-     * Free blocks by order (block = UNIT << order), each order a list linked
-     * through the unit its blocks start at, taken from the front and added at
+     * Free blocks by order (block = GRAIN << order), each order a list linked
+     * through the grain its blocks start at, taken from the front and added at
      * the back: a block is taken, joined to its twin or added with no object
      * made, where a set of offsets made garbage on most of those changes.
      */
-    /** By order: the unit the first free block starts at, -1 where none is free. */
+    /** By order: the grain the first free block starts at, -1 where none is free. */
     const heads = new Int32Array(top + 1).fill(-1);
-    /** By order: the unit the last free block starts at. */
+    /** By order: the grain the last free block starts at. */
     const tails = new Int32Array(top + 1).fill(-1);
-    /** By the unit a free block starts at: the next and previous free block of its order, -1 for none. */
-    const next = new Int32Array(units);
-    const previous = new Int32Array(units);
-    /** By the unit a free block starts at: its order, -1 where none starts. */
-    const freeOrders = new Int8Array(units).fill(-1);
-    /** By the unit a block handed out starts at: its order, -1 where none starts. */
-    const orders = new Int8Array(units).fill(-1);
-    /** By the unit a block handed out starts at: whose it is (`own`). */
-    const owners = new Int32Array(units);
+    /**
+     * By the grain a free block starts at: the next and previous free block
+     * of its order, -1 for none. By the grain a body starts at, as it is on
+     * no list: whose it is (`own`) and its length in grains.
+     */
+    const next = new Int32Array(grains);
+    const owners = next;
+    const previous = new Int32Array(grains);
+    const lengths = previous;
+    /** By the grain a block starts at: `FREE` and its order, `BODY`, or -1 where none starts. */
+    const orders = new Int8Array(grains).fill(-1);
     let given = 0;
     let used = 0;
     let asked = 0;
 
-    /** @param {number} order @param {number} unit  a block not free, added free */
-    const addFree = (order, unit)=>{
-        freeOrders[unit] = order;
-        next[unit] = -1;
-        previous[unit] = tails[order];
+    /** @param {number} order @param {number} start  a block not free, added free */
+    const addFree = (order, start)=>{
+        orders[start] = FREE | order;
+        next[start] = -1;
+        previous[start] = tails[order];
         if (tails[order] >= 0)
         {
-            next[tails[order]] = unit;
+            next[tails[order]] = start;
         }
         else
         {
-            heads[order] = unit;
+            heads[order] = start;
         }
-        tails[order] = unit;
+        tails[order] = start;
     };
 
-    /** @param {number} unit  a free block, taken off its list */
-    const takeFree = unit=>{
-        const order = freeOrders[unit];
-        freeOrders[unit] = -1;
-        if (previous[unit] >= 0)
+    /** @param {number} start  a free block, taken off its list */
+    const takeFree = start=>{
+        const order = orders[start] & ~FREE;
+        orders[start] = -1;
+        if (previous[start] >= 0)
         {
-            next[previous[unit]] = next[unit];
+            next[previous[start]] = next[start];
         }
         else
         {
-            heads[order] = next[unit];
+            heads[order] = next[start];
         }
-        if (next[unit] >= 0)
+        if (next[start] >= 0)
         {
-            previous[next[unit]] = previous[unit];
+            previous[next[start]] = previous[start];
         }
         else
         {
-            tails[order] = previous[unit];
+            tails[order] = previous[start];
         }
+    };
+
+    /** The block of `order` at `start` free, joined with its twins as far as they are. @param {number} order @param {number} start */
+    const join = (order, start)=>{
+        while (order < top)
+        {
+            const twin = start ^ (1 << order);
+            if (orders[twin] !== (FREE | order))
+            {
+                break;
+            }
+            takeFree(twin);
+            start = Math.min(start, twin);
+            order++;
+        }
+        addFree(order, start);
     };
 
     addFree(top, 0);
 
-    /** @param {number} length */
-    const orderOf = length=>{
-        const units = Math.ceil(length / UNIT);
-        return units <= 1 ? 0 : log2(units - 1) + 1;
-    };
-
     return {
         bytes,
         /**
-         * A block holding `length` bytes: its offset, or -1 where none is free.
+         * Room for `length` bytes: its offset, or -1 where no block holds it.
          *
          * @param {number} length
          */
@@ -135,7 +165,8 @@ export function createBuddy(bytes){
             {
                 return -1;
             }
-            const order = orderOf(length);
+            const count = Math.ceil(length / GRAIN);
+            const order = orderOf(count);
             let at = order;
             while (at <= top && heads[at] < 0)
             {
@@ -145,88 +176,116 @@ export function createBuddy(bytes){
             {
                 return -1;
             }
-            const unit = heads[at];
-            takeFree(unit);
+            const start = heads[at];
+            takeFree(start);
             // Split down to the order asked, the upper halves left free.
             while (at > order)
             {
                 at--;
-                addFree(at, unit + (1 << at));
+                addFree(at, start + (1 << at));
             }
-            const offset = unit * UNIT;
-            orders[offset / UNIT] = order;
-            owners[offset / UNIT] = -1;
+            // The end the body leaves, free as the blocks that make it up,
+            // largest first: no twin of them is free, the body lying in each.
+            for (let end = 1 << order, piece = order - 1; piece >= 0; piece--)
+            {
+                if (end - (1 << piece) >= count)
+                {
+                    end -= 1 << piece;
+                    addFree(piece, start + end);
+                }
+            }
+            orders[start] = BODY;
+            owners[start] = -1;
+            lengths[start] = count;
             given++;
-            used += UNIT << order;
+            used += count * GRAIN;
             asked += length;
-            return offset;
+            return start * GRAIN;
         },
         /**
-         * Gives back the block at `offset`, which held `length` bytes.
+         * Gives back the body at `offset`, which held `length` bytes.
          *
          * @param {number} offset @param {number} length
          */
         give(offset, length){
-            let order = orders[offset / UNIT];
-            if (!(order >= 0))
+            let at = offset / GRAIN;
+            if (orders[at] !== BODY)
             {
-                throw new Error(`cache: no block at ${offset} to give back`);
+                throw new Error(`cache: no body at ${offset} to give back`);
             }
-            orders[offset / UNIT] = -1;
+            const count = lengths[at];
+            orders[at] = -1;
             given--;
-            used -= UNIT << order;
+            used -= count * GRAIN;
             asked -= length;
-            let at = offset / UNIT;
-            while (order < top)
+            // Its grains as the blocks that make them up, the block it was
+            // placed in starting with it: largest first.
+            for (let piece = orderOf(count); piece >= 0; piece--)
             {
-                const twin = at ^ (1 << order);
-                if (freeOrders[twin] !== order)
+                if (at + (1 << piece) <= offset / GRAIN + count)
                 {
-                    break;
+                    join(piece, at);
+                    at += 1 << piece;
                 }
-                takeFree(twin);
-                at = Math.min(at, twin);
-                order++;
             }
-            addFree(order, at);
         },
         /**
-         * Says whose body the block at `offset` holds, for `ownersWithin`.
+         * Says whose the body at `offset` is, for `ownersWithin`.
          *
          * @param {number} offset @param {number} owner
          */
         own(offset, owner){
-            owners[offset / UNIT] = owner;
+            owners[offset / GRAIN] = owner;
         },
         /**
-         * The owners of the blocks handed out within `span` bytes from
-         * `from`, a span of a block's size and place that holds a block handed
-         * out: so every block it meets lies inside it.
+         * The owners of the bodies within `span` bytes from `from`, a span of
+         * a block's size and place that holds a body, in order: every body
+         * that starts in it lies in the block it was placed in, and so inside
+         * it, but for one placed in a larger block before it, which may run
+         * into it.
          *
          * @param {number} from @param {number} span @returns {number[]}
          */
         ownersWithin(from, span){
             /** @type {number[]} */
             const found = [];
-            for (let at = from; at < from + span;)
+            let at = from / GRAIN;
+            // Only where a body or a free block starts is a mark: the first
+            // mark at the starts of ever larger blocks around the span is
+            // the one that may run into it.
+            for (let order = log2(span / GRAIN) + 1; order <= top; order++)
             {
-                const order = orders[at / UNIT];
-                if (order >= 0)
+                const start = at & -(1 << order);
+                if (orders[start] !== -1)
                 {
-                    found.push(owners[at / UNIT]);
-                    at += UNIT << order;
-                    continue;
+                    if (orders[start] === BODY && start + lengths[start] > at)
+                    {
+                        found.push(owners[start]);
+                        at = start + lengths[start];
+                    }
+                    break;
                 }
-                // A free block starts here, of the one order it is free at.
-                at += UNIT << freeOrders[at / UNIT];
+            }
+            while (at < (from + span) / GRAIN)
+            {
+                // A body or a free block starts here.
+                if (orders[at] === BODY)
+                {
+                    found.push(owners[at]);
+                    at += lengths[at];
+                }
+                else
+                {
+                    at += 1 << (orders[at] & ~FREE);
+                }
             }
             return found;
         },
-        /** No block handed out: the segment can be let go whole. */
+        /** No body placed: the segment can be let go whole. */
         empty: ()=>given === 0,
-        /** Bytes in blocks handed out. */
+        /** Bytes the bodies placed take. */
         used: ()=>used,
-        /** Bytes of those blocks the bodies do not fill. */
+        /** Bytes of those the bodies do not fill. */
         wasted: ()=>used - asked,
         /** The largest block free now. */
         largest(){
@@ -234,7 +293,7 @@ export function createBuddy(bytes){
             {
                 if (heads[order] >= 0)
                 {
-                    return UNIT << order;
+                    return GRAIN << order;
                 }
             }
             return 0;
