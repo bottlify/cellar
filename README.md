@@ -13,7 +13,7 @@ Built for [Bottlify](https://github.com/bottlify/bottlify), and useful wherever 
 | [Link](docs/link.md) | Calls both ways with values; a waiting side answers the other's calls meanwhile, and small word calls take turns in place. |
 | [Ring](docs/ring.md) | A bounded one-writer, one-reader byte stream, with backpressure and in-place writing. |
 | [Journal](docs/journal.md) | One writer, many readers; older records are overwritten, and the writer never waits for readers. |
-| [Table](docs/table.md) | Named float64 counters and rows one thread stores and any thread reads, with no request to the writer. |
+| [Table](docs/table.md) | Named integer counters and rows one thread stores and any thread reads, with no request to the writer. |
 | [Bell](docs/bell.md) | Wait on a shared word; notify only when a wait is registered. |
 | [Doorbell](docs/bell.md#doorbell) | One wait for several sources of work. |
 

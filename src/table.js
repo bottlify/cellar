@@ -7,19 +7,19 @@
 /**
  * Numbers one thread stores where they change and any thread reads when it
  * likes: counters, a row per worker, a ring of the last frames. Rows of
- * float64 columns, the columns named once when the memory is made, and two
- * counts: the rows that carry something, and the rows ever taken from the
- * ring.
+ * columns named once when the memory is made, and two counts: the rows that
+ * carry something, and the rows ever taken from the ring.
  *
- * A cell is a plain float64 store, no atomic: a count that passes 2^31 in
- * seconds fits, and a store costs what a store into any typed array does.
- * One thread writes a table (`add` reads before it stores). A reader sees
- * each cell whole: an aligned eight-byte access is one instruction on x86-64
- * and arm64, which is how engines compile it, though the JavaScript memory
- * model promises that only for integer arrays. A row is not read whole: a
- * reader that looks while the writer fills one may take some cells new and
- * some old. The counts are atomic words, and a row the writer filled before
- * it published a count is seen filled by a reader that read that count.
+ * A cell is one kind: a signed 64-bit integer, stored, added to and read
+ * through `Atomics`, so a reader sees each cell whole because the standard
+ * says so, not because of how an engine compiles an eight-byte store. A
+ * fraction has no cell: a figure goes in integer units its column's name
+ * says (nanoseconds, parts per million), converted where it is read. A
+ * value set is rounded to the nearest integer; one that is not finite
+ * throws. One thread writes a table. A row is not read whole: a reader that
+ * looks while the writer fills one may take some cells new and some old.
+ * The counts are atomic words, and a row the writer filled before it
+ * published a count is seen filled by a reader that read that count.
  */
 
 const USED = 0;
@@ -35,12 +35,12 @@ const HEADER_BYTES = 8;
 /**
  * @typedef {Object} Table
  * @property {TableMemory} memory
- * @property {Float64Array} values      `rows * width` cells, row-major.
  * @property {number} rows
  * @property {number} width
  * @property {string[]} columns
  * @property {(row: number, column: number, value: number) => void} set
  * @property {(row: number, column: number, amount: number) => void} add
+ * @property {(row: number, column: number) => number} get
  * @property {(count: number) => void} use      Publishes how many rows carry something.
  * @property {() => number} advance     Takes the next row of the ring; answers it.
  * @property {() => number} used
@@ -70,25 +70,31 @@ export function openTable(memory){
     const { buffer, rows, columns } = memory;
     const width = columns.length;
     const counts = new Int32Array(buffer, 0, 2);
-    const values = new Float64Array(buffer, HEADER_BYTES, rows * width);
+    const cells = new BigInt64Array(buffer, HEADER_BYTES, rows * width);
+    /** @param {number} at @param {number} column */
+    const get = (at, column)=>Number(Atomics.load(cells, at * width + column));
     /** @param {number} at */
     const row = at=>{
         /** @type {Record<string, number>} */
         const out = {};
         for (let column = 0; column < width; column++)
         {
-            out[columns[column]] = values[at * width + column];
+            out[columns[column]] = get(at, column);
         }
         return out;
     };
     return {
         memory,
-        values,
         rows,
         width,
         columns,
-        set: (at, column, value)=>{ values[at * width + column] = value; },
-        add: (at, column, amount)=>{ values[at * width + column] += amount; },
+        set: (at, column, value)=>{
+            Atomics.store(cells, at * width + column, BigInt(Math.round(value)));
+        },
+        add: (at, column, amount)=>{
+            Atomics.add(cells, at * width + column, BigInt(Math.round(amount)));
+        },
+        get,
         use: count=>{ Atomics.store(counts, USED, count); },
         advance(){
             const written = Atomics.load(counts, WRITTEN) >>> 0;

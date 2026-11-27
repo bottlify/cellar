@@ -49,7 +49,7 @@ test('a value stored where it happens is what a reader picks up, by name', ()=>{
     assert.equal(reader.used(), 2);
     assert.deepEqual(reader.all(), [{ turns: 7, boosts: 0 }, { turns: 0, boosts: 9 }]);
     assert.deepEqual(reader.row(1), { turns: 0, boosts: 9 });
-    assert.equal(reader.values[1 * 2 + 1], 9, 'row-major cells');
+    assert.equal(reader.get(1, 1), 9);
 });
 
 test('a ring of rows reads oldest first once it has lapped', ()=>{
@@ -65,6 +65,18 @@ test('a ring of rows reads oldest first once it has lapped', ()=>{
     assert.equal(table.written(), 5);
     assert.equal(table.used(), 3);
     assert.deepEqual(openTable(table.memory).all().map(row=>row.index), [2, 3, 4]);
+});
+
+test('a cell is an integer: a value set is rounded, and one that is not finite throws', ()=>{
+    const table = openTable(createTableMemory({ rows: 1, columns: ['ns'] }));
+    table.set(0, 0, 2.6);
+    table.add(0, 0, -0.4);
+    assert.equal(table.get(0, 0), 3);
+    table.set(0, 0, 2 ** 53);
+    table.add(0, 0, 2 ** 53);
+    assert.equal(table.get(0, 0), 2 ** 54, 'past 2^32 and 2^53 the count goes on');
+    assert.throws(()=>table.set(0, 0, NaN), RangeError);
+    assert.throws(()=>table.add(0, 0, Infinity), RangeError);
 });
 
 test('a table of no rows or no columns is refused', ()=>{
@@ -92,7 +104,7 @@ test('readers on other threads see each cell whole while the writer stores into 
         let bad = null;
         for (;;)
         {
-            const value = table.values[0];
+            const value = table.get(0, 0);
             const n = (value - data.BASE) / data.STEP;
             if (!Number.isInteger(n) || n < last) { bad = value; break; }
             last = n;
@@ -136,7 +148,7 @@ test('a row filled before its count was published is seen filled by a reader on 
             {
                 for (let column = 0; column < 3; column++)
                 {
-                    if (table.values[row * 3 + column] !== row + 1) empty++;
+                    if (table.get(row, column) !== row + 1) empty++;
                 }
             }
             seen = used;
