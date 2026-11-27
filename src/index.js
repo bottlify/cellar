@@ -8,8 +8,9 @@
  * @bottlify/cellar - shared-memory primitives for multithreaded JavaScript:
  * the bell two threads wait on each other by, byte rings, journals (one
  * writer, any readers, the oldest written over), calls between two threads
- * (channels), and a cache of bodies in shared memory read in place by
- * name, under one budget, idle ones on the disk (OPFS).
+ * (channels) and both ways with values (links), and a cache of bodies in
+ * shared memory read in place by name, under one budget, idle ones on the
+ * disk (OPFS).
  */
 
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
@@ -18,6 +19,8 @@ export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } f
 export { SPIN_MS, createDoorbell, createSpin, deadlineOf, openDoorbell, publish, ring, wake, waitFor,
     waitForAsync } from './bell.js';
 export { RingClosed, createRingMemory, openRing } from './ring.js';
+export { LINK_BYTES, LinkClosed, createLinkMemory, openLink } from './link.js';
+export { decodeValue, encodeValue, textOf } from './codec.js';
 export { createJournalMemory, openJournal } from './journal.js';
 
 /** @typedef {import('./keeper.js').Keeper} Keeper */
@@ -36,3 +39,7 @@ export { createJournalMemory, openJournal } from './journal.js';
 /** @typedef {import('./ring.js').Ring} Ring */
 /** @typedef {import('./journal.js').JournalMemory} JournalMemory */
 /** @typedef {import('./journal.js').Journal} Journal */
+/** @typedef {import('./link.js').LinkEnd} LinkEnd */
+/** @typedef {import('./link.js').Link} Link */
+/** @typedef {import('./link.js').Handlers} LinkHandlers */
+/** @typedef {import('./link.js').WordsHandler} WordsHandler */

@@ -10,6 +10,7 @@ Built for [Bottlify](https://github.com/bottlify/bottlify), and useful wherever 
 | --- | --- |
 | [Cache](docs/cache.md) | Shared bodies by name, read in place, one memory budget, optional disk storage. |
 | [Channel](docs/channel.md) | Blocking or asynchronous RPC between two threads. |
+| [Link](docs/link.md) | Calls both ways with values; a waiting side answers the other's calls meanwhile, and small word calls take turns in place. |
 | [Ring](docs/ring.md) | A bounded one-writer, one-reader byte stream, with backpressure and in-place writing. |
 | [Journal](docs/journal.md) | One writer, many readers; older records are overwritten, and the writer never waits for readers. |
 | [Bell](docs/bell.md) | Wait on a shared word; notify only when a wait is registered. |
@@ -68,6 +69,7 @@ A worker may also use `client.ask()` to block for an answer, or `server.serveAsy
 
 - **Cache:** resources used by many workers, under one budget; optionally cold on disk.
 - **Channel:** ask another thread to do something and return an answer.
+- **Link:** two threads that call each other, nested, with values or a few words at a time.
 - **Ring:** deliver commands or batches without overwriting unread data; build directly in shared memory with `reserve()` and `commit()`.
 - **Journal:** logs, traces and measurements; each reader follows its own sequence and can miss old records without stopping the writer.
 - **Bell / Doorbell:** wait for a change or for work from several rings.
@@ -98,7 +100,7 @@ For browser isolation, a common starting configuration is `Cross-Origin-Opener-P
 
 ## Documentation and examples
 
-[Cache](docs/cache.md) · [Channel](docs/channel.md) · [Ring](docs/ring.md) · [Journal](docs/journal.md) · [Bell and Doorbell](docs/bell.md) · [Benchmarks](docs/benchmarks.md)
+[Cache](docs/cache.md) · [Channel](docs/channel.md) · [Link](docs/link.md) · [Ring](docs/ring.md) · [Journal](docs/journal.md) · [Bell and Doorbell](docs/bell.md) · [Benchmarks](docs/benchmarks.md)
 
 [How Cellar works, drawn](examples/README.md) - diagrams and runnable examples.
 
