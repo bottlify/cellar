@@ -51,6 +51,7 @@
     "typecheck": "tsc -p jsconfig.json",
     "build": "node scripts/build.mjs",
     "prepack": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
     "check": "npm run typecheck && npm test && npm run test:integration && npm run build"
   },
   "devDependencies": {
