@@ -23,7 +23,7 @@
  */
 
 import {
-    COLD, GONE, HOT, MOVING, RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT,
+    COLD, GONE, HOT, H_LET_GO, MOVING, RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT,
     R_STATE, WRITING, checkName, stateWord, viewIndex,
 } from './shared.js';
 import { bytesOf } from './bytes.js';
@@ -254,6 +254,22 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
+     * A reservation given up without a body: its room the keeper's again at
+     * its next reserve, told so by the count of those let go (`H_LET_GO`),
+     * which moves after the record is gone, so a keeper that sees it moved
+     * finds the record gone.
+     *
+     * @param {Place} place
+     */
+    const letGo = place=>{
+        counts.abandoned++;
+        if (finish(place, stateWord(GONE)) === ENDED)
+        {
+            Atomics.add(index.words, H_LET_GO, 1);
+        }
+    };
+
+    /**
      * What `reserve` and `put` ask the keeper with: their options, the
      * defaults filled in, and the segments this reader has heard of. No
      * object is made for options not given.
@@ -314,8 +330,7 @@ export function createReader({ shared, segments = [], keeper }){
         if (view === null || view === undefined)
         {
             // Placed where this reader cannot write: given back.
-            counts.abandoned++;
-            finish(place, stateWord(GONE));
+            letGo(place);
             counts.refused++;
             return null;
         }
@@ -492,7 +507,7 @@ export function createReader({ shared, segments = [], keeper }){
          * keeper never takes back, cools or moves, and no one reads through
          * `with`: memory, not a body. Counted under its name and in the
          * keeper's budget like any body; never on the disk. Let go of with
-         * `abandon`, its room the keeper's again at its next sweep. Null
+         * `abandon`, its room the keeper's again at its next reserve. Null
          * where there is no room, or where the room is in a segment this
          * reader cannot write.
          *
@@ -530,7 +545,7 @@ export function createReader({ shared, segments = [], keeper }){
         /**
          * Lets go of a reservation without a body (a writer that failed):
          * the name is left with none, as `reserve` took its body before away,
-         * and the room goes back to the keeper at its next sweep. Nothing
+         * and the room goes back to the keeper at its next reserve. Nothing
          * where `name` is not reserved here.
          *
          * @param {string} name
@@ -542,8 +557,7 @@ export function createReader({ shared, segments = [], keeper }){
                 return;
             }
             writing.delete(name);
-            counts.abandoned++;
-            finish(place, stateWord(GONE));
+            letGo(place);
         },
 
         /**
@@ -570,8 +584,7 @@ export function createReader({ shared, segments = [], keeper }){
                 /** @type {Uint8Array} */ (views[place.segment]).set(taken, place.offset);
             }
             catch (e){
-                counts.abandoned++;
-                finish(place, stateWord(GONE));
+                letGo(place);
                 throw e;
             }
             return publish(place);

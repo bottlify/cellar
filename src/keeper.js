@@ -35,7 +35,7 @@ import { UNIT, blockOf, checkSegmentBytes, createBuddy } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_FOR_ROOM, F_HELD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
-    CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_NAMES, H_TICK, MAX_RECORDS,
+    CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_LET_GO, H_NAMES, H_TICK, MAX_RECORDS,
     MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
     checkName, growableShared, growTo, sharedBuffer,
@@ -958,6 +958,32 @@ export async function openKeeper(options){
         set(id, R_SEGMENT, -1);
     };
 
+    /** The count of reservations let go of (`H_LET_GO`) as the keeper last gave their room back. */
+    let letGoSeen = 0;
+
+    /**
+     * The room of every reservation let go of without a body, given back:
+     * once the count of those moved since the last time, so a reserve after
+     * an `abandon` finds the room it let go of, in a run that lets go of none
+     * at the cost of one load.
+     */
+    const takeLetGo = ()=>{
+        const count = Atomics.load(words, H_LET_GO);
+        if (count === letGoSeen)
+        {
+            return;
+        }
+        letGoSeen = count;
+        for (let id = 0; id < words[H_COUNT]; id++)
+        {
+            if (stateOf(stateWordOf(id)) === GONE && get(id, R_SEGMENT) >= 0)
+            {
+                giveBack(id);
+                counts.abandoned++;
+            }
+        }
+    };
+
     // --- disk ---------------------------------------------------------------
 
     /** @param {DiskFile} file */
@@ -1817,7 +1843,8 @@ export async function openKeeper(options){
                 return null;
             }
             const state = stateOf(stateWordOf(id));
-            // A reservation let go of without a body keeps its room until here.
+            // Reservations let go of without a body keep their room until here.
+            takeLetGo();
             if (state === GONE && get(id, R_SEGMENT) >= 0)
             {
                 giveBack(id);
@@ -2010,6 +2037,8 @@ export async function openKeeper(options){
          * taken back, segments empty long enough are let go but one.
          */
         sweep(){
+            // What was let go of is given back below, so a reserve after it scans for none.
+            letGoSeen = Atomics.load(words, H_LET_GO);
             const at = tick();
             Atomics.store(words, H_TICK, at);
             for (let id = 0; id < words[H_COUNT]; id++)

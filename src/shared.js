@@ -45,8 +45,14 @@ export const H_TICK = 1;
 export const H_NAMES = 2;
 /** What the words mean (`CACHE_LAYOUT`), so that memory of another layout, or none, is refused. */
 export const H_LAYOUT = 3;
+/**
+ * Reservations let go of without a body, counted by the reader that let go
+ * (`abandon`): the keeper's next `reserve` gives their room back when the
+ * count moved, so memory let go of is room again at once, not at a sweep.
+ */
+export const H_LET_GO = 4;
 /** The layout these words are in: changed with any word's meaning. */
-export const CACHE_LAYOUT = 0x43430c01;
+export const CACHE_LAYOUT = 0x43430c02;
 
 /** One record, in 32-bit words. */
 export const RECORD_WORDS = 12;

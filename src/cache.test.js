@@ -883,3 +883,15 @@ test('an owner\'s names are let go together: what was under its prefix, and what
     assert.equal(keeper.figures().released, 3);
     assert.throws(()=>keeper.release(/** @type {any} */ (7)), TypeError);
 });
+
+test('memory let go of gives its room back at the next reserve of any name, not at the sweep', async()=>{
+    const { keeper, reader } = await cacheOf({ budget: 64 * 1024, segmentBytes: 64 * 1024 });
+    assert.ok(reader.hold('frame/1', 64 * 1024));
+    assert.equal(reader.hold('frame/2', 64 * 1024), null, 'one segment, held whole');
+    reader.abandon('frame/1');
+    assert.ok(reader.hold('frame/2', 64 * 1024), 'the room frame/1 let go of, with no sweep between');
+    assert.equal(keeper.figures().abandoned, 1);
+    reader.abandon('frame/2');
+    assert.ok(reader.reserve('frame/3', 1000), 'a reserve too');
+    assert.equal(keeper.figures().placedBytes, UNIT, 'frame/3 alone is placed');
+});
