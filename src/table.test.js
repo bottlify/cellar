@@ -220,3 +220,44 @@ test('a row filled before its count was published is seen filled by a reader on 
     }
     assert.equal(await reader, 0);
 });
+
+test('a slot is claimed with its type and owner, named by a handle that a reuse makes stale', ()=>{
+    const table = openTable(createTableMemory({ rows: 2, columns: ['object'], slots: true }));
+    assert.deepEqual(table.columns, ['type', 'owner', 'object']);
+    const first = table.claim(3, 10);
+    const second = table.claim(4, 11);
+    assert.equal(table.claim(5, 12), -1, 'no row is free');
+    assert.equal(table.used(), 2);
+    const row = table.slot(first);
+    assert.ok(row >= 0);
+    assert.deepEqual(table.row(row), { type: 3, owner: 10, object: 0 });
+    table.set(row, 2, 99);
+    assert.equal(table.release(first), true);
+    assert.equal(table.release(first), false, 'released once');
+    assert.equal(table.slot(first), -1);
+    const again = table.claim(6, 10);
+    assert.equal(table.slot(again), row, 'the row freed is the one claimed again');
+    assert.notEqual(again, first, 'under a new generation');
+    assert.equal(table.slot(first), -1, 'the old handle is refused');
+    assert.equal(table.release(first), false);
+    assert.equal(table.get(row, 2), 0, 'a claim starts from zeros');
+    assert.deepEqual(table.owned(10), [again]);
+    assert.deepEqual(table.all().map(one=>one.type).sort(), [4, 6]);
+    assert.equal(table.releaseOwner(11), 1);
+    assert.equal(table.slot(second), -1);
+    assert.equal(table.used(), 1);
+    for (const handle of [-1, 0, 1, 1.5, NaN, 2 ** 60])
+    {
+        assert.equal(table.slot(handle), -1, `${handle} names no slot`);
+    }
+});
+
+test('a table of slots is claimed, not published or advanced, and only it is claimed', ()=>{
+    const slots = openTable(createTableMemory({ rows: 1, columns: [], slots: true }));
+    assert.throws(()=>slots.use(1), TypeError);
+    assert.throws(()=>slots.advance(), TypeError);
+    const plain = openTable(createTableMemory({ rows: 1, columns: ['a'] }));
+    assert.throws(()=>plain.claim(1, 1), TypeError);
+    assert.throws(()=>plain.slot(1), TypeError);
+    assert.throws(()=>createTableMemory({ rows: 2 ** 24 + 1, columns: [], slots: true }), RangeError);
+});

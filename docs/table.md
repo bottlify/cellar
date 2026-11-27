@@ -1,4 +1,4 @@
-# Table - numbers one thread stores, any thread reads
+# Table - numbers one thread stores, any thread reads; slots any thread claims
 
 [Home](../README.md) · [Journal](journal.md) · [Ring](ring.md)
 
@@ -36,6 +36,27 @@ worker.onmessage = ({ data })=>{
 - Reading: `get(row, column)`, `used()`, `written()` (rows ever taken by `advance`, an unsigned 32-bit count), `row(index)` as an object by column name, `all()` the rows in use, oldest first once a ring has lapped.
 
 The table does not grow: its shape is fixed when it is made.
+
+## Slots
+
+`createTableMemory({ rows, columns, slots: true })` makes a table of slots: rows any thread claims and releases, such as a table of handles to objects shared across threads. Its columns are `type` and `owner`, then `columns`.
+
+```js
+const memory = createTableMemory({ rows: 4096, columns: ['object'], slots: true });
+const handles = openTable(memory);                 // on any thread
+const handle = handles.claim(EVENT, processId);    // -1 where every row is held
+const row = handles.slot(handle);                  // -1 once released: a stale handle
+handles.set(row, 2, objectId);
+handles.release(handle);
+handles.releaseOwner(processId);                   // a process's end: how many released
+```
+
+- `claim(type, owner)` takes a free row, writes its `type` and `owner` and zeros in the rest, and answers a handle; `slot(handle)` the row a handle holds, or -1; `release(handle)` true where it released it; `owned(owner)` the handles an owner holds; `releaseOwner(owner)` releases them. `used()` is the rows held, `written()` the claims ever made, `all()` the rows held. `use` and `advance` throw on a table of slots, `claim` and the rest on a table without.
+- **A handle names a row and a generation**: `generation * rows + row`, never 0. Each row has a word of its own, its generation and its state (free, being claimed, held), changed only by `Atomics.compareExchange`: a claim moves a free row to being claimed under the next generation, writes its cells, then stores it held; a release moves it from held under the handle's generation back to free. A handle kept past its release is refused once the row is claimed again (ABA), until the row's generation comes round again after 2^29 - 1 claims. Rows are at most 2^24, so a handle is exact in a double.
+- **No lock.** A claim starts looking at the row after the last claim's (`written()`), so a row freed is not the next one taken, and passes over rows another thread holds or is claiming. A table with no free row answers -1 after one look at each.
+- **The holder writes its row.** While a thread holds a row it is the row's one writer, under the rules above for every cell. Another thread reads it as any reader does; a read made between two answers of `slot(handle)` that agree is of the row that handle held. `owned` reads a row's `owner` between two looks at the same held word, so it never names a row held by another owner's later claim; a row released between `owned` and `release` is not released twice.
+
+[`src/table.itest.js`](../src/table.itest.js) has four threads claim and release rows of a table too small for all of them, each stamping and checking the rows it holds and checking that every handle it released stays refused, and then releases one owner's rows from the main thread.
 
 ## What a reader sees
 

@@ -14,7 +14,7 @@ Built for [Bottlify](https://github.com/bottlify/bottlify), and useful wherever 
 | [Link](docs/link.md) | Calls both ways with values; a waiting side answers the other's calls meanwhile, and small word calls take turns in place. |
 | [Ring](docs/ring.md) | A bounded one-writer, one-reader byte stream, with backpressure and in-place writing. |
 | [Journal](docs/journal.md) | One writer, many readers; older records are overwritten, and the writer never waits for readers. |
-| [Table](docs/table.md) | Named integer counters and rows one thread stores and any thread reads, with no request to the writer. |
+| [Table](docs/table.md) | Named integer counters and rows one thread stores and any thread reads, with no request to the writer; or slots any thread claims and releases, named by handles a reuse makes stale. |
 | [Bell](docs/bell.md) | Wait on a shared word; notify only when a wait is registered. |
 | [Doorbell](docs/bell.md#doorbell) | One wait for several sources of work. |
 
@@ -74,7 +74,7 @@ A worker may also use `client.ask()` to block for an answer, or `server.serveAsy
 - **Link:** two threads that call each other, nested, with values or a few words at a time.
 - **Ring:** deliver commands or batches without overwriting unread data; build directly in shared memory with `reserve()` and `commit()`.
 - **Journal:** logs, traces and measurements; each reader follows its own sequence and can miss old records without stopping the writer.
-- **Table:** counters and figures a reader samples whenever it likes, stored where they change.
+- **Table:** counters and figures a reader samples whenever it likes, stored where they change; with slots, a table of handles any thread claims and releases.
 - **Bell / Doorbell:** wait for a change or for work from several rings.
 
 ## Performance
