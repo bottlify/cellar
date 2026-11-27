@@ -92,7 +92,7 @@ These measurements compare the example workloads, not every use of `postMessage`
 ## Requirements and important contracts
 
 - Cross-origin isolation and `SharedArrayBuffer` for sharing memory between browser threads. Without shared memory, the cache can run within one thread.
-- Growable buffers for the cache index. `Atomics.waitAsync` is used where available; otherwise asynchronous waits poll. Node.js 22 or later.
+- Growable buffers for the cache index and its segments of one body. `Atomics.waitAsync` is used where available; otherwise asynchronous waits poll. Node.js 22 or later.
 - Never block the browser's main thread. Use the asynchronous APIs there. Views handed out for reading or writing have limited lifetimes; follow each primitive's contract.
 - Journal copies records into private scratch memory. Its cross-thread integrity check relies on how current engines implement sequentially consistent Atomics, not solely on the ECMAScript memory model. See [Journal](docs/journal.md#memory-ordering).
 - Optional disk storage uses a single Keeper per directory. OPFS synchronous handles belong in a worker.

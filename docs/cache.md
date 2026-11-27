@@ -4,6 +4,8 @@
 
 One Keeper places named byte bodies in shared segments, manages their memory budget, and optionally keeps cold bodies on disk. Each thread has a Reader. Hot reads need no call to the Keeper; reservation and promotion from disk do.
 
+A body of up to a quarter of `segmentBytes` (a page at least) takes a block of a shared segment, rounded up to a power of two. A larger one, held memory included, takes a segment of its own of its length rounded to a page: counted in the budget at that size, and let go of the moment the body goes (evicted, cooled, dropped, released or abandoned), not after `releaseAfterMs` as an empty shared segment is. The Keeper keeps own segments announced ahead with no bytes (address space only), as many as large bodies the budget holds at once, and grows one to the body it is given, so a Reader writing it has heard of it; one that writes more than that before it hears of the next is refused (`refusedUnseen`). Placing a large body over the budget lets go of empty shared segments but the spare, then makes room from the least recently used bodies as any reserve does. The spare stays for small bodies, so a budget of one segment holds no large body.
+
 ## Page and worker
 
 Here the Keeper runs on the page without a disk. For OPFS synchronous handles, run the Keeper in a worker. The Channel is just one possible transport for KeeperCalls.
@@ -111,7 +113,7 @@ Choose a prefix with a delimiter for an owner's resources, for example `texels/r
 - `keeper.under(prefix)` reports bodies and bytes under the prefix, and of those in memory their bytes (`hotBytes`) and the blocks they take (`placedBytes`): the difference is what rounding to blocks costs that owner.
 - `keeper.release(prefix)` drops those bodies together, including only copies, and reports what was there and what is still held by readers or writers. Deferred drops complete when the relevant use ends. Memory held under the prefix (`reader.hold`) is taken back at once: the owner going is its holder going, and the sweep never takes held memory itself.
 
-Prefixes are literal string prefixes, not path or glob expressions. `figures()` includes release counters.
+Prefixes are literal string prefixes, not path or glob expressions. `figures()` includes release counters. Its `segments` and `segmentBytes` are the segments holding memory now, `peakSegmentBytes` the most they held at once; `segmentsMade` and `segmentsLetGo` count every segment announced, the own ones made ahead with no bytes included.
 
 ## Persistence and recovery
 
@@ -148,7 +150,7 @@ Only one Keeper may manage a directory. OPFS sync handles lock files; custom Dis
 | `budget` | Finite nonnegative byte budget for hot bodies. |
 | `segmentBytes` | Power of two, 4 KiB to 1 GiB. |
 | `packBytes` | Positive, below 2 GiB. |
-| Body length | Positive integer, must fit a segment. |
+| Body length | Positive integer, within the budget and below 2 GiB (`refusedLarge`). A body larger than `packBytes` takes a pack of its own on the disk. |
 | Idle and reservation spans | Below half the 32-bit millisecond clock range (about 24.8 days). |
 | Names | Strings only; 2^20 names and 2^25 UTF-16 units per run. |
 

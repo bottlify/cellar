@@ -29,6 +29,19 @@ const stateIndex = (keeper, id)=>{
 /** The record `name` leads to now. @param {any} keeper @param {string} name */
 const recordOf = (keeper, name)=>viewIndex(keeper.shared).find(name);
 
+/**
+ * Units 2 to 7 of a segment of eight held by only copies that never leave:
+ * units 0 and 1 the one block of two that can be formed.
+ *
+ * @param {import('./reader.js').Reader} reader
+ */
+const pinRest = reader=>{
+    for (let i = 2; i < 8; i++)
+    {
+        assert.equal(reader.put(`pin${i}`, bodyOf(UNIT, i), { onlyCopy: true, disk: 'never' }), true);
+    }
+};
+
 test('a name that is not a string is refused by every call, and the names are left as they were',
     async()=>{
         const { keeper, reader } = await cacheOf();
@@ -238,9 +251,14 @@ test('a record given to another name between a reader\'s lookup and its entering
 test('memory held is never taken back: written and read in place by its holder for as long as it '
     + 'holds it, counted under its name, its room given back when it lets go', async()=>{
     const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 10,
-        goneAfterMs: 20, budget: 4 * UNIT, segmentBytes: 4 * UNIT });
+        goneAfterMs: 20, budget: 8 * UNIT, segmentBytes: 8 * UNIT });
     const held = reader.hold('sound/table', 2 * UNIT);
     assert.ok(held, 'room for it');
+    // Half the segment held by bodies that never leave.
+    for (const name of ['pin1', 'pin2'])
+    {
+        assert.equal(reader.put(name, bodyOf(2 * UNIT, 9), { onlyCopy: true, disk: 'never' }), true);
+    }
     held.set(bodyOf(2 * UNIT, 5));
     step(5000);
     assert.equal(keeper.figures().takenBack, 0, 'held five times abandonAfterMs');
@@ -296,17 +314,20 @@ test('a hot body read again is read through the same view, made anew only where 
 test('an owner released takes its held memory with it: the room is the next body\'s at once, its'
     + ' holder\'s view no longer the cache\'s', async()=>{
     const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,
-        goneAfterMs: 1e6, budget: 4 * UNIT, segmentBytes: 4 * UNIT });
+        goneAfterMs: 1e6, budget: 8 * UNIT, segmentBytes: 8 * UNIT });
     // An owner - a worker, a process - that went without letting its holds go.
     assert.ok(reader.hold('scratch/7/rows', 2 * UNIT));
-    assert.ok(reader.hold('scratch/7/texels', UNIT));
-    assert.ok(reader.put('other', bodyOf(UNIT, 1)));
-    assert.deepEqual(keeper.release('scratch/7/'), { bodies: 2, bytes: 3 * UNIT, waiting: 0 },
+    assert.ok(reader.hold('scratch/7/texels', 2 * UNIT));
+    assert.ok(reader.put('other', bodyOf(2 * UNIT, 1)));
+    assert.ok(reader.put('more', bodyOf(2 * UNIT, 3)));
+    assert.deepEqual(keeper.release('scratch/7/'), { bodies: 2, bytes: 4 * UNIT, waiting: 0 },
         'both held, none waiting on a reader');
     assert.deepEqual(keeper.under('scratch/'), { bodies: 0, bytes: 0, hotBytes: 0, placedBytes: 0 });
     step(1);
     assert.equal(reader.put('next', bodyOf(2 * UNIT, 2)), true, 'their room given back');
-    assert.deepEqual(reader.with('other', body=>[...body]), [...bodyOf(UNIT, 1)], 'the rest kept');
+    assert.equal(reader.put('after', bodyOf(2 * UNIT, 4)), true);
+    assert.deepEqual(reader.with('other', body=>[...body]), [...bodyOf(2 * UNIT, 1)], 'the rest kept');
+    assert.deepEqual(reader.with('more', body=>[...body]), [...bodyOf(2 * UNIT, 3)]);
 });
 
 test('a reservation never committed is taken back after abandonAfterMs, and its commit then fails',
@@ -399,48 +420,51 @@ test('a drop that reaches a name being written takes the body written, once comm
 });
 
 test('a reserve no block can be formed for cools nothing', async()=>{
-    // One segment, an only copy at its end that cannot leave: no 64 KiB block can form.
+    // One segment, an only copy at the end of each quarter that cannot leave:
+    // no 16 KiB block can form.
     const { keeper, reader } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
-    for (let i = 0; i < 15; i++)
+    for (let i = 0; i < 16; i++)
     {
-        reader.put(`n${i}`, bodyOf(UNIT, i + 1));
+        reader.put(`n${i}`, bodyOf(UNIT, i + 1), { onlyCopy: i % 4 === 3 });
     }
-    reader.put('pinned', bodyOf(UNIT, 0), { onlyCopy: true });
-    assert.equal(reader.reserve('big', 64 * KIB), null);
+    assert.equal(reader.reserve('big', 16 * KIB), null);
     assert.equal(keeper.figures().refusedRoom, 1);
     assert.equal(keeper.figures().gone, 0, 'nothing taken away for it');
-    for (let i = 0; i < 15; i++)
+    for (let i = 0; i < 16; i++)
     {
         assert.equal(reader.look(`n${i}`), 'hot', `n${i}`);
     }
+    // Past what the budget holds beside the spare: refused before anything is looked at.
+    assert.equal(reader.reserve('larger', 32 * KIB), null);
+    assert.equal(keeper.figures().refusedLarge, 1);
 });
 
 test('room is made in a block the body fits, not by cooling the oldest bodies around one that stays',
     async()=>{
         const { keeper, reader, step } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
-        // Units 0 to 7: the oldest bodies, then an only copy that cannot leave.
-        for (let i = 1; i < 8; i++)
+        // Units 0 to 7: the oldest bodies, an only copy that cannot leave in
+        // each block of four.
+        for (let i = 0; i < 8; i++)
         {
-            reader.put(`old${i}`, bodyOf(UNIT, i));
+            reader.put(`old${i}`, bodyOf(UNIT, i), { onlyCopy: i % 4 === 3 });
         }
-        reader.put('pinned', bodyOf(UNIT, 0), { onlyCopy: true });
         step(10);
         // Units 8 to 15: newer ones.
         for (let i = 8; i < 16; i++)
         {
             reader.put(`new${i}`, bodyOf(UNIT, i));
         }
-        assert.equal(reader.put('big', bodyOf(32 * KIB, 99)), true);
-        for (let i = 1; i < 8; i++)
+        assert.equal(reader.put('big', bodyOf(16 * KIB, 99)), true);
+        for (let i = 0; i < 8; i++)
         {
-            assert.equal(reader.look(`old${i}`), 'hot', `old${i}: in the block that cannot form`);
+            assert.equal(reader.look(`old${i}`), 'hot', `old${i}: in a block that cannot form`);
         }
         for (let i = 8; i < 16; i++)
         {
-            assert.equal(reader.look(`new${i}`), null, `new${i}`);
+            assert.equal(reader.look(`new${i}`), i < 12 ? null : 'hot', `new${i}`);
         }
-        assert.equal(keeper.figures().gone, 8);
-        assert.deepEqual(reader.with('big', body=>[...body]), [...bodyOf(32 * KIB, 99)]);
+        assert.equal(keeper.figures().gone, 4);
+        assert.deepEqual(reader.with('big', body=>[...body]), [...bodyOf(16 * KIB, 99)]);
     });
 
 test('a full cache walks its records once for many reserves, and a body read since it was listed is'
@@ -591,8 +615,10 @@ test('a reserve refused in a tick does not refuse one of more segments known, or
     // The record spared: a name's own body is not cooled for its own
     // reserve, and is held while room is looked for; for another name's it
     // is the body that can leave.
-    const spared = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT });
+    const spared = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT });
     assert.equal(spared.reader.put('a', bodyOf(UNIT, 3), { disk: 'never', idle: 'stay' }), true);
+    assert.equal(spared.reader.put('c', bodyOf(UNIT, 4), { disk: 'never' }), true);
+    pinRest(spared.reader);
     assert.equal(spared.reader.reserve('a', 2 * UNIT), null, 'its own body is not cooled for it');
     assert.equal(spared.reader.look('a'), 'hot', 'and stays as it was');
     assert.ok(spared.reader.reserve('b', 2 * UNIT), 'another name\'s takes its room');
@@ -602,9 +628,10 @@ test('a reserve refused in a tick does not refuse one of more segments known, or
 test('a large reserve refused in a tick does not refuse a small one the same tick could place', async()=>{
     // The refusal of a block of 8 KiB, whose other half holds an only copy,
     // says nothing of a block of 4 KiB: a body that can leave makes it.
-    const { keeper, reader } = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT });
+    const { keeper, reader } = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT });
     assert.equal(reader.put('pin', bodyOf(UNIT, 1), { onlyCopy: true, disk: 'never' }), true);
     assert.equal(reader.put('free', bodyOf(UNIT, 2), { disk: 'never', idle: 'stay' }), true);
+    pinRest(reader);
     assert.equal(reader.reserve('big', 2 * UNIT), null, 'no block of 8 KiB can be formed');
     // The same refusal asked again in the tick costs one look, not a walk.
     const listed = keeper.figures().oldestListed;
@@ -623,10 +650,11 @@ test('a block that cannot be made whole moves no body of it: a failed write leav
         // whose write to the disk fails. Neither may leave for a block that
         // is not formed.
         const disk = crashDisk();
-        const { keeper, reader, wait } = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT,
+        const { keeper, reader, wait } = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT,
             packBytes: 2 * UNIT, disk });
         assert.equal(reader.put('a', bodyOf(UNIT, 1), { disk: 'never' }), true);
         assert.equal(reader.put('b', bodyOf(UNIT, 2), { onlyCopy: true }), true);
+        pinRest(reader);
         for (const name of disk.current().keys())
         {
             disk.failing.write.add(name);
@@ -647,9 +675,10 @@ test('a block that cannot be made whole moves no body of it: a reader entering o
     + 'judged free to leave, or a flush failing as the block is made', async()=>{
     // A reader enters the second body between the keeper's look and its
     // hold: the first, held already, is let go of as it was.
-    const entered = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT });
+    const entered = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT });
     assert.equal(entered.reader.put('a', bodyOf(UNIT, 1), { disk: 'never' }), true);
     assert.equal(entered.reader.put('b', bodyOf(UNIT, 2), { disk: 'never' }), true);
+    pinRest(entered.reader);
     const exchange = Atomics.compareExchange;
     let holds = 0;
     /** The reader that entered, leaving. */
@@ -684,9 +713,10 @@ test('a block that cannot be made whole moves no body of it: a reader entering o
     // An only copy's write lands and its flush fails: the disk may not hold
     // it, so it stays, and its neighbour with it.
     const disk = crashDisk();
-    const flushed = await cacheOf({ budget: 2 * UNIT, segmentBytes: 2 * UNIT, packBytes: 2 * UNIT, disk });
+    const flushed = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT, packBytes: 2 * UNIT, disk });
     assert.equal(flushed.reader.put('a', bodyOf(UNIT, 3), { disk: 'never' }), true);
     assert.equal(flushed.reader.put('b', bodyOf(UNIT, 4), { onlyCopy: true }), true);
+    pinRest(flushed.reader);
     for (let number = 0; number < 8; number++)
     {
         disk.failing.flush.add(`pack-${number}`);
@@ -743,7 +773,8 @@ test('a cache nothing in can leave walks its records once a tick for reserves it
 });
 
 test('segments let go and made again keep their numbers apart, the budget and every body', async()=>{
-    const { keeper, reader, step, said } = await cacheOf({ budget: 192 * KIB, segmentBytes: 64 * KIB,
+    // Each body in a segment of its own, beside the shared spare.
+    const { keeper, reader, step, said } = await cacheOf({ budget: 256 * KIB, segmentBytes: 64 * KIB,
         coldAfterMs: 1e6, goneAfterMs: 1e6 });
     for (let round = 0; round < 30; round++)
     {
@@ -752,7 +783,7 @@ test('segments let go and made again keep their numbers apart, the budget and ev
             assert.equal(reader.put(`r${round}-${i}`, bodyOf(60 * KIB, round + i)), true);
         }
         const figures = keeper.figures();
-        assert.ok(figures.segmentBytes <= 192 * KIB, JSON.stringify(figures));
+        assert.ok(figures.segmentBytes <= 256 * KIB, JSON.stringify(figures));
         for (let i = 0; i < 3; i++)
         {
             assert.deepEqual(reader.with(`r${round}-${i}`, body=>body[1]), (31 + round + i) & 255);
@@ -886,12 +917,18 @@ test('an owner\'s names are let go together: what was under its prefix, and what
 
 test('memory let go of gives its room back at the next reserve of any name, not at the sweep', async()=>{
     const { keeper, reader } = await cacheOf({ budget: 64 * 1024, segmentBytes: 64 * 1024 });
-    assert.ok(reader.hold('frame/1', 64 * 1024));
-    assert.equal(reader.hold('frame/2', 64 * 1024), null, 'one segment, held whole');
-    reader.abandon('frame/1');
-    assert.ok(reader.hold('frame/2', 64 * 1024), 'the room frame/1 let go of, with no sweep between');
+    for (let i = 0; i < 4; i++)
+    {
+        assert.ok(reader.hold(`rows/${i}`, 16 * 1024));
+    }
+    assert.equal(reader.hold('frame/2', 16 * 1024), null, 'one segment, held whole');
+    reader.abandon('rows/0');
+    assert.ok(reader.hold('frame/2', 16 * 1024), 'the room rows/0 let go of, with no sweep between');
     assert.equal(keeper.figures().abandoned, 1);
-    reader.abandon('frame/2');
+    for (const name of ['rows/1', 'rows/2', 'rows/3', 'frame/2'])
+    {
+        reader.abandon(name);
+    }
     assert.ok(reader.reserve('frame/3', 1000), 'a reserve too');
     assert.equal(keeper.figures().placedBytes, UNIT, 'frame/3 alone is placed');
 });

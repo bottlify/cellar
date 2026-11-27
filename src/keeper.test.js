@@ -205,10 +205,11 @@ test('a save torn mid-write leaves the one before it, which the next run reads',
     assert.equal(second.reader.with('a', body=>body[1], { wait: true }), (31 + 1) & 255);
 });
 
-test('a body larger than a segment is refused and said so', async()=>{
+test('a body larger than the budget is refused and said so', async()=>{
     const { reader, keeper } = await cacheOf();
-    assert.equal(reader.put('big', new Uint8Array(65 * KIB)), false);
+    assert.equal(reader.put('big', new Uint8Array(257 * KIB)), false);
     assert.equal(keeper.figures().refusedLarge, 1);
+    assert.equal(keeper.figures().segments, 1, 'nothing moved for it');
 });
 
 test('where memory cannot be shared the cache is one thread\'s, every part of it the same', async()=>{
@@ -356,18 +357,22 @@ test('a put lets go of the name\'s reservation not committed yet and holds none 
 
 test('a cold body is raised only into a segment the asking thread has', async()=>{
     const { keeper, reader, step } = await cacheOf({ disk: memoryDisk() });
-    reader.put('a', bodyOf(60 * KIB, 1));
+    reader.put('a', bodyOf(16 * KIB, 1));
     step(100);
     assert.equal(reader.look('a'), 'cold');
-    // A thread that knows the first segment only, which a body fills now.
+    // A thread that knows the first segment only, which its bodies fill now.
     const late = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers().slice(0, 1),
         keeper: {
             reserve: (name, length, options)=>keeper.reserve(name, length, options),
             raise: (name, options)=>keeper.raise(name, options),
             raiseLater: ()=>{}, drop: ()=>{},
         } });
-    assert.equal(late.put('b', bodyOf(60 * KIB, 2)), true);
+    for (let i = 0; i < 4; i++)
+    {
+        assert.equal(late.put(`b${i}`, bodyOf(16 * KIB, 2)), true);
+    }
     assert.equal(late.with('a', body=>body[1], { wait: true }), (31 + 1) & 255);
+    assert.equal(late.look('b0'), 'cold', 'the oldest of the first segment made room');
 });
 
 test('a body the disk holds less of than the index says is gone, or an only copy stays cold, not'
@@ -416,10 +421,10 @@ test('a body the disk holds less of than the index says is gone, or an only copy
         assert.deepEqual(third.reader.with('doc', body=>[...body], { wait: true }), [...bodyOf(8000, 6)]);
     });
 
-test('a body saved by a run of larger segments is not raised, and moves nothing', async()=>{
+test('a body saved by a run of a larger budget is not raised, and moves nothing', async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk, budget: 512 * KIB, segmentBytes: 128 * KIB });
-    first.reader.put('big', bodyOf(100 * KIB, 1));
+    first.reader.put('big', bodyOf(300 * KIB, 1));
     first.keeper.close();
     const second = await cacheOf({ disk });
     for (let i = 0; i < 4; i++)
@@ -876,7 +881,8 @@ test('an index of Cellar 0.9.0 of more packs than a run opens, or of an unsafe g
 });
 
 test('a body asked away while read and then cooled for room goes, not to the disk', async()=>{
-    const { reader, keeper, step } = await cacheOf({ disk: memoryDisk(), budget: 64 * KIB });
+    // Each in a segment of its own, beside the shared spare.
+    const { reader, keeper, step } = await cacheOf({ disk: memoryDisk(), budget: 128 * KIB });
     reader.put('a', bodyOf(32 * KIB, 1), { onlyCopy: true });
     reader.with('a', ()=>{
         keeper.drop('a');
@@ -894,8 +900,8 @@ test('a body asked away while read and then cooled for room goes, not to the dis
 test('a segment the engine will not make is counted, and room found by cooling as if the budget'
     + ' were spent: no body is left mid-move, no reservation half made', async()=>{
     const { reader, keeper } = await cacheOf({ disk: memoryDisk(), budget: 1024 * KIB });
-    reader.put('cold', bodyOf(60 * KIB, 1), { onlyCopy: true });
-    reader.put('a', bodyOf(60 * KIB, 2));
+    reader.put('cold', bodyOf(16 * KIB, 1), { onlyCopy: true });
+    reader.put('a', bodyOf(16 * KIB, 2));
     const Shared = globalThis.SharedArrayBuffer;
     globalThis.SharedArrayBuffer = /** @type {any} */ (class extends /** @type {any} */ (Shared) {
         /** @param {number} bytes @param {any} [options] */
@@ -909,20 +915,23 @@ test('a segment the engine will not make is counted, and room found by cooling a
     });
     try
     {
-        // Two segments, the second the spare: each write takes one, its next
-        // spare is refused, and the next write cools what it must.
-        assert.equal(reader.put('b', bodyOf(60 * KIB, 3)), true);
-        assert.equal(reader.put('c', bodyOf(60 * KIB, 4)), true);
+        // Four bodies fill a segment: the first and the spare made before
+        // are filled, the next spare is refused, and the next write cools
+        // what it must.
+        for (const name of ['b', 'c', 'd', 'e', 'f', 'g', 'h'])
+        {
+            assert.equal(reader.put(name, bodyOf(16 * KIB, 3)), true, name);
+        }
         assert.equal(reader.look('cold'), 'cold');
-        assert.deepEqual(reader.with('cold', body=>[...body], { wait: true }), [...bodyOf(60 * KIB, 1)]);
-        assert.equal(reader.put('c', bodyOf(60 * KIB, 5)), true, 'rewritten');
+        assert.deepEqual(reader.with('cold', body=>[...body], { wait: true }), [...bodyOf(16 * KIB, 1)]);
+        assert.equal(reader.put('c', bodyOf(16 * KIB, 5)), true, 'rewritten');
     }
     finally
     {
         globalThis.SharedArrayBuffer = Shared;
     }
     assert.ok(keeper.figures().segmentFailures > 0);
-    assert.deepEqual(reader.with('c', body=>[...body]), [...bodyOf(60 * KIB, 5)]);
+    assert.deepEqual(reader.with('c', body=>[...body]), [...bodyOf(16 * KIB, 5)]);
 });
 
 test('names are not spent once the records are full', { timeout: 120_000 }, async()=>{
@@ -961,27 +970,45 @@ test('an index of Cellar 0.9.0 of a generation past what a save counts to is not
 test('a reader that missed a segment\'s message is placed only below it: an only copy rewritten is'
     + ' not lost', async()=>{
     const { reader: full, keeper } = await cacheOf({ budget: 192 * KIB });
-    full.put('a', bodyOf(60 * KIB, 1), { onlyCopy: true });
-    full.put('b', bodyOf(60 * KIB, 2));
-    full.put('c', bodyOf(60 * KIB, 3));
-    keeper.drop('b');
-    // A reader told of segments 0 and 2, not of 1, which is the free one.
-    const [s0, , s2] = keeper.segmentBuffers();
+    // The first segment: the only copy and three that never leave; the
+    // second and the third four bodies each.
+    full.put('a', bodyOf(16 * KIB, 1), { onlyCopy: true });
+    for (let i = 0; i < 3; i++)
+    {
+        full.put(`pin${i}`, bodyOf(16 * KIB, 5), { onlyCopy: true, disk: 'never' });
+    }
+    for (let i = 0; i < 8; i++)
+    {
+        full.put(`${i < 4 ? 'b' : 'c'}${i}`, bodyOf(16 * KIB, 2));
+    }
+    for (let i = 0; i < 4; i++)
+    {
+        keeper.drop(`b${i}`);
+    }
+    // A reader told of the first and the third, not of the second, which is
+    // the free one (the own segments between are spares of no bytes).
+    const [s0, free, s3] = keeper.segmentBuffers().filter(buffer=>buffer?.byteLength === 64 * KIB);
     const partial = createReader({ shared: keeper.shared, segments: [s0], keeper: {
         reserve: (name, length, options)=>keeper.reserve(name, length, options),
         raise: (name, options)=>keeper.raise(name, options),
         raiseLater: ()=>{}, drop: ()=>{},
     } });
-    partial.adopt({ segment: 2, buffer: s2 });
-    assert.equal(partial.put('a', bodyOf(60 * KIB, 4), { onlyCopy: true }), true);
-    assert.deepEqual(partial.with('a', body=>[...body]), [...bodyOf(60 * KIB, 4)]);
+    partial.adopt({ segment: keeper.segmentBuffers().indexOf(s3), buffer: s3 });
+    assert.ok(keeper.segmentBuffers().indexOf(free) < keeper.segmentBuffers().indexOf(s3));
+    assert.equal(partial.put('a', bodyOf(16 * KIB, 4), { onlyCopy: true }), true);
+    assert.deepEqual(partial.with('a', body=>[...body]), [...bodyOf(16 * KIB, 4)]);
     assert.equal(partial.figures().refused, 0);
 });
 
 test('a name\'s own body is not cooled to make room for its rewrite, though its reader left',
     async()=>{
         const { reader, keeper } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
-        reader.put('a', bodyOf(60 * KIB, 1));
+        reader.put('a', bodyOf(16 * KIB, 1));
+        // The rest of the one segment the budget holds, never to leave.
+        for (let i = 0; i < 3; i++)
+        {
+            reader.put(`pin${i}`, bodyOf(16 * KIB, 2), { onlyCopy: true, disk: 'never' });
+        }
         // Read when the rewrite looks at it, out before room is sought: a
         // reader in another thread leaving between the two.
         const words = new Int32Array(keeper.shared.records);
@@ -1003,7 +1030,7 @@ test('a name\'s own body is not cooled to make room for its rewrite, though its 
         let place;
         try
         {
-            place = keeper.reserve('a', 60 * KIB, { known: 1 });
+            place = keeper.reserve('a', 16 * KIB, { known: 1 });
         }
         finally
         {
@@ -1011,7 +1038,7 @@ test('a name\'s own body is not cooled to make room for its rewrite, though its 
         }
         assert.equal(leave, false, 'the reader left between the two');
         assert.equal(place, null, 'no room but its own');
-        assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(60 * KIB, 1)], 'as it was');
+        assert.deepEqual(reader.with('a', body=>[...body]), [...bodyOf(16 * KIB, 1)], 'as it was');
     });
 
 test('bytes that grow while they are put are put as long as they were', async()=>{
@@ -1664,10 +1691,8 @@ test('a close whose save fails brings back into memory the cold only copies no w
     const { reader, keeper, step } = await cacheOf({ disk, budget: 128 * KIB });
     reader.put('only', bodyOf(60 * KIB, 4), { onlyCopy: true });
     step(150);
-    for (const name of ['h1', 'h2'])
-    {
-        assert.equal(reader.put(name, bodyOf(60 * KIB, 5), { onlyCopy: true, disk: 'never' }), true);
-    }
+    // Its own segment beside the shared spare: the budget's room for one such.
+    assert.equal(reader.put('h1', bodyOf(60 * KIB, 5), { onlyCopy: true, disk: 'never' }), true);
     disk.failing.write.add('index-a').add('index-b');
     assert.equal(keeper.close(), false);
     assert.equal(reader.look('only'), null);
@@ -2200,7 +2225,8 @@ test('a pack flush that fails may lose what the pack took since the flush before
 test('a body being raised whose copy a failed flush let go of while room was made goes, rather than'
     + ' stay cold with no copy', async()=>{
     const disk = crashDisk();
-    const { reader, keeper } = await cacheOf({ disk, budget: 64 * KIB });
+    // Room for one body of a segment of its own beside the shared spare.
+    const { reader, keeper } = await cacheOf({ disk, budget: 128 * KIB });
     reader.put('block', bodyOf(40 * KIB, 1));
     // Room for the only copy cools the block: written, not flushed yet.
     reader.put('only', bodyOf(40 * KIB, 2), { onlyCopy: true });

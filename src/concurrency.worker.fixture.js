@@ -198,7 +198,10 @@ for (let op = 0; op < operations || !enough(); op++)
     else if (roll < 92)
     {
         counts.writes++;
-        if (write(name, next(), 16 + (next() % (12 * 1024))))
+        // One write in eight a body of 20 to 48 KiB: in the gate's segments
+        // of 64 KiB, one in a segment of its own.
+        if (write(name, next(), (next() & 7) === 0 ? 20 * 1024 + (next() % (28 * 1024))
+            : 16 + (next() % (12 * 1024))))
         {
             counts.written++;
         }

@@ -127,6 +127,8 @@ test('threads on one pool never read a body the keeper gave away', { timeout: 12
     assert.ok(figures.cooled > 100, `cooled ${figures.cooled}`);
     assert.ok(figures.raised > 10, `raised ${figures.raised}`);
     assert.ok(figures.segmentsLetGo > 0, `segments let go ${figures.segmentsLetGo}`);
+    // Bodies of a segment of their own, of under 64 KiB, among them.
+    assert.ok(figures.letGoBytes < figures.segmentsLetGo * 64 * KIB, `${figures.letGoBytes} bytes let go`);
     assert.ok(figures.segmentBytes <= 512 * KIB);
 });
 
