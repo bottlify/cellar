@@ -620,8 +620,14 @@ export async function openKeeper(options){
     const pageOf = length=>Math.ceil(length / UNIT) * UNIT;
     /** The bytes a body of `length` takes in memory: its grains, or its own segment. @param {number} length */
     const placedOf = length=>(length > large ? pageOf(length) : grainsOf(length));
-    /** Whether a segment can hold a body of `length`. @param {number} length */
-    const fits = length=>length > 0 && (length <= large || pageOf(length) <= ownMost);
+    /**
+     * Whether a segment can hold a body of `length` within the budget: a
+     * shared one the page its grains reach, an own one its pages.
+     *
+     * @param {number} length
+     */
+    const fits = length=>length > 0
+        && (length <= large ? pageOf(grainsOf(length)) <= budget : pageOf(length) <= ownMost);
 
     /** @param {number} at */
     const segmentAt = at=>/** @type {NonNullable<typeof segments[0]>} */ (segments[at]);
@@ -731,6 +737,17 @@ export async function openKeeper(options){
      * @type {number[]}
      */
     const spares = [];
+    /** The tick a large body last asked for spares the engine would not make: asked again at the next. */
+    let sparesAskedAt = -1;
+    /** Spares made again for a large body where none is left, once a tick at most. */
+    const askSpareOwn = ()=>{
+        const now = tick();
+        if (spares.length === 0 && sparesAskedAt !== now)
+        {
+            sparesAskedAt = now;
+            keepSpareOwn();
+        }
+    };
     const keepSpareOwn = ()=>{
         while (spares.length < Math.floor(ownMost / (large + UNIT)))
         {
@@ -864,6 +881,7 @@ export async function openKeeper(options){
      */
     const placeOwn = (length, limit)=>{
         const bytes = pageOf(length);
+        askSpareOwn();
         const at = spares.length > 0 && spares[0] < limit ? spares[0] : -1;
         if (at < 0)
         {
@@ -1022,20 +1040,16 @@ export async function openKeeper(options){
      * body's, on the disk, for the next time it goes cold. Gone and retired
      * bodies no one reads can change only here, and go last.
      *
-     * @param {number[]} ids
+     * @param {number[]} ids @param {number} count  the first `count` of them
      */
-    const vacate = ids=>{
-        /** @type {number[]} */
-        const taken = [];
-        const giveUp = ()=>{
-            for (const id of taken)
-            {
-                store(id, HOT);
-            }
-            return false;
-        };
-        for (const id of ids)
+    const vacate = (ids, count)=>{
+        // Kept between calls, as a full cache vacates at every reserve; a
+        // vacate is never made inside another.
+        const taken = vacating;
+        let held = 0;
+        for (let i = 0; i < count; i++)
         {
+            const id = ids[i];
             if (stateOf(stateWordOf(id)) !== HOT)
             {
                 continue;
@@ -1043,32 +1057,33 @@ export async function openKeeper(options){
             if (Atomics.compareExchange(words, index.at(id) + R_STATE, stateWord(HOT),
                 stateWord(MOVING)) !== stateWord(HOT))
             {
-                return giveUp();
+                return heldAgain(taken, held);
             }
-            taken.push(id);
+            taken[held++] = id;
         }
-        for (const id of taken)
+        for (let i = 0; i < held; i++)
         {
-            const flags = get(id, R_FLAGS);
-            if ((flags & F_DROP) === 0 && (flags & F_ON_DISK) === 0 && !writeOut(id, false)
+            const flags = get(taken[i], R_FLAGS);
+            if ((flags & F_DROP) === 0 && (flags & F_ON_DISK) === 0 && !writeOut(taken[i], false)
                 && (flags & F_ONLY_COPY) !== 0)
             {
-                return giveUp();
+                return heldAgain(taken, held);
             }
         }
         // The packs the only copies lie in flushed, each once; one that fails
         // forgets the copies it may have lost.
-        for (const id of taken)
+        for (let i = 0; i < held; i++)
         {
-            const flags = get(id, R_FLAGS);
+            const flags = get(taken[i], R_FLAGS);
             if ((flags & (F_DROP | F_ONLY_COPY)) === F_ONLY_COPY
-                && ((flags & F_ON_DISK) === 0 || !flushPack(get(id, R_PACK))))
+                && ((flags & F_ON_DISK) === 0 || !flushPack(get(taken[i], R_PACK))))
             {
-                return giveUp();
+                return heldAgain(taken, held);
             }
         }
-        for (const id of taken)
+        for (let i = 0; i < held; i++)
         {
+            const id = taken[i];
             const flags = get(id, R_FLAGS);
             giveBack(id);
             if ((flags & F_DROP) !== 0)
@@ -1089,8 +1104,9 @@ export async function openKeeper(options){
                 counts.gone++;
             }
         }
-        for (const id of ids)
+        for (let i = 0; i < count; i++)
         {
+            const id = ids[i];
             const state = stateOf(stateWordOf(id));
             if (state === GONE && get(id, R_SEGMENT) >= 0)
             {
@@ -1104,15 +1120,30 @@ export async function openKeeper(options){
         return true;
     };
 
+    /** The bodies `vacate` holds (MOVING) while it takes a block's out. @type {number[]} */
+    const vacating = [];
+    /**
+     * Bodies a `vacate` held, hot again as they were: false, the vacate given up.
+     *
+     * @param {number[]} taken @param {number} held  the first `held` of them
+     */
+    const heldAgain = (taken, held)=>{
+        for (let i = 0; i < held; i++)
+        {
+            store(taken[i], HOT);
+        }
+        return false;
+    };
+
     /**
      * Whether every record of `ids` can leave for the record `spare`'s room
      * (`canLeave`): a loop, not a callback, so that `room` makes no context
      * of its own at each reserve for a closure it seldom runs.
      *
-     * @param {number[]} ids @param {number} spare
+     * @param {number[]} ids @param {number} count  the first `count` of them @param {number} spare
      */
-    const allCanLeave = (ids, spare)=>{
-        for (let i = 0; i < ids.length; i++)
+    const allCanLeave = (ids, count, spare)=>{
+        for (let i = 0; i < count; i++)
         {
             if (!canLeave(ids[i], spare))
             {
@@ -1122,15 +1153,86 @@ export async function openKeeper(options){
         return true;
     };
 
+
+    /** What `room` knows of the budget the bodies that can leave give back. */
+    const BUDGET_UNASKED = 0;
+    const BUDGET_YES = 1;
+    const BUDGET_NO = 2;
+    /** The bodies of a block or a segment as `room`, `reuse` and `freeable` weigh them, kept between reserves. */
+    /** @type {number[]} */
+    const roomOwners = [];
+    /** @type {number[]} */
+    const freeableOwners = [];
+    /**
+     * Whether every record of `ids` but `own` can leave for `own`'s room.
+     *
+     * @param {number[]} ids @param {number} count  the first `count` of them @param {number} own
+     */
+    const othersCanLeave = (ids, count, own)=>{
+        for (let i = 0; i < count; i++)
+        {
+            if (ids[i] !== own && !canLeave(ids[i], own))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    /**
+     * The budget the bodies below segment `limit` that can leave would give
+     * back by leaving (`canLeave`), `spare` kept: an own segment's whole,
+     * and a shared segment's reach where every body in it can go (an empty
+     * one's too). A body that leaves a shared segment others stay in gives
+     * nothing back: the segment's reach does not come down while it is held.
+     *
+     * @param {number} limit @param {number} spare
+     */
+    const freeable = (limit, spare)=>{
+        let bytes = 0;
+        const owners = freeableOwners;
+        for (let id = 0; id < words[H_COUNT]; id++)
+        {
+            const segment = get(id, R_SEGMENT);
+            if (segment >= 0 && segment < limit && segmentAt(segment).buddy === null
+                && stateOf(stateWordOf(id)) !== GONE && canLeave(id, spare))
+            {
+                bytes += segmentAt(segment).reach;
+            }
+        }
+        for (let i = 0; i < liveSegments.length && liveSegments[i] < limit; i++)
+        {
+            const at = liveSegments[i];
+            if (segmentAt(at).reach > 0
+                && allCanLeave(owners, buddyOf(at).ownersInto(0, segmentBytes, owners), spare))
+            {
+                bytes += segmentAt(at).reach;
+            }
+        }
+        return bytes;
+    };
+
+    /**
+     * Whether the budget would hold `need` bytes more with every body below
+     * `limit` that can leave gone, `spare` kept.
+     *
+     * @param {number} need @param {number} limit @param {number} spare
+     */
+    const budgetMakes = (need, limit, spare)=>(account.fits(Math.max(0, need - freeable(limit, spare)), kind)
+        ? BUDGET_YES : BUDGET_NO);
+
     /**
      * Room for `length` bytes, the least recently used bodies made cold to
-     * find it, but only where that forms a block for it: a body is taken out
-     * only with every other in the block of the size asked it lies in, and
-     * only where all of them can leave; a large body's block is a whole
-     * shared segment, let go of for the budget, and a body in an own segment
-     * frees the segment; so is held memory's, which grows a segment of its
-     * own kind. A request no block can be formed for moves nothing. Where it
-     * is (a place, as `placeIn`'s), or -1.
+     * find it, but only where their going makes it: a request is placed
+     * either in a block of a shared segment, formed by every body in that
+     * block leaving (all of them able to), within the segment's reach or a
+     * growth the budget has room for; or by budget the bodies give back (an
+     * own segment's body, a shared segment all of whose bodies go), which
+     * an own segment and held memory are placed by, and a shared request
+     * where no block forms. A request the bodies that can leave could not
+     * make room for even all gone moves nothing: nor one whose own segment
+     * the writer has not heard of. Where it is (a place, as `placeIn`'s),
+     * or -1.
      *
      * @param {number} length @param {number} limit  segments a writer has
      * @param {number} [spare]  the record the room is for, never cooled for it
@@ -1142,8 +1244,29 @@ export async function openKeeper(options){
         {
             return found;
         }
-        const block = length > large || memory ? segmentBytes : blockOf(length);
-        /** Blocks found holding a body that cannot leave, by segment and offset: each looked at once. */
+        const own = length > large && !memory;
+        // An own segment the writer has not heard of: no body's going makes it one.
+        if (own && !(spares.length > 0 && spares[0] < limit))
+        {
+            return -1;
+        }
+        // The budget a body takes where it grows a segment: its pages, or a
+        // fresh segment's page its grains reach.
+        const need = own ? pageOf(length) : pageOf(grainsOf(length));
+        // Whether what can leave gives back budget enough: asked once, where
+        // it matters - a state of the call, not a closure that would make a
+        // context at every reserve.
+        let byBudget = BUDGET_UNASKED;
+        if (own || memory)
+        {
+            byBudget = budgetMakes(need, limit, spare);
+            if (byBudget === BUDGET_NO)
+            {
+                return -1;
+            }
+        }
+        const block = own || memory ? segmentBytes : blockOf(length);
+        /** Blocks found holding a body that cannot leave, or making no room, by segment and offset: each looked at once. */
         /** @type {Set<number> | null} */
         let held = null;
         for (let listed = false; ;)
@@ -1181,10 +1304,14 @@ export async function openKeeper(options){
                 continue;
             }
             const segment = get(id, R_SEGMENT);
-            if (segmentAt(segment).buddy === null || blockOf(get(id, R_LENGTH)) >= block)
+            if (segmentAt(segment).buddy === null)
             {
-                // Its own block, or its own segment, holds the body.
-                if (!cool(id))
+                // A body in a segment of its own gives back budget, and nothing else.
+                if (byBudget === BUDGET_UNASKED)
+                {
+                    byBudget = budgetMakes(need, limit, spare);
+                }
+                if (byBudget === BUDGET_NO || !cool(id))
                 {
                     continue;
                 }
@@ -1197,13 +1324,25 @@ export async function openKeeper(options){
                 {
                     continue;
                 }
-                const inside = buddyOf(segment).ownersWithin(from, block);
-                if (!allCanLeave(inside, spare))
+                // The block formed holds the request where it lies within the
+                // segment's reach, or the budget grows the segment to it; a
+                // whole segment let go of gives budget back.
+                const end = from + grainsOf(length);
+                const reach = segmentAt(segment).reach;
+                let makes = block !== segmentBytes && (end <= reach || account.fits(pageOf(end) - reach, kind));
+                if (!makes)
                 {
-                    (held ??= new Set()).add(key);
-                    continue;
+                    if (byBudget === BUDGET_UNASKED)
+                    {
+                        byBudget = budgetMakes(need, limit, spare);
+                    }
+                    makes = byBudget === BUDGET_YES;
                 }
-                if (!vacate(inside))
+                const inside = makes ? buddyOf(segment).ownersInto(from, block, roomOwners) : 0;
+                // A body alone in its block leaves as any body cools.
+                const left = inside > 0 && (inside === 1 && roomOwners[0] === id ? cool(id)
+                    : allCanLeave(roomOwners, inside, spare) && vacate(roomOwners, inside));
+                if (!left)
                 {
                     (held ??= new Set()).add(key);
                     continue;
@@ -1215,6 +1354,46 @@ export async function openKeeper(options){
                 return found;
             }
         }
+    };
+
+    /**
+     * Room for record `id`'s new body of `length` in the block its old body
+     * lies at the start of, the old one held (MOVING) and given back only
+     * where the new one is sure to be placed: every other body in that block
+     * gone first (`evict`, where each can leave), none where it is false.
+     * Within the segment's reach, a shared body for a shared body. Where it
+     * is (a place), or -1 with nothing moved.
+     *
+     * @param {number} id @param {number} length @param {number} limit @param {boolean} evict
+     */
+    const reuse = (id, length, limit, evict)=>{
+        const segment = get(id, R_SEGMENT);
+        if (segment < 0 || segment >= limit || length > large || segmentAt(segment).buddy === null)
+        {
+            return -1;
+        }
+        const block = blockOf(length);
+        const from = get(id, R_OFFSET) & -block;
+        const reach = segmentAt(segment).reach;
+        if (from + grainsOf(length) > reach)
+        {
+            return -1;
+        }
+        // The old body is in the block, held (MOVING): no other leaving
+        // gives nothing to vacate, and vacate passes a body it holds by.
+        const inside = buddyOf(segment).ownersInto(from, block, roomOwners);
+        const alone = inside === 1 && roomOwners[0] === id;
+        if (!alone && (!evict || !othersCanLeave(roomOwners, inside, id) || !vacate(roomOwners, inside)))
+        {
+            return -1;
+        }
+        giveBack(id);
+        const offset = buddyOf(segment).place(length, reach);
+        if (offset < 0)
+        {
+            throw new Error(`cache: the block at ${from} of segment ${segment} was free and placed nothing`);
+        }
+        return segment * segmentBytes + offset;
     };
 
     /**
@@ -1234,6 +1413,12 @@ export async function openKeeper(options){
         }
         counts.roomAsked++;
         letGoEmpty(0);
+        // What the account could not hold were every body that can leave gone moves none.
+        if (!account.fits(Math.max(0, bytes - freeable(Infinity, -1))))
+        {
+            counts.roomRefused++;
+            return false;
+        }
         /** Shared segments found holding a body that cannot leave. @type {Set<number>} */
         const held = new Set();
         listOldest();
@@ -1250,8 +1435,8 @@ export async function openKeeper(options){
             {
                 continue;
             }
-            const inside = buddy.ownersWithin(0, segmentBytes);
-            if (!inside.every(other=>canLeave(other, -1)) || !vacate(inside))
+            const inside = buddy.ownersInto(0, segmentBytes, roomOwners);
+            if (!allCanLeave(roomOwners, inside, -1) || !vacate(roomOwners, inside))
             {
                 held.add(segment);
                 continue;
@@ -2329,15 +2514,27 @@ export async function openKeeper(options){
             const held = state === HOT && Atomics.compareExchange(words, index.at(id) + R_STATE,
                 stateWord(HOT), stateWord(MOVING)) === stateWord(HOT);
             const memory = (flags & F_HELD) !== 0;
-            // The name's own body is not cooled for it: a reader that leaves
-            // it meanwhile does not make it a candidate.
-            let found = room(length, known, id, memory);
-            if (found < 0 && held && !memory && get(id, R_SEGMENT) < known && length <= large
-                && get(id, R_LENGTH) <= large && blockOf(length) <= blockOf(get(id, R_LENGTH)))
+            // Room as it is; then the old body's own block, where no other
+            // body need go; then the oldest bodies; then the old body's block
+            // with those beside it gone. The name's own body is not cooled for
+            // it, and given back only where the new one is placed for sure.
+            const writtenOver = held && !memory;
+            let found = -1;
+            if (writtenOver)
             {
-                // Its own block holds the new body: written over in place.
-                giveBack(id);
-                found = placeIn(liveSegments, length, known);
+                found = placeNow(length, known, memory);
+                if (found < 0)
+                {
+                    found = reuse(id, length, known, false);
+                }
+            }
+            if (found < 0)
+            {
+                found = room(length, known, id, memory);
+            }
+            if (found < 0 && writtenOver)
+            {
+                found = reuse(id, length, known, true);
             }
             if (found < 0)
             {

@@ -687,15 +687,25 @@ test('a reserve refused in a tick does not refuse one of more segments known, or
 
     // The record spared: a name's own body is not cooled for its own
     // reserve, and is held while room is looked for; for another name's it
-    // is the body that can leave.
-    const spared = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT });
-    assert.equal(spared.reader.put('a', bodyOf(UNIT, 3), F_NO_DISK | F_FOR_ROOM), true);
-    assert.equal(spared.reader.put('c', bodyOf(UNIT, 4), reserveFlags({ disk: 'never' })), true);
-    pinRest(spared.reader);
-    assert.equal(spared.reader.reserve('a', 2 * UNIT), null, 'its own body is not cooled for it');
-    assert.equal(spared.reader.look('a'), 'hot', 'and stays as it was');
-    assert.ok(spared.reader.reserve('b', 2 * UNIT), 'another name\'s takes its room');
-    assert.equal(spared.reader.look('a'), null);
+    // is the body that can leave. Its block grows over the body beside it
+    // where that one can leave.
+    /** @param {number} besideFlags */
+    const spared = async besideFlags=>{
+        const cache = await cacheOf({ budget: 8 * UNIT, segmentBytes: 8 * UNIT });
+        assert.equal(cache.reader.put('a', bodyOf(UNIT, 3), F_NO_DISK | F_FOR_ROOM), true);
+        assert.equal(cache.reader.put('c', bodyOf(UNIT, 4), besideFlags), true);
+        pinRest(cache.reader);
+        return cache;
+    };
+    const pinned = await spared(F_ONLY_COPY | F_NO_DISK);
+    assert.equal(pinned.reader.reserve('a', 2 * UNIT), null, 'its own body is not cooled for it');
+    assert.equal(pinned.reader.look('a'), 'hot', 'and stays as it was');
+    const beside = await spared(reserveFlags({ disk: 'never' }));
+    assert.ok(beside.reader.reserve('a', 2 * UNIT), 'written over in its block, the body beside it gone');
+    assert.equal(beside.reader.look('c'), null);
+    const other = await spared(reserveFlags({ disk: 'never' }));
+    assert.ok(other.reader.reserve('b', 2 * UNIT), 'another name\'s takes its room');
+    assert.equal(other.reader.look('a'), null);
 });
 
 test('a large reserve refused in a tick does not refuse a small one the same tick could place', async()=>{

@@ -314,9 +314,11 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             {
                 return true;
             }
-            // The kind at its own ceiling: no room the cache makes is its.
+            // The kind at its own ceiling, or a take past the limit itself: no
+            // room the cache makes is its.
             const ceilingAt = KINDS_AT + at * KIND_WORDS;
-            if (room !== null && load(ceilingAt + K_HELD) + units <= load(ceilingAt + K_CEILING))
+            if (room !== null && load(ceilingAt + K_HELD) + units <= load(ceilingAt + K_CEILING)
+                && units <= load(LIMIT))
             {
                 add(ROOM_ASKED, 1);
                 if (room(units * ACCOUNT_UNIT) && tryTake(at, units))

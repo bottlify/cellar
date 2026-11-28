@@ -153,7 +153,7 @@ export function createBuddy(bytes){
 
     addFree(top, 0);
 
-    return {
+    const self = {
         bytes,
         /**
          * Room for `length` bytes ending at `below` at most: its offset, or
@@ -263,6 +263,19 @@ export function createBuddy(bytes){
         ownersWithin(from, span){
             /** @type {number[]} */
             const found = [];
+            found.length = self.ownersInto(from, span, found);
+            return found;
+        },
+        /**
+         * `ownersWithin` written into the front of `found`, what lies past
+         * them left as it was: how many. A caller that asks at every reserve
+         * keeps one array, and an array cut short lets go of its room.
+         *
+         * @param {number} from @param {number} span @param {number[]} found
+         * @returns {number}
+         */
+        ownersInto(from, span, found){
+            let count = 0;
             let at = from / GRAIN;
             // Only where a body or a free block starts is a mark: the first
             // mark at the starts of ever larger blocks around the span is
@@ -274,7 +287,7 @@ export function createBuddy(bytes){
                 {
                     if (orders[start] === BODY && start + lengths[start] > at)
                     {
-                        found.push(owners[start]);
+                        found[count++] = owners[start];
                         at = start + lengths[start];
                     }
                     break;
@@ -285,7 +298,7 @@ export function createBuddy(bytes){
                 // A body or a free block starts here.
                 if (orders[at] === BODY)
                 {
-                    found.push(owners[at]);
+                    found[count++] = owners[at];
                     at += lengths[at];
                 }
                 else
@@ -293,7 +306,7 @@ export function createBuddy(bytes){
                     at += 1 << (orders[at] & ~FREE);
                 }
             }
-            return found;
+            return count;
         },
         /** No body placed: the segment can be let go whole. */
         empty: ()=>given === 0,
@@ -313,6 +326,7 @@ export function createBuddy(bytes){
             return 0;
         },
     };
+    return self;
 }
 
 /** @typedef {ReturnType<typeof createBuddy>} Buddy */
