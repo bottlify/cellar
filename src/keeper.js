@@ -130,6 +130,13 @@ const COMPACT_PASS_BYTES = 1 << 20;
  * cools what it needs, past this.
  */
 const COOL_PASS_BYTES = 4 << 20;
+/**
+ * The address space the own segments announced ahead reserve in all: each
+ * can grow to the budget, and a browser's V8 sandbox holds every buffer of a
+ * page in one TiB (Chromium 158 made 502 growable buffers of 2 GiB and
+ * refused the next), where the guest's memories must fit too.
+ */
+const SPARE_ADDRESS_BYTES = 16 * 2 ** 30;
 
 /** What `append` answers where it wrote nothing: no pack open yet, or the disk refused. */
 const NOT_YET = -1;
@@ -767,8 +774,14 @@ export async function openKeeper(options){
             keepSpareOwn();
         }
     };
+    /**
+     * As many as large bodies the budget holds at once, within
+     * `SPARE_ADDRESS_BYTES` of address space; two at least.
+     */
+    const sparesMost = Math.max(2, Math.min(Math.floor(ownMost / (large + UNIT)),
+        Math.floor(SPARE_ADDRESS_BYTES / Math.max(ownMost, UNIT))));
     const keepSpareOwn = ()=>{
-        while (spares.length < Math.floor(ownMost / (large + UNIT)))
+        while (spares.length < sparesMost)
         {
             // No memory yet, only room to grow into: nothing of the budget.
             const buffer = take(()=>growableShared(0, ownMost), 0);
@@ -3165,6 +3178,8 @@ export async function openKeeper(options){
                     + index.table().byteLength,
                 // The fixed memory disk reads and writes of growable memory go through.
                 ioScratchBytes: ioScratch.length,
+                // The address space the own segments announced ahead may grow into.
+                spareAddressBytes: spares.length * ownMost,
                 // The shared segments' room lists, beside their memory: 9 bytes a grain.
                 metadataBytes: shares.reduce((sum, one)=>sum + one.metadataBytes(), 0),
                 packs: packs.size,

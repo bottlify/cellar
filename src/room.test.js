@@ -263,3 +263,20 @@ test('a sweep cools a bounded part of the idle bodies, the rest at the sweeps af
     }
     assert.equal(keeper.figures().cold, 4096, 'the rest at the sweeps after');
 });
+
+test('the own segments announced ahead reserve a bounded address space, whatever the budget', async()=>{
+    // Each spare can grow to the budget: a spare for every large body the
+    // budget holds was 511 of 2 GiB for a budget of 2 GiB - a TiB of address
+    // space, which a browser's V8 sandbox has in all (Chromium made 502).
+    const { openKeeper } = await import('./keeper.js');
+    const MIB = 1024 * KIB;
+    for (const budget of [256 * MIB, 2048 * MIB])
+    {
+        const keeper = await openKeeper({ budget, segmentBytes: 16 * MIB, announce: ()=>{} });
+        const figures = keeper.figures();
+        assert.ok(figures.spareAddressBytes <= 16 * 1024 * MIB + budget,
+            `${figures.spareAddressBytes / MIB} MiB of address space for a budget of ${budget / MIB}`);
+        assert.ok(figures.spareAddressBytes >= 2 * Math.min(budget, 2 ** 31 - 4096), 'two spares at least');
+        keeper.close();
+    }
+});
