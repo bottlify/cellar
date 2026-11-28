@@ -308,6 +308,9 @@ export function createBuddy(bytes){
             }
             return count;
         },
+        /** The bytes its lists take beside the segment: heads, tails, links and marks. */
+        metadataBytes: ()=>heads.byteLength + tails.byteLength + next.byteLength + previous.byteLength
+            + orders.byteLength,
         /** No body placed: the segment can be let go whole. */
         empty: ()=>given === 0,
         /** Bytes the bodies placed take. */

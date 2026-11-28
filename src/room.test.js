@@ -226,3 +226,18 @@ test('a body of its own segment cut short on the disk is no body there: it stays
     assert.deepEqual(second.reader.with('big', read=>read.slice(), { wait: true }), body,
         'read back whole by a keeper opened again');
 });
+
+test('the room lists of the shared segments are counted beside their memory, nine bytes a grain', async()=>{
+    // The four spare shared segments a keeper announces ahead (two of bodies,
+    // two of held memory) hold no memory and still have their lists.
+    const { keeper, reader } = await cacheOf({ budget: 256 * KIB, segmentBytes: 64 * KIB });
+    const grains = 64 * KIB / 512;
+    const each = grains * 9 + 2 * 4 * (Math.log2(grains) + 1);
+    assert.equal(keeper.figures().metadataBytes, 4 * each);
+    for (let n = 0; n < 20; n++)
+    {
+        reader.put(`b/${n}`, bytes(8192, n));
+    }
+    assert.equal(keeper.figures().metadataBytes % each, 0);
+    assert.ok(keeper.figures().metadataBytes > 4 * each, 'a segment grown is one more');
+});

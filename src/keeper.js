@@ -3152,6 +3152,8 @@ export async function openKeeper(options){
                     + index.table().byteLength,
                 // The fixed memory disk reads and writes of growable memory go through.
                 ioScratchBytes: ioScratch.length,
+                // The shared segments' room lists, beside their memory: 9 bytes a grain.
+                metadataBytes: shares.reduce((sum, one)=>sum + one.metadataBytes(), 0),
                 packs: packs.size,
                 // Let go of, the file not gone yet: removal pending, or failed and left to the next run.
                 going: going.size,
