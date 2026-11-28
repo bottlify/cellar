@@ -134,6 +134,28 @@ test('a value past 2^53 either way is refused, not stored for a reader to stall 
     assert.throws(()=>table.add(0, 0, 2), RangeError, 'an add past it too');
 });
 
+test('an add that would step past 2^53 by any amount is refused and stores nothing, a count too', ()=>{
+    // A double holds 2^53 + 1 as 2^53: a check made in doubles let it through.
+    const table = openTable(createTableMemory({ rows: 1, columns: ['wide', 'count'], counting: ['count'] }));
+    table.set(0, 0, 2 ** 53 - 1);
+    assert.throws(()=>table.add(0, 0, 2), RangeError, '2^53 - 1 and 2');
+    assert.equal(table.get(0, 0), 2 ** 53 - 1, 'left as it was');
+    table.add(0, 0, 1);
+    assert.equal(table.get(0, 0), 2 ** 53, 'up to 2^53 itself');
+    table.set(0, 0, -(2 ** 53) + 1);
+    assert.throws(()=>table.add(0, 0, -2), RangeError, 'and below');
+    assert.equal(table.get(0, 0), -(2 ** 53) + 1);
+    table.add(0, 1, 2 ** 53 - 1);
+    assert.throws(()=>table.add(0, 1, 2), RangeError, 'a count past it, carrying');
+    assert.equal(table.get(0, 1), 2 ** 53 - 1);
+    table.add(0, 1, 1);
+    assert.equal(table.get(0, 1), 2 ** 53);
+    assert.throws(()=>table.add(0, 1, 1), RangeError, 'a count at 2^53, not carrying');
+    assert.equal(table.get(0, 1), 2 ** 53);
+    table.add(0, 1, 0);
+    assert.equal(table.get(0, 1), 2 ** 53, 'nothing added is no step past it');
+});
+
 test('a reader on another thread sees a counter added to across the carry into its high word',
     { timeout: 60_000 }, async()=>{
     // Each add carries every other time: a read of the low word of one value

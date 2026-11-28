@@ -47,6 +47,9 @@ const WRITTEN = 1;
 const HEADER_BYTES = 8;
 /** The most a cell holds either way of zero: every integer up to it is exact. */
 const MOST = 2 ** 53;
+const MOST_BIG = BigInt(MOST);
+/** A counting cell's high word at 2^53: its low word 0 then. */
+const HIGH_MOST = MOST / 2 ** 32;
 /** A counting cell's high word while its writer is between its words: no count within 2^53 has it. */
 const BUSY = 0x40000000;
 /** How long a reader looks at a counting cell whose words never agree before it says so. */
@@ -164,7 +167,8 @@ export function openTable(memory){
      */
     const addCount = (low, column, amount)=>{
         const sum = words[low] + Math.round(amount);
-        if (sum >= words[low] && sum <= 0xffffffff)
+        // Below the top high part a sum that does not carry stays within 2^53.
+        if (sum >= words[low] && sum <= 0xffffffff && words[low + 1] < HIGH_MOST)
         {
             words[low] = sum;
             return;
@@ -173,8 +177,9 @@ export function openTable(memory){
         {
             throw new RangeError(`table: ${columns[column]} only grows, not by ${amount}`);
         }
+        // In words, not a double: 2^53 + 1 is 2^53 there.
         const high = words[low + 1] + Math.floor(sum / 2 ** 32);
-        if (high * 2 ** 32 > MOST)
+        if (high > HIGH_MOST || (high === HIGH_MOST && sum % 2 ** 32 !== 0))
         {
             throw new RangeError(`table: ${columns[column]} past 2^53`);
         }
@@ -190,10 +195,13 @@ export function openTable(memory){
             throw new RangeError(`table: ${amount} is not a number a cell holds`);
         }
         // One writer: what it added it may take back before anyone else stores.
-        const was = Number(Atomics.add(cells, cell, BigInt(by)));
-        if (Math.abs(was + by) > MOST)
+        // Summed as a BigInt: in a double 2^53 + 1 is 2^53, and passes.
+        const step = BigInt(by);
+        const was = Atomics.add(cells, cell, step);
+        const sum = was + step;
+        if (sum > MOST_BIG || sum < -MOST_BIG)
         {
-            Atomics.store(cells, cell, BigInt(was));
+            Atomics.store(cells, cell, was);
             throw new RangeError(`table: ${was} and ${amount} is not a number a cell holds`);
         }
     };
