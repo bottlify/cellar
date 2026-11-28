@@ -526,6 +526,8 @@ test('a disk that fails to flush fails the save, and close still lets go of ever
     assert.equal(keeper.save(), true);
     failing = true;
     step(1);
+    assert.equal(keeper.save(), true, 'nothing written since: no pack flushed');
+    reader.put('b', bodyOf(100, 2));
     assert.equal(keeper.save(), false);
     assert.equal(keeper.close(), false);
     await new Promise(resolve=>setTimeout(resolve, 0));
@@ -1700,7 +1702,10 @@ test('a close whose save fails brings back into memory the cold only copies no w
         }
         else if (fault === 'pack')
         {
-            disk.failing.flush.add('pack-0');
+            // A body the close's save writes there: a pack nothing was
+            // written to since its flush is not flushed again.
+            reader.put('late', bodyOf(KIB, 4));
+            disk.failing.flush.add('pack-0').add('pack-1');
         }
         assert.equal(keeper.close(), fault === 'none', fault);
         assert.deepEqual(reader.with('texels', body=>[...body]), [...bodyOf(2 * KIB, 3)], fault);
@@ -2001,6 +2006,29 @@ test('readSaved trusts no more than a keeper opening the index: an entry of 0.9.
         records: [['a', 0, 0, 10, 0], ['b', 0, -5, 10, 0], ['c', 0, 10, 0, 0]] }));
     assert.deepEqual([...(readSaved([json, null])?.bodies.keys() ?? [])], ['a']);
     assert.equal(readSaved([baseOf(1, 4, [2, 2], []), null]), null);
+});
+
+test('a sweep or a save flushes the packs written since their last flush, not every pack', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper, step } = await cacheOf({ disk, packBytes: 16 * KIB });
+    for (let i = 0; i < 4; i++)
+    {
+        reader.put(`n${i}`, bodyOf(12 * KIB, i));
+        step(150);
+        await settle();
+    }
+    assert.equal(keeper.figures().packs, 4);
+    const packFlushes = ()=>disk.flushes.filter(name=>name.startsWith('pack-')).length;
+    const before = packFlushes();
+    step(1);
+    step(1);
+    assert.ok(keeper.save());
+    assert.equal(packFlushes() - before, 0, 'nothing written: no pack flushed');
+    reader.put('n4', bodyOf(2 * KIB, 4));
+    step(150);
+    assert.equal(packFlushes() - before, 1, 'the one the cooled body went to');
+    step(1);
+    assert.equal(packFlushes() - before, 1);
 });
 
 test('a save flushes each pack once, not once a body; where that flush fails, no body it wrote counts'

@@ -68,7 +68,7 @@ Historical measurements reported in the 0.10.0 change (`e4ca6ca`): Node.js 22, f
 | Save without changes | 19-23 ms | 0.11 ms |
 | Sweep | 0.94-1.04 ms | 0.17-0.19 ms |
 
-Not taken, 2026-11-26: flushing only the packs written since their last flush. Every save and sweep flushes each open pack, written to or not; a pack nothing was written to costs nothing to flush. Headless Chromium 158.0.8127.36 on Linux, x86 VM, a dedicated worker, OPFS sync access handles of 64 KiB, 50 runs an arm: flushing 1, 8, 32 or 128 unchanged files took a median of 0 ms and at most 0.2 ms for all of them (the worker's timer counts in 0.1 ms steps), while flushing one file after a 4 KiB write took a median of 0.5-0.7 ms whether the unchanged files were flushed beside it or not. Worth measuring again where a target's OPFS flush of an unchanged file is not free: another engine, or macOS and Windows.
+Flushing only the packs written since their last flush (2026-11-28): a sweep or a save of four packs nothing was written to flushed 4 files each before, none after (`keeper.test.js`, a crash disk counting flushes: 12 flushes over two sweeps and a save before, 0 after). Measured before on Chromium 158, Linux x86 VM, a dedicated worker, OPFS sync access handles of 64 KiB, 50 runs an arm: flushing 1, 8, 32 or 128 unchanged files took a median of 0 ms and at most 0.2 ms, so on that target the change saves calls, not time measured; a target whose flush of an unchanged file is not free (another engine, macOS, Windows) is where it shows.
 
 ## Ring and channel
 

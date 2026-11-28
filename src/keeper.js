@@ -1385,11 +1385,16 @@ export async function openKeeper(options){
      * forgets its copy (written again when it goes cold or is saved), a cold
      * one goes (it can be made again: a cold only copy was flushed before it
      * left memory, and lies below), and one being raised is let go by the
-     * raise.
+     * raise. A pack written nothing since its last flush is not flushed
+     * again: a sweep or a save flushes what it changed, not every file.
      *
      * @param {number} number
      */
     const flushPack = number=>{
+        if (durable.get(number) === filled.get(number))
+        {
+            return true;
+        }
         try
         {
             /** @type {DiskFile} */ (packs.get(number)).flush();

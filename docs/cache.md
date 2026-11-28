@@ -99,7 +99,7 @@ Prefixes are literal string prefixes, not path or glob expressions. `figures()` 
 
 ## Persistence and recovery
 
-`save()` writes hot bodies lacking a disk copy, flushes packs and saves the index of persistent bodies. False can mean some bodies remained in memory; a failure is not an all-or-nothing transaction over the entire live cache.
+`save()` writes hot bodies lacking a disk copy, flushes the packs written since their last flush (as `sweep()` does) and saves the index of persistent bodies. False can mean some bodies remained in memory; a failure is not an all-or-nothing transaction over the entire live cache.
 
 The index is a binary base followed by checksummed deltas. A save appends changed names, writes nothing when nothing changed, and periodically writes a base to the other index file. A torn index write leaves the last complete save readable. Legacy JSON indices (0.9.0 and earlier) are supported.
 
