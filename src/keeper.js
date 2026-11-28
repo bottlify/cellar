@@ -1035,6 +1035,24 @@ export async function openKeeper(options){
     };
 
     /**
+     * Whether every record of `ids` can leave for the record `spare`'s room
+     * (`canLeave`): a loop, not a callback, so that `room` makes no context
+     * of its own at each reserve for a closure it seldom runs.
+     *
+     * @param {number[]} ids @param {number} spare
+     */
+    const allCanLeave = (ids, spare)=>{
+        for (let i = 0; i < ids.length; i++)
+        {
+            if (!canLeave(ids[i], spare))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    /**
      * Room for `length` bytes, the least recently used bodies made cold to
      * find it, but only where that forms a block for it: a body is taken out
      * only with every other in the block of the size asked it lies in, and
@@ -1108,7 +1126,7 @@ export async function openKeeper(options){
                     continue;
                 }
                 const inside = buddyOf(segment).ownersWithin(from, block);
-                if (!inside.every(other=>canLeave(other, spare)))
+                if (!allCanLeave(inside, spare))
                 {
                     (held ??= new Set()).add(key);
                     continue;
