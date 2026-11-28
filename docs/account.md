@@ -27,7 +27,7 @@ if (guest.take(64 << 20, 'guest'))
 | --- | --- |
 | `take(bytes, kind)` | Room for `bytes` more of `kind`: true, or false and nothing taken. A take past the limit asks `room` once for room for its `bytes`, then tries again; one past its kind's ceiling asks nothing. |
 | `overdraw(bytes, kind)` | What the holder cannot do without (the code a program runs) taken whatever the limit: counted (`overdrawn`), the account over its limit in its report, and told (`onOverdrawn`). Never held uncounted. |
-| `give(bytes, kind)` | Gives back at most what this view's holder holds of `kind`, never another holder's. |
+| `give(bytes, kind)` | Gives back at most what this view's holder holds of `kind`. While the holder is held that is its own; a view kept past its holder's `release` throws, and once the number is claimed again counts against the new holder (see `release`). |
 | `move(bytes, kind, to)` | What this holder holds handed to holder `to`, the sum unchanged. |
 | `claim()` / `release(holder)` | A holder no one holds, `RUN_HOLDER` (0) where all 127 are; every kind a holder holds given back at once (the bytes). A holder is released once nothing takes or gives for it any more - its process ended, its workers gone: its number is the next claim's at once. A view of it used after the release and before the number is claimed again throws (`holder N was released`); once claimed again, it counts against the new holder, which no check of separate words can tell apart. `move` to a holder no one holds, or a holder number past the account's, throws. |
 | `heldBy(kind)`, `fits(bytes, kind?)`, `bound(kind)` | What this holder holds; whether `bytes` more fit now (with `kind`, within its ceiling as well); the most a kind may hold, `Infinity` for no bound. |
