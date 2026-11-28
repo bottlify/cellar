@@ -96,6 +96,22 @@ Do not mix these measurements with earlier record-size microbenchmarks: the work
 
 What went: a `Map` entry per put (the `Map` shrinks its table on each delete), the reserved view, the buddy allocator's `Set` iterators and resized tables, the `{ segment, offset }` of each placement and a closure per reserve. What is left is the `Place` and the options a reserve sends, both part of the `KeeperCalls` contract. A put into names never written costs 2-3 µs, but most of that is the first touch of a new segment's pages and the segment's allocation, not Cellar's code. A hit allocates only its view.
 
+`node scripts/bench-cache.mjs 9 256,4096,65536` - the same, at three body sizes, with `reserve` (a reserve, a byte written, the commit and a `with` reading it back, over the same names) beside the puts; 1,024 names cycled at 256 B and 4 KiB, 512 at 64 KiB. Nine runs per process after a warm-up, three processes per arm, arms alternated: 1.0.0 (`414627e`) against the reservation as words. Node.js 22.23.5, four-core x86 VM (Xeon 2.1 GHz), other jobs running (load 4.9-6.9). Each cell lists the three processes' medians, ns per operation; bytes are a sampled allocation per operation in the steady state (V8's sampling heap profiler, `allocation.fixture.js`), collections those the nine runs of one process made.
+
+| Work | 1.0.0 | Flags a word, the place the reader's |
+| --- | ---: | ---: |
+| `put` over, 256 B | 826, 1,094, 827; 126 B; 28 collections | 827, 838, 689; 16 B; 4 |
+| `put` evicting, 256 B | 1,151, 1,215, 1,165; 134 B; 15 | 829, 917, 955; 15 B; 2 |
+| `reserve`, commit, read, 256 B | 1,191, 1,236, 1,395; 471 B; 71 | 1,244, 1,246, 1,312; 115 B; 26 |
+| `put` over, 4 KiB | 1,058, 999, 1,150; 131 B | 1,049, 1,161, 1,045; 15 B |
+| `put` evicting, 4 KiB | 1,337, 1,224, 1,138; 131 B | 1,472, 1,565, 1,582; 18 B |
+| `reserve`, commit, read, 4 KiB | 1,231, 1,235, 1,236; 474 B | 1,200, 1,232, 1,521; 114 B |
+| `put` over, 64 KiB | 5,512, 5,393, 5,785; 131 B | 6,275, 7,031, 6,558; 16 B |
+| `reserve`, commit, read, 64 KiB | 1,460, 1,681, 1,485; 473 B | 1,569, 2,131, 1,727; 112 B |
+| `with`, a hit, 256 B | 192, 209, 213; 1 B | 158, 165, 180; 2 B |
+
+What went: the options object a reserve was asked with (now the word `reserveFlags` makes once, the record's own flags, which the remote format carries as they are), the `Place` it answered (now written into the asker's own `Int32Array`), the context `room` made at every reserve for a callback it seldom ran, the map entry a reserve made and deleted (kept and changed in place), and the second view a read of a just-reserved body made. What is left: 16 bytes a reserve where the keeper's clock is `performance.now` (its double, boxed), which a clock of whole numbers does not make, and the view a `reserve` hands out (about 96 bytes). The time an operation takes moved inside the spread under this load: the allocation is what changed. A 64 KiB put is its copy's; that scenario alone again, three processes an arm alternated, gave 6.5, 6.8, 6.2 µs (1.0.0) and 6.4, 7.6, 8.0 µs, its rounds spread 10-60%: not explained, and not measured on a quiet machine.
+
 ## Remote keeper
 
 `node --expose-gc --max-semi-space-size=128 scripts/bench-remote.mjs 9 3000` - a reserve of 256 bytes, 3,000 a round, nine rounds after a warm-up, the keeper on the main thread serving on its event loop and the reader's calls from a worker. Node.js 22.23.5, four-core x86 VM (Xeon 2.1 GHz), other jobs running (load 3.7). Three processes; each cell lists their medians, µs a reserve. Bytes are the heap's growth over a round, a reserve, on each thread. The JSON arm is the protocol it replaced (each request `JSON.stringify`, the answer `JSON.parse`d, over the same channel), run beside it in the same minutes from a script outside the repository.
@@ -109,4 +125,4 @@ What went: a `Map` entry per put (the `Map` shrinks its table on each delete), t
 | JSON over a channel, blocking | 26.3, 27.1, 27.2 | 50 / 557-699 |
 | JSON over a channel, each call awaited | 52.0, 52.6, 53.8 | - / 565-764 |
 
-Under a load of 8-9 on the same machine the blocking medians spread to 6-17 µs, their best rounds staying near 2. What a reserve allocates on the keeper's thread is its `Place` and options (as on its own thread), the name read into a string and the event loop's own; the worker's is the `Place` the reader is handed. An awaited call costs two turns of the event loops. Heap growth is not a sampling profile: the JSON arm's 50 bytes on the worker is lower than its strings should make, and not explained.
+Under a load of 8-9 on the same machine the blocking medians spread to 6-17 µs, their best rounds staying near 2. What a reserve allocates on the keeper's thread is its `Place` and options (as on its own thread), the name read into a string and the event loop's own; the worker's is the `Place` the reader is handed. An awaited call costs two turns of the event loops. Heap growth is not a sampling profile: the JSON arm's 50 bytes on the worker is lower than its strings should make, and not explained. Measured before a reservation became words (`reserveFlags`, the asker's place); not measured again since.

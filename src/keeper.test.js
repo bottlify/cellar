@@ -10,10 +10,12 @@ import { createBuddy, grainsOf, UNIT } from './buddy.js';
 import { INDEX_FILES, openKeeper, readSaved } from './keeper.js';
 import { createReader } from './reader.js';
 import { crashDisk, memoryDisk } from './disk.fixture.js';
-import { bodyOf, cacheOf } from './cache.fixture.js';
+import { bodyOf, cacheOf, placeOf } from './cache.fixture.js';
 import { BASE, chunkWriter, readIndexFile } from './index-file.js';
-import { COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
-    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, hashName, viewIndex } from './shared.js';
+import {
+    COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
+    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, hashName, reserveFlags, viewIndex,
+} from './shared.js';
 
 const KIB = 1024;
 
@@ -86,7 +88,7 @@ test('past the budget the oldest body goes cold to the disk and comes back as it
 
 test('without a disk a body that can be made again goes away, the only copy stays', async()=>{
     const { reader, keeper } = await cacheOf();
-    assert.equal(reader.put('kept', bodyOf(32 * KIB, 9), { onlyCopy: true }), true);
+    assert.equal(reader.put('kept', bodyOf(32 * KIB, 9), F_ONLY_COPY), true);
     for (let i = 0; i < 12; i++)
     {
         reader.put(`n${i}`, bodyOf(32 * KIB, i));
@@ -131,7 +133,7 @@ test('a name written anew while written: the later write wins, the earlier one i
         first.set(bodyOf(100, 1));
         // A second writer of the same name, before the first commits.
         assert.equal(reader.put('b', bodyOf(10, 0)), true);
-        const second = keeper.reserve('a', 200);
+        const second = placeOf(keeper, 'a', 200);
         assert.ok(second);
         reader.commit('a');
         assert.equal(reader.with('a', ()=>1), undefined, 'the second is not written yet');
@@ -172,7 +174,7 @@ test('a table filled is made larger and sent; every name is found through it', a
 test('a run after a save finds every body cold on the disk and reads it back as it was', async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
-    first.reader.put('kept', bodyOf(9000, 4), { onlyCopy: true });
+    first.reader.put('kept', bodyOf(9000, 4), F_ONLY_COPY);
     for (let i = 0; i < 12; i++)
     {
         first.reader.put(`n${i}`, bodyOf(32 * KIB, i));
@@ -235,7 +237,7 @@ test('where memory cannot be shared the cache is one thread\'s, every part of it
                 [...bodyOf(32, n)], `body ${n} read back`);
         }
         // The only copy of a body cooled to the disk and raised again.
-        assert.equal(reader.put('only', bodyOf(5000, 9), { onlyCopy: true }), true);
+        assert.equal(reader.put('only', bodyOf(5000, 9), F_ONLY_COPY), true);
         step(150);
         assert.ok(keeper.figures().cooled > 0, 'cooled');
         assert.equal(reader.look('only'), 'cold');
@@ -289,10 +291,10 @@ test('a thread joining after the table grew is handed the larger table', async()
 test('a reserve refused leaves the name\'s body as it was, hot or on the disk', async()=>{
     const disk = memoryDisk();
     const { reader, keeper } = await cacheOf({ disk });
-    reader.put('doc', bodyOf(5000, 7), { onlyCopy: true });
+    reader.put('doc', bodyOf(5000, 7), F_ONLY_COPY);
     // Refused: no segment the writer has, and a body no block holds.
-    assert.equal(keeper.reserve('doc', 5000, { onlyCopy: true, known: 0 }), null);
-    assert.equal(reader.put('doc', new Uint8Array(0), { onlyCopy: true }), false);
+    assert.equal(placeOf(keeper, 'doc', 5000, F_ONLY_COPY, 0), null);
+    assert.equal(reader.put('doc', new Uint8Array(0), F_ONLY_COPY), false);
     assert.deepEqual(reader.with('doc', body=>[...body]), [...bodyOf(5000, 7)]);
     keeper.close();
     const next = await cacheOf({ disk });
@@ -303,11 +305,11 @@ test('a body rewritten into a full cache takes its own block, written over in pl
     const { reader } = await cacheOf({ budget: 64 * KIB, segmentBytes: 64 * KIB });
     for (let i = 0; i < 16; i++)
     {
-        assert.equal(reader.put(`n${i}`, bodyOf(UNIT, i), { onlyCopy: true }), true);
+        assert.equal(reader.put(`n${i}`, bodyOf(UNIT, i), F_ONLY_COPY), true);
     }
-    assert.equal(reader.put('n3', bodyOf(UNIT - 100, 40), { onlyCopy: true }), true);
+    assert.equal(reader.put('n3', bodyOf(UNIT - 100, 40), F_ONLY_COPY), true);
     assert.deepEqual(reader.with('n3', body=>[...body]), [...bodyOf(UNIT - 100, 40)]);
-    assert.equal(reader.put('n4', bodyOf(2 * UNIT, 41), { onlyCopy: true }), false, 'no block holds it');
+    assert.equal(reader.put('n4', bodyOf(2 * UNIT, 41), F_ONLY_COPY), false, 'no block holds it');
     assert.deepEqual(reader.with('n4', body=>[...body]), [...bodyOf(UNIT, 4)], 'kept');
 });
 
@@ -363,7 +365,7 @@ test('a cold body is raised only into a segment the asking thread has', async()=
     // A thread that knows the first segment only, which its bodies fill now.
     const late = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers().slice(0, 1),
         keeper: {
-            reserve: (name, length, options)=>keeper.reserve(name, length, options),
+            reserve: keeper.reserve,
             raise: (name, options)=>keeper.raise(name, options),
             raiseLater: ()=>{}, drop: ()=>{},
         } });
@@ -381,7 +383,7 @@ test('a body the disk holds less of than the index says is gone, or an only copy
         // The pack gone before the run: its entries are skipped as the index is read.
         const disk = memoryDisk();
         const first = await cacheOf({ disk });
-        first.reader.put('doc', bodyOf(8000, 5), { onlyCopy: true });
+        first.reader.put('doc', bodyOf(8000, 5), F_ONLY_COPY);
         first.keeper.close();
         disk.files.delete('pack-0');
         const second = await cacheOf({ disk });
@@ -402,7 +404,7 @@ test('a body the disk holds less of than the index says is gone, or an only copy
             },
         };
         const third = await cacheOf({ disk: cut });
-        third.reader.put('doc', bodyOf(8000, 6), { onlyCopy: true });
+        third.reader.put('doc', bodyOf(8000, 6), F_ONLY_COPY);
         third.reader.put('block', bodyOf(8000, 7));
         third.step(150);
         assert.deepEqual([third.reader.look('doc'), third.reader.look('block')], ['cold', 'cold']);
@@ -455,7 +457,7 @@ test('a name longer than a call takes as arguments is saved and found by the nex
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
     const long = 'n'.repeat(300_000);
-    first.reader.put(long, bodyOf(100, 1), { onlyCopy: true });
+    first.reader.put(long, bodyOf(100, 1), F_ONLY_COPY);
     first.keeper.close();
     const second = await cacheOf({ disk });
     assert.equal(second.reader.with(long, body=>body[1], { wait: true }), (31 + 1) & 255);
@@ -568,10 +570,10 @@ test('a disk that writes less than asked holds no body, and two failed saves kee
         },
     };
     const first = await cacheOf({ disk });
-    first.reader.put('kept', bodyOf(5000, 1), { onlyCopy: true });
+    first.reader.put('kept', bodyOf(5000, 1), F_ONLY_COPY);
     assert.equal(first.keeper.save(), true);
     short = true;
-    first.reader.put('cut', bodyOf(5000, 2), { onlyCopy: true });
+    first.reader.put('cut', bodyOf(5000, 2), F_ONLY_COPY);
     assert.equal(first.keeper.save(), false, 'the disk did not take it whole');
     first.step(150);
     assert.equal(first.reader.look('cut'), 'hot', 'an only copy stays in memory');
@@ -627,7 +629,7 @@ test('a disk that throws at once when a pack is opened is counted, and no body i
             },
         };
         const { reader, keeper, step } = await cacheOf({ disk });
-        reader.put('a', bodyOf(100, 1), { onlyCopy: true });
+        reader.put('a', bodyOf(100, 1), F_ONLY_COPY);
         step(150);
         assert.equal(reader.look('a'), 'hot', 'an only copy the disk did not take stays');
         assert.ok(keeper.figures().diskFailures > 0);
@@ -708,7 +710,7 @@ test('after close the keeper is memory\'s only: an only copy stays hot, a cold b
     first.reader.put('cold', bodyOf(100, 1));
     first.step(150);
     assert.equal(first.reader.look('cold'), 'cold');
-    first.reader.put('only', bodyOf(100, 2), { onlyCopy: true });
+    first.reader.put('only', bodyOf(100, 2), F_ONLY_COPY);
     first.keeper.close();
     first.step(150);
     first.step(150);
@@ -731,7 +733,7 @@ test('an index file the disk fails to read, or reads short, keeps the keeper fro
     first.keeper.save();
     await settle();
     // An only copy named by a delta of the newer file alone, in a pack the other does not list.
-    first.reader.put('only', bodyOf(12 * KIB, 2), { onlyCopy: true });
+    first.reader.put('only', bodyOf(12 * KIB, 2), F_ONLY_COPY);
     first.step(150);
     await settle();
     assert.equal(first.keeper.save(), true);
@@ -780,7 +782,7 @@ test('a budget that is not a number of bytes, and a body of a fraction of a byte
             await assert.rejects(openKeeper({ budget }), RangeError);
         }
         const { keeper, reader } = await cacheOf();
-        assert.throws(()=>keeper.reserve('a', 100.5), RangeError);
+        assert.throws(()=>placeOf(keeper, 'a', 100.5), RangeError);
         assert.equal(reader.put('a', bodyOf(100, 1)), true);
         assert.equal(keeper.figures().placedBytes, grainsOf(100));
     });
@@ -849,7 +851,7 @@ test('an announce that throws is counted and the keeper goes on', async()=>{
         throw new Error('no thread to tell');
     } });
     assert.ok(keeper.figures().announceFailures > 0);
-    assert.notEqual(keeper.reserve('a', 100), null);
+    assert.notEqual(placeOf(keeper, 'a', 100), null);
 });
 
 test('an index of Cellar 0.9.0 of more packs than a run opens, or of an unsafe generation, is not'
@@ -883,7 +885,7 @@ test('an index of Cellar 0.9.0 of more packs than a run opens, or of an unsafe g
 test('a body asked away while read and then cooled for room goes, not to the disk', async()=>{
     // Each in a segment of its own, beside the shared spare.
     const { reader, keeper, step } = await cacheOf({ disk: memoryDisk(), budget: 128 * KIB });
-    reader.put('a', bodyOf(32 * KIB, 1), { onlyCopy: true });
+    reader.put('a', bodyOf(32 * KIB, 1), F_ONLY_COPY);
     reader.with('a', ()=>{
         keeper.drop('a');
     });
@@ -900,7 +902,7 @@ test('a body asked away while read and then cooled for room goes, not to the dis
 test('a segment the engine will not make is counted, and room found by cooling as if the budget'
     + ' were spent: no body is left mid-move, no reservation half made', async()=>{
     const { reader, keeper } = await cacheOf({ disk: memoryDisk(), budget: 1024 * KIB });
-    reader.put('cold', bodyOf(16 * KIB, 1), { onlyCopy: true });
+    reader.put('cold', bodyOf(16 * KIB, 1), F_ONLY_COPY);
     reader.put('a', bodyOf(16 * KIB, 2));
     const Shared = globalThis.SharedArrayBuffer;
     globalThis.SharedArrayBuffer = /** @type {any} */ (class extends /** @type {any} */ (Shared) {
@@ -972,10 +974,10 @@ test('a reader that missed a segment\'s message is placed only below it: an only
     const { reader: full, keeper } = await cacheOf({ budget: 192 * KIB });
     // The first segment: the only copy and three that never leave; the
     // second and the third four bodies each.
-    full.put('a', bodyOf(16 * KIB, 1), { onlyCopy: true });
+    full.put('a', bodyOf(16 * KIB, 1), F_ONLY_COPY);
     for (let i = 0; i < 3; i++)
     {
-        full.put(`pin${i}`, bodyOf(16 * KIB, 5), { onlyCopy: true, disk: 'never' });
+        full.put(`pin${i}`, bodyOf(16 * KIB, 5), F_ONLY_COPY | F_NO_DISK);
     }
     for (let i = 0; i < 8; i++)
     {
@@ -989,13 +991,13 @@ test('a reader that missed a segment\'s message is placed only below it: an only
     // the free one (the own segments between are spares of no bytes).
     const [s0, free, s3] = keeper.segmentBuffers().filter(buffer=>buffer?.byteLength === 64 * KIB);
     const partial = createReader({ shared: keeper.shared, segments: [s0], keeper: {
-        reserve: (name, length, options)=>keeper.reserve(name, length, options),
+        reserve: keeper.reserve,
         raise: (name, options)=>keeper.raise(name, options),
         raiseLater: ()=>{}, drop: ()=>{},
     } });
     partial.adopt({ segment: keeper.segmentBuffers().indexOf(s3), buffer: s3 });
     assert.ok(keeper.segmentBuffers().indexOf(free) < keeper.segmentBuffers().indexOf(s3));
-    assert.equal(partial.put('a', bodyOf(16 * KIB, 4), { onlyCopy: true }), true);
+    assert.equal(partial.put('a', bodyOf(16 * KIB, 4), F_ONLY_COPY), true);
     assert.deepEqual(partial.with('a', body=>[...body]), [...bodyOf(16 * KIB, 4)]);
     assert.equal(partial.figures().refused, 0);
 });
@@ -1007,7 +1009,7 @@ test('a name\'s own body is not cooled to make room for its rewrite, though its 
         // The rest of the one segment the budget holds, never to leave.
         for (let i = 0; i < 3; i++)
         {
-            reader.put(`pin${i}`, bodyOf(16 * KIB, 2), { onlyCopy: true, disk: 'never' });
+            reader.put(`pin${i}`, bodyOf(16 * KIB, 2), F_ONLY_COPY | F_NO_DISK);
         }
         // Read when the rewrite looks at it, out before room is sought: a
         // reader in another thread leaving between the two.
@@ -1030,7 +1032,7 @@ test('a name\'s own body is not cooled to make room for its rewrite, though its 
         let place;
         try
         {
-            place = keeper.reserve('a', 16 * KIB, { known: 1 });
+            place = placeOf(keeper, 'a', 16 * KIB, 0, 1);
         }
         finally
         {
@@ -1084,7 +1086,7 @@ test('a body for this run goes cold to the disk and back, and the next run is no
     async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
-    first.reader.put('texels', bodyOf(32 * KIB, 7), { onlyCopy: true, disk: 'run' });
+    first.reader.put('texels', bodyOf(32 * KIB, 7), reserveFlags({ onlyCopy: true, disk: 'run' }));
     first.reader.put('block', bodyOf(32 * KIB, 8));
     first.step(100);
     assert.equal(first.reader.look('texels'), 'cold', 'an only copy left memory: the disk holds it');
@@ -1101,8 +1103,8 @@ test('a body never on the disk goes away when idle, or stays hot as the only cop
     + 'neither', async()=>{
     const disk = memoryDisk();
     const first = await cacheOf({ disk });
-    first.reader.put('again', bodyOf(32 * KIB, 1), { disk: 'never' });
-    first.reader.put('only', bodyOf(32 * KIB, 2), { onlyCopy: true, disk: 'never' });
+    first.reader.put('again', bodyOf(32 * KIB, 1), reserveFlags({ disk: 'never' }));
+    first.reader.put('only', bodyOf(32 * KIB, 2), F_ONLY_COPY | F_NO_DISK);
     first.step(100);
     assert.equal(first.reader.look('again'), null, 'made again: away, not to the disk');
     assert.equal(first.reader.look('only'), 'hot', 'the only copy: kept in memory');
@@ -1114,9 +1116,9 @@ test('a body never on the disk goes away when idle, or stays hot as the only cop
 
 test('a disk policy not one of the three is refused', async()=>{
     const { reader } = await cacheOf();
-    assert.throws(()=>reader.put('a', bodyOf(8, 1), { disk: /** @type {any} */ ('always') }),
+    assert.throws(()=>reader.put('a', bodyOf(8, 1), reserveFlags({ disk: /** @type {any} */ ('always') })),
         /disk policy/);
-    assert.throws(()=>reader.put('a', bodyOf(8, 1), { disk: /** @type {any} */ ('toString') }),
+    assert.throws(()=>reader.put('a', bodyOf(8, 1), reserveFlags({ disk: /** @type {any} */ ('toString') })),
         /disk policy/);
 });
 
@@ -1186,7 +1188,7 @@ test('a save of what changed leaves the index a base would: seeded runs of write
             {
                 const body = 1 + Math.floor(next() * 12 * KIB);
                 const policy = next() < 0.75 ? 'kept' : next() < 0.6 ? 'run' : 'never';
-                if (reader.put(name, bodyOf(body, step), { onlyCopy: next() < 0.3, disk: policy }))
+                if (reader.put(name, bodyOf(body, step), reserveFlags({ onlyCopy: next() < 0.3, disk: policy })))
                 {
                     content.set(name, step);
                 }
@@ -1283,7 +1285,7 @@ test('a save torn anywhere in its write, base or delta, leaves the index of the 
         if (roll < 0.5)
         {
             cache.reader.put(name, bodyOf(1 + Math.floor(next() * 8 * KIB), step),
-                { onlyCopy: next() < 0.3 });
+                reserveFlags({ onlyCopy: next() < 0.3 }));
         }
         else if (roll < 0.6)
         {
@@ -1381,7 +1383,7 @@ test('a keeper opening an index lets go of the packs no body of it is in: what t
     const first = await cacheOf({ disk, packBytes: 64 * KIB });
     for (let i = 0; i < 6; i++)
     {
-        first.reader.put(`texels${i}`, bodyOf(10 * KIB, i), { onlyCopy: true, disk: 'run' });
+        first.reader.put(`texels${i}`, bodyOf(10 * KIB, i), reserveFlags({ onlyCopy: true, disk: 'run' }));
     }
     first.step(100);
     await settle();
@@ -1481,7 +1483,7 @@ test('a pack an only copy moved out of stays while either index file names it th
         },
     };
     const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
-    reader.put('only', bodyOf(10 * KIB, 1), { onlyCopy: true });
+    reader.put('only', bodyOf(10 * KIB, 1), F_ONLY_COPY);
     for (let i = 0; i < 5; i++)
     {
         reader.put(`a${i}`, bodyOf(10 * KIB, 2 + i));
@@ -1555,8 +1557,8 @@ test('what a saved index names is read without a keeper as a keeper opening it r
     {
         reader.put(`n${i}`, bodyOf(20 * KIB, i));
     }
-    reader.put('only', bodyOf(5000, 9), { onlyCopy: true });
-    reader.put('run', bodyOf(5000, 10), { onlyCopy: true, disk: 'run' });
+    reader.put('only', bodyOf(5000, 9), F_ONLY_COPY);
+    reader.put('run', bodyOf(5000, 10), reserveFlags({ onlyCopy: true, disk: 'run' }));
     step(100);
     assert.equal(keeper.save(), true);
     /** @returns {(Uint8Array | null)[]} */
@@ -1604,15 +1606,15 @@ test('a save whose index the disk took but did not flush spends its generation: 
     + ' is the newer one', async()=>{
     const disk = crashDisk();
     const { reader, keeper } = await cacheOf({ disk });
-    reader.put('a', bodyOf(5000, 1), { onlyCopy: true });
+    reader.put('a', bodyOf(5000, 1), F_ONLY_COPY);
     assert.equal(keeper.save(), true);
     assert.equal(keeper.save(), true, 'a base into each file');
-    reader.put('b', bodyOf(5000, 2), { onlyCopy: true });
+    reader.put('b', bodyOf(5000, 2), F_ONLY_COPY);
     // A delta written whole, its flush refused: the bytes are on the disk all the same.
     disk.failing.flush.add('index-a').add('index-b');
     assert.equal(keeper.save(), false);
     disk.failing.flush.clear();
-    reader.put('c', bodyOf(5000, 3), { onlyCopy: true });
+    reader.put('c', bodyOf(5000, 3), F_ONLY_COPY);
     assert.equal(keeper.close(), true);
     assert.deepEqual(await nextRunReads(disk.current(), ['a', 'b', 'c']),
         [[...bodyOf(5000, 1)], [...bodyOf(5000, 2)], [...bodyOf(5000, 3)]]);
@@ -1622,7 +1624,7 @@ test('a pack compacted moves a hot body as it moves a cold one: an only copy rea
     + ' named where it went, though the disk refuses to write it after', async()=>{
     const disk = crashDisk();
     const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
-    reader.put('only', bodyOf(10 * KIB, 1), { onlyCopy: true });
+    reader.put('only', bodyOf(10 * KIB, 1), F_ONLY_COPY);
     for (let i = 0; i < 5; i++)
     {
         reader.put(`a${i}`, bodyOf(10 * KIB, 2 + i));
@@ -1660,8 +1662,8 @@ test('a close whose save fails brings back into memory the cold only copies no w
         await settle();
         keeper.save();
         keeper.save();
-        reader.put('only', bodyOf(12 * KIB, 2), { onlyCopy: true });
-        reader.put('texels', bodyOf(2 * KIB, 3), { onlyCopy: true, disk: 'run' });
+        reader.put('only', bodyOf(12 * KIB, 2), F_ONLY_COPY);
+        reader.put('texels', bodyOf(2 * KIB, 3), reserveFlags({ onlyCopy: true, disk: 'run' }));
         step(150);
         await settle();
         assert.deepEqual([reader.look('only'), reader.look('texels')], ['cold', 'cold'], fault);
@@ -1689,10 +1691,10 @@ test('a close whose save fails brings back into memory the cold only copies no w
     // Memory full of only copies that stay: the one brought back has no room.
     const disk = crashDisk();
     const { reader, keeper, step } = await cacheOf({ disk, budget: 128 * KIB });
-    reader.put('only', bodyOf(60 * KIB, 4), { onlyCopy: true });
+    reader.put('only', bodyOf(60 * KIB, 4), F_ONLY_COPY);
     step(150);
     // Its own segment beside the shared spare: the budget's room for one such.
-    assert.equal(reader.put('h1', bodyOf(60 * KIB, 5), { onlyCopy: true, disk: 'never' }), true);
+    assert.equal(reader.put('h1', bodyOf(60 * KIB, 5), F_ONLY_COPY | F_NO_DISK), true);
     disk.failing.write.add('index-a').add('index-b');
     assert.equal(keeper.close(), false);
     assert.equal(reader.look('only'), null);
@@ -1709,7 +1711,7 @@ test('a full disk makes room from the oldest pack it can empty: not one an only 
         const round = async(names, onlyCopy = false)=>{
             for (const name of names)
             {
-                reader.put(name, bodyOf(4000, name.charCodeAt(1)), { onlyCopy });
+                reader.put(name, bodyOf(4000, name.charCodeAt(1)), reserveFlags({ onlyCopy }));
             }
             step(100);
             keeper.save();
@@ -1755,7 +1757,7 @@ test('compaction passes over a pack it has emptied that an index still names an 
         const disk = memoryDisk();
         const { reader, keeper, step } = await cacheOf({ disk, packBytes: 32 * KIB, budget: 512 * KIB,
             goneAfterMs: 1e9 });
-        reader.put('only', bodyOf(30 * KIB, 1), { onlyCopy });
+        reader.put('only', bodyOf(30 * KIB, 1), reserveFlags({ onlyCopy }));
         step(150);
         await settle();
         for (let p = 0; p < 4; p++)
@@ -1938,7 +1940,7 @@ test('pack numbers are given from past the highest either index file names, not 
     + ' run before reached: a disk whose count reached what a run reads still takes bodies', async()=>{
     const full = crashDisk(new Map([['index-a', baseOf(5, 1 << 20, [], [])]]));
     const run = await cacheOf({ disk: full });
-    run.reader.put('only', bodyOf(4000, 1), { onlyCopy: true });
+    run.reader.put('only', bodyOf(4000, 1), F_ONLY_COPY);
     run.reader.put('block', bodyOf(4000, 2));
     run.step(150);
     await settle();
@@ -1980,7 +1982,7 @@ test('a save flushes each pack once, not once a body; where that flush fails, no
     const { reader, keeper, step } = await cacheOf({ disk, budget: 1024 * KIB });
     for (let i = 0; i < 200; i++)
     {
-        reader.put(`only${i}`, bodyOf(64, i), { onlyCopy: true });
+        reader.put(`only${i}`, bodyOf(64, i), F_ONLY_COPY);
     }
     const before = disk.flushes.length;
     assert.equal(keeper.save(), true);
@@ -1988,7 +1990,7 @@ test('a save flushes each pack once, not once a body; where that flush fails, no
     assert.deepEqual(flushed, ['pack-0'], 'one pack, one flush');
 
     // The pack's flush fails and loses what the save wrote: the copy there is not the body's.
-    reader.put('lost', bodyOf(3000, 7), { onlyCopy: true });
+    reader.put('lost', bodyOf(3000, 7), F_ONLY_COPY);
     disk.failing.losing.add('pack-0');
     assert.equal(keeper.save(), false);
     disk.failing.losing.clear();
@@ -2011,7 +2013,7 @@ test('a pack compacted that reads short keeps its only copy cold and counts the 
     } };
     const { reader, keeper, step } = await cacheOf({ disk, packBytes: 64 * KIB });
     reader.put('block', bodyOf(5 * KIB, 1));
-    reader.put('only', bodyOf(5 * KIB, 2), { onlyCopy: true });
+    reader.put('only', bodyOf(5 * KIB, 2), F_ONLY_COPY);
     for (let i = 0; i < 5; i++)
     {
         reader.put(`a${i}`, bodyOf(10 * KIB, 3 + i));
@@ -2099,7 +2101,7 @@ test('seeded runs crashed at random points, each change a flush had not reached 
                 const onlyCopy = next() < 0.35;
                 const policy = next() < 0.12 ? 'run' : 'kept';
                 const body = taggedBody(name, ++version, 16 + Math.floor(next() * 9 * KIB));
-                if (cache.reader.put(name, body, { onlyCopy, disk: policy }))
+                if (cache.reader.put(name, body, reserveFlags({ onlyCopy, disk: policy })))
                 {
                     has.set(name, { version, onlyCopy: onlyCopy && policy === 'kept' });
                 }
@@ -2229,7 +2231,7 @@ test('a body being raised whose copy a failed flush let go of while room was mad
     const { reader, keeper } = await cacheOf({ disk, budget: 128 * KIB });
     reader.put('block', bodyOf(40 * KIB, 1));
     // Room for the only copy cools the block: written, not flushed yet.
-    reader.put('only', bodyOf(40 * KIB, 2), { onlyCopy: true });
+    reader.put('only', bodyOf(40 * KIB, 2), F_ONLY_COPY);
     assert.equal(reader.look('block'), 'cold');
     // The block's raise cools the only copy for room, whose flush fails and loses the block's bytes.
     disk.failing.losing.add('pack-0');

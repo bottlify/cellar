@@ -64,7 +64,7 @@ The example omits application shutdown and error reporting. The Keeper must be a
 
 ## Writing and ownership
 
-`reserve(name, length, options)` gives a writable view, or null; `commit(name)` publishes it. `put` combines reserve, copy and commit. `abandon(name)` returns an uncommitted reservation.
+`reserve(name, length, flags)` gives a writable view, or null; `commit(name)` publishes it. `put(name, bytes, flags)` combines reserve, copy and commit. `abandon(name)` returns an uncommitted reservation. `flags` is one word made by `reserveFlags({ onlyCopy, disk, idle })` (0, the default, is none of them): a writer makes it once for a kind of body, not at each write, so a write makes no options object. A `put` makes no object of its own; a `reserve` makes its view, which a read of the body hands again while it lies where it was written.
 
 A refused Keeper reservation leaves the previous body as it was. A granted one replaces it; abandoning the replacement leaves no body. Room is made only where a block can be formed: an impossible request does not evict unrelated bodies for no result. When no body can leave (all reserved, read or only copies with nowhere to go), the walk that found that is not repeated within the same millisecond of the Keeper's clock: reservations refused meanwhile cost one look each, and a body that becomes free to leave is found from the next millisecond. A walk made while a reservation held its own name's body (which it never displaces for itself) is remembered only for that request: for another name's, that body may leave. Where bodies could leave but formed no block for a request, only the same request (block size, segments known, the name's own record) is refused that way within the millisecond; a smaller block is looked for afresh.
 
@@ -72,7 +72,7 @@ A reservation expires after `abandonAfterMs` (five minutes by default) and the n
 
 An idle hot body goes by the Keeper's `coldAfterMs`: to the disk, or away when it has nowhere to go. `idle: 'stay'` on `reserve` or `put` keeps such a body hot however long it is idle; it leaves only when its room is wanted, as the least recently used. That suits a body read again long after it was written (a translator's function, at a relink). The policy is the run's: a body read back from an earlier run's disk goes by the idle rule.
 
-KeeperCalls must carry the whole placement `{ id, segment, offset, mark }`. The mark identifies the particular reservation. The `known` option limits placement and promotion to segments the Reader has heard of.
+`KeeperCalls.reserve(name, length, flags, known, place)` answers true with the whole placement written into the caller's `place`, an `Int32Array` of `PLACE_WORDS` words (`P_ID`, `P_SEGMENT`, `P_OFFSET`, `P_MARK`), or false where room was refused: a Reader hands the same `place` to every reserve, so a reservation makes no object on either side. The mark identifies the particular reservation. `known` limits placement and promotion to segments the Reader has heard of (`Infinity` for every one).
 
 ## Disk policies
 

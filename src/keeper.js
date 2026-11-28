@@ -48,7 +48,7 @@ import {
     CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_LET_GO, H_NAMES, H_TICK, MAX_RECORDS,
     MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
-    checkName, growableShared, growTo, sharedBuffer,
+    P_ID, P_MARK, P_OFFSET, P_SEGMENT, checkFlags, checkName, growableShared, growTo, sharedBuffer,
     hashName, readersOf, stateOf, stateWord, viewIndex,
 } from './shared.js';
 
@@ -105,17 +105,7 @@ export function readSaved(files){
         [name, { pack: entry.pack, offset: entry.offset, length: entry.length }])) };
 }
 
-/**
- * Where a body may go on the disk: `kept` there and named in the saved index
- * for the next run (the default), there for this `run` only (a cold body that
- * means nothing to the next run: texels a GPU was given, say), or `never`
- * (one the disk must not hold, or not worth a write).
- *
- * @typedef {'kept' | 'run' | 'never'} DiskPolicy
- */
-/** A map with no prototype: `toString` is no policy. @type {Record<string, number>} */
-const POLICY_FLAGS = Object.assign(Object.create(null),
-    { kept: 0, run: F_THIS_RUN, never: F_NO_DISK });
+/** @typedef {import('./shared.js').DiskPolicy} DiskPolicy */
 
 /**
  * A pack whose bodies fill less than this share of its file is compacted:
@@ -2082,30 +2072,20 @@ export async function openKeeper(options){
 
         /**
          * Room for `name`'s body of `length` bytes, in a segment below
-         * `known`: the record, where to write and the reservation's mark, or
-         * null with why counted. The writer stores the record hot (`commit`)
-         * once it has written.
+         * `known`: true with the record, where to write and the reservation's
+         * mark in `place` (`P_ID`...), or false with why counted. The writer
+         * stores the record hot (`commit`) once it has written. `flags` is
+         * the word `reserveFlags` makes; with `F_HELD`, memory the writer
+         * keeps writing and reading in place, never committed and never taken
+         * back by `abandonAfterMs` (`Reader.hold`).
          *
-         * `hold`: memory the writer keeps writing and reading in place, never
-         * committed and never taken back by `abandonAfterMs` (`Reader.hold`).
-         *
-         * @param {string} name @param {number} length
-         * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, idle?: 'go' | 'stay',
-         *     known?: number, hold?: boolean }} [options]
-         * @returns {import('./reader.js').Place | null}
+         * @param {string} name @param {number} length @param {number} flags
+         * @param {number} known @param {Int32Array} place
+         * @returns {boolean}
          */
-        reserve(name, length, { onlyCopy = false, disk: policy = 'kept', idle = 'go',
-            known = Infinity, hold = false } = {}){
+        reserve(name, length, flags, known, place){
             checkName(name);
-            const policyFlags = POLICY_FLAGS[policy];
-            if (policyFlags === undefined)
-            {
-                throw new RangeError(`cache: a disk policy of ${String(policy)}`);
-            }
-            if (idle !== 'go' && idle !== 'stay')
-            {
-                throw new RangeError(`cache: an idle policy of ${String(idle)}`);
-            }
+            checkFlags(flags);
             if (!Number.isInteger(length))
             {
                 throw new RangeError(`cache: a body of ${length} bytes`);
@@ -2114,13 +2094,13 @@ export async function openKeeper(options){
             if (!fits(length))
             {
                 counts.refusedLarge++;
-                return null;
+                return false;
             }
             let id = recordOf(name);
             if (id < 0)
             {
                 counts.refusedRoom++;
-                return null;
+                return false;
             }
             const state = stateOf(stateWordOf(id));
             // Reservations let go of without a body keep their room until here.
@@ -2151,7 +2131,7 @@ export async function openKeeper(options){
                     store(id, HOT);
                 }
                 counts[beyond(known, length) ? 'refusedUnseen' : 'refusedRoom']++;
-                return null;
+                return false;
             }
             if (held)
             {
@@ -2169,13 +2149,12 @@ export async function openKeeper(options){
                 {
                     giveRoom(segmentOf(found), offsetOf(found), length);
                     counts.refusedRoom++;
-                    return null;
+                    return false;
                 }
                 id = fresh;
             }
             forgetDisk(id);
-            set(id, R_FLAGS, (onlyCopy ? F_ONLY_COPY : 0) | policyFlags
-                | (idle === 'stay' ? F_FOR_ROOM : 0) | (hold ? F_HELD : 0));
+            set(id, R_FLAGS, flags);
             store(id, MOVING);
             const segment = segmentOf(found);
             const offset = offsetOf(found);
@@ -2189,7 +2168,11 @@ export async function openKeeper(options){
             Atomics.store(words, index.at(id) + R_STATE, stateWord(WRITING, mark));
             counts.reserved++;
             keepSpare();
-            return { id, segment, offset, mark };
+            place[P_ID] = id;
+            place[P_SEGMENT] = segment;
+            place[P_OFFSET] = offset;
+            place[P_MARK] = mark;
+            return true;
         },
 
         /**

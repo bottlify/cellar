@@ -20,6 +20,7 @@ import { answerKeeper, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
 import { openKeeper } from './keeper.js';
 import { createReader } from './reader.js';
+import { F_ONLY_COPY, reserveFlags } from './shared.js';
 
 /** Waits of 50 ms a side gives the other at most: a minute. */
 const WAITS = 1200;
@@ -59,12 +60,12 @@ test('a thread waiting on a body the keeper is moving to the disk reads it once 
         // The first pack opens behind a promise.
         await new Promise(resolve=>setTimeout(resolve, 0));
         const reader = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers(), keeper: {
-            reserve: (name, length, options)=>keeper.reserve(name, length, options),
+            reserve: keeper.reserve,
             raise: (name, options)=>keeper.raise(name, options),
             raiseLater: ()=>{}, drop: ()=>{},
         } });
         const body = Uint8Array.from({ length: 30_000 }, (_, i)=>(i * 7 + 3) & 255);
-        assert.equal(reader.put('doc', body, { onlyCopy: true }), true);
+        assert.equal(reader.put('doc', body, F_ONLY_COPY), true);
         const channel = createChannel();
         const link = serveKeeperChannel(channel, answerKeeper({ keeper }));
         worker = new Worker(new URL('./moving.worker.fixture.js', import.meta.url), {

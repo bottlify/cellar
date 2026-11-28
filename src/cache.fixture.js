@@ -11,8 +11,24 @@
 
 import { openKeeper } from './keeper.js';
 import { createReader } from './reader.js';
+import { PLACE_WORDS, P_ID, P_MARK, P_OFFSET, P_SEGMENT } from './shared.js';
 
 const KIB = 1024;
+
+/**
+ * A reserve as a test reads it: the place granted as an object, or null where
+ * room was refused. `calls` is a keeper or a remote keeper's calls.
+ *
+ * @param {Pick<import('./reader.js').KeeperCalls, 'reserve'>} calls
+ * @param {string} name @param {number} length @param {number} [flags]
+ * @param {number} [known]
+ * @returns {{ id: number, segment: number, offset: number, mark: number } | null}
+ */
+export function placeOf(calls, name, length, flags = 0, known = Infinity){
+    const place = new Int32Array(PLACE_WORDS);
+    return calls.reserve(name, length, flags, known, place) ? { id: place[P_ID],
+        segment: place[P_SEGMENT], offset: place[P_OFFSET], mark: place[P_MARK] } : null;
+}
 
 /** @param {Partial<import('./keeper.js').KeeperOptions>} [options] */
 export async function cacheOf(options = {}){
@@ -33,7 +49,7 @@ export async function cacheOf(options = {}){
     reader = createReader({
         shared: keeper.shared, segments: keeper.segmentBuffers(),
         keeper: {
-            reserve: (name, length, opts)=>keeper.reserve(name, length, opts),
+            reserve: keeper.reserve,
             raise: name=>keeper.raise(name),
             raiseLater: name=>{
                 keeper.raise(name);

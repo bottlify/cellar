@@ -98,6 +98,73 @@ export const F_FOR_ROOM = 32;
  */
 export const F_HELD = 64;
 
+/**
+ * What a reservation may ask for, as a word (`reserveFlags`): its record's own
+ * flags, the keeper storing the word as it is asked. `F_HELD` is `hold`'s.
+ */
+const ASKED = F_ONLY_COPY | F_THIS_RUN | F_NO_DISK | F_FOR_ROOM | F_HELD;
+
+/**
+ * Whether `flags` is a reservation's word: no bit a reservation does not ask
+ * for, and no body both on the disk for this run only and never on it.
+ *
+ * @param {number} flags
+ */
+export const isFlags = flags=>flags === (flags | 0) && (flags & ~ASKED) === 0
+    && (flags & (F_THIS_RUN | F_NO_DISK)) !== (F_THIS_RUN | F_NO_DISK);
+
+/** Throws where `flags` is no reservation's word (`isFlags`). @param {number} flags */
+export const checkFlags = flags=>{
+    if (!isFlags(flags))
+    {
+        throw new RangeError(`cache: reservation flags ${String(flags)}`);
+    }
+};
+
+/**
+ * Where a body may go on the disk: `kept` there and named in the saved index
+ * for the next run (the default), there for this `run` only (a cold body that
+ * means nothing to the next run: texels a GPU was given, say), or `never`
+ * (one the disk must not hold, or not worth a write).
+ *
+ * @typedef {'kept' | 'run' | 'never'} DiskPolicy
+ */
+
+/**
+ * The word a `reserve` or a `put` asks with, made once by whoever writes a
+ * kind of body, not at each write: `onlyCopy`, bodies that cannot be made
+ * again, which go to the disk and never away; `disk`, where a body may go on
+ * the disk (`DiskPolicy`); `idle`, whether an idle body goes by the keeper's
+ * idle rule (`'go'`) or stays until its room is wanted (`'stay'`). No options
+ * are 0.
+ *
+ * @param {{ onlyCopy?: boolean, disk?: DiskPolicy, idle?: 'go' | 'stay' }} [options]
+ */
+export function reserveFlags({ onlyCopy = false, disk = 'kept', idle = 'go' } = {}){
+    if (disk !== 'kept' && disk !== 'run' && disk !== 'never')
+    {
+        throw new RangeError(`cache: a disk policy of ${String(disk)}`);
+    }
+    if (idle !== 'go' && idle !== 'stay')
+    {
+        throw new RangeError(`cache: an idle policy of ${String(idle)}`);
+    }
+    return (onlyCopy ? F_ONLY_COPY : 0) | (disk === 'run' ? F_THIS_RUN : disk === 'never' ? F_NO_DISK : 0)
+        | (idle === 'stay' ? F_FOR_ROOM : 0);
+}
+
+/**
+ * Room the keeper granted, as the words of a record its asker owns and hands
+ * to every reserve (`KeeperCalls.reserve`), so that a reserve makes no object:
+ * the body's record, the segment and offset to write it at, and the
+ * reservation's mark, which `commit` names.
+ */
+export const P_ID = 0;
+export const P_SEGMENT = 1;
+export const P_OFFSET = 2;
+export const P_MARK = 3;
+export const PLACE_WORDS = 4;
+
 /** No body: never had one, or dropped; or a record no name leads to any more. */
 export const GONE = 0;
 /**

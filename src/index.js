@@ -20,6 +20,7 @@ export { ACCOUNT_UNIT, RUN_HOLDER, createAccountMemory, openAccount, openCharge 
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
 export { grainsOf } from './buddy.js';
 export { createReader } from './reader.js';
+export { PLACE_WORDS, P_ID, P_MARK, P_OFFSET, P_SEGMENT, reserveFlags } from './shared.js';
 export { ChannelClosed, ChannelFailed, createChannel, openClient, openServer } from './channel.js';
 export { SPIN_MS, createDoorbell, createSpin, deadlineOf, mayWait, openDoorbell, publish, ring, wake,
     waitFor, waitForAsync } from './bell.js';
@@ -40,7 +41,7 @@ export { createTableMemory, openTable } from './table.js';
 /** @typedef {import('./keeper.js').DiskFile} DiskFile */
 /** @typedef {import('./reader.js').Reader} Reader */
 /** @typedef {import('./reader.js').KeeperCalls} KeeperCalls */
-/** @typedef {import('./reader.js').Place} Place */
+/** @typedef {import('./shared.js').DiskPolicy} DiskPolicy */
 /** @typedef {import('./shared.js').SharedIndex} SharedIndex */
 /** @typedef {import('./channel.js').ChannelOptions} ChannelOptions */
 /** @typedef {import('./channel.js').Handler} ChannelHandler */

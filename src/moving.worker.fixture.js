@@ -22,7 +22,7 @@ let asked = false;
 const reader = createReader({
     shared, segments,
     keeper: {
-        reserve: ()=>null,
+        reserve: ()=>false,
         raise: (name, options)=>{
             asked = Atomics.load(phase, 0) === 1;
             Atomics.store(phase, 0, 2);

@@ -12,7 +12,7 @@ serveKeeperChannel(channel, answer);                 // or: openLink(end, mine, 
 // the Reader's thread
 const client = openKeeperClient(openClient(channel)); // or: openKeeperClient(linkCarrier(link))
 const reader = createReader({ shared, segments, keeper: client.keeper });
-const place = await client.reserveLater('texels/1/a', 4096, { onlyCopy: true, disk: 'run' });
+const place = await client.reserveLater('texels/1/a', 4096, reserveFlags({ onlyCopy: true, disk: 'run' }));
 ```
 
 | API | Behaviour |
@@ -43,7 +43,7 @@ Little-endian 32-bit words. A request is five words, then the name in UTF-8, exa
 | release | 5 | bodies held | | | the owner's prefix |
 | room | 6 | units of 4 KiB wanted ([account](account.md)) | | | none |
 
-Reservation flags: 1 only copy, 2 hold, 4 idle `stay`, bits 3-4 the disk policy (0 `kept`, 1 `run`, 2 `never`).
+Reservation flags: the word `reserveFlags` makes, the record's own flags as the Keeper stores them: 1 only copy, 8 on the disk for this run only (`disk: 'run'`), 16 never on the disk (`'never'`), 32 idle `stay`, 64 memory held (`hold`). Any other bit, or 8 and 16 together, is malformed.
 
 An answer is five words, the first its status:
 
@@ -57,7 +57,7 @@ An answer is five words, the first its status:
 
 An unknown op or a malformed request is refused and nothing is done for it; the client throws the failure where it asked. A call not waited on (`raiseLater`, `drop`) that fails goes to `onFailure`, by default thrown where nothing catches it; one that fails because the carrier closed is not a failure, since nothing is left to answer.
 
-A name of ASCII is written and read without an object of its own; a fixed answer is read where it lies. A reserve makes its `Place`, which `KeeperCalls` hands back. A request and its answer lie on a four-byte boundary, as both carriers' slots do. Calls keep the order they were made in over both carriers: a channel full of requests copies a call and sends it when a slot frees, before anything asked after it. A name longer than the carrier holds (a channel's `slotBytes`, or a link's `words` times four, less the five words) is refused by the carrier when it is sent.
+A name of ASCII is written and read without an object of its own; a fixed answer is read where it lies. A blocking reserve writes its answer into the asker's `place` and makes no object; `reserveLater` answers a place of its own (`Int32Array` of `PLACE_WORDS`), as a promise does. A request and its answer lie on a four-byte boundary, as both carriers' slots do. Calls keep the order they were made in over both carriers: a channel full of requests copies a call and sends it when a slot frees, before anything asked after it. A name longer than the carrier holds (a channel's `slotBytes`, or a link's `words` times four, less the five words) is refused by the carrier when it is sent.
 
 ## Closing
 

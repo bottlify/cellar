@@ -23,26 +23,22 @@
  */
 
 import {
-    COLD, GONE, HOT, H_LET_GO, MOVING, RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT,
-    R_STATE, WRITING, checkName, stateWord, viewIndex,
+    COLD, F_HELD, F_NO_DISK, GONE, HOT, H_LET_GO, MOVING, PLACE_WORDS, P_ID, P_MARK, P_OFFSET, P_SEGMENT,
+    RETIRED, RETIRED_WRITING, R_LENGTH, R_OFFSET, R_SEGMENT, R_STATE, WRITING, checkName, stateWord,
+    viewIndex,
 } from './shared.js';
 import { bytesOf } from './bytes.js';
 
 /**
- * Room the keeper granted: the record, where to write, and the reservation's
- * mark, which `commit` names.
- *
- * @typedef {{ id: number, segment: number, offset: number, mark: number }} Place
- */
-
-/**
  * What the reader asks the keeper: `reserve` and `raise` answer at once,
  * across a link by a blocking call; `raiseLater` and `drop` are not waited on.
+ * A reserve asks with its flags (`reserveFlags`) and the segments this reader
+ * has, and is answered in the words of the reader's own place (`P_ID`...):
+ * true where room was granted.
  *
  * @typedef {Object} KeeperCalls
- * @property {(name: string, length: number, options: { onlyCopy: boolean,
- *     disk?: import('./keeper.js').DiskPolicy, idle?: 'go' | 'stay', known: number, hold?: boolean })
- *     => Place | null} reserve
+ * @property {(name: string, length: number, flags: number, known: number, place: Int32Array)
+ *     => boolean} reserve
  * @property {(name: string, options: { known: number }) => boolean} raise
  *     `known`: the segments this reader has; a body placed past them could not be read here
  * @property {(name: string) => void} raiseLater
@@ -72,6 +68,9 @@ const KNOWN_MOST = 1 << 16;
  * @typedef {{ id: number, nameAt: number }} Found
  */
 
+/** Entries of ended reservations a reader keeps by name, at most (`writing`). */
+const ENDED_MOST = 1 << 12;
+
 /** How a reservation ended (`finish`). */
 const LATE = 0;
 const ENDED = 1;
@@ -93,8 +92,31 @@ export function createReader({ shared, segments = [], keeper }){
      * leaves a gap, and nothing past the gap is counted.
      */
     let heard = views.length;
-    /** Reserved and not committed yet, by name. @type {Map<string, Place>} */
-    const writing = new Map();
+    /**
+     * The places of reservations made here and not committed yet, `PLACE_WORDS`
+     * a slot: a slot taken for each, its index by name (`writing`), and given
+     * back to `freeSlots` when the reservation ends. The first slot is where
+     * the keeper answers (`GRANTED`), copied into a slot of its own only for a
+     * reservation that outlives the call (`reserve`, `hold`): a `put` holds
+     * none.
+     */
+    let places = new Int32Array(PLACE_WORDS * 8);
+    /** Slots given back, for the next reservation. @type {number[]} */
+    const freeSlots = [];
+    /** Slots ever used, the first included. */
+    let slotsUsed = 1;
+    /**
+     * Reserved and not committed yet: each name's slot, -1 for a name whose
+     * reservation ended. An entry is kept when its reservation ends, so that
+     * the next reserve of the name changes it in place: a map that empties
+     * makes its table again at each delete. Past `ENDED_MOST` ended entries
+     * (its size less the slots in use) the map is made again of those still
+     * reserved.
+     *
+     * @type {Map<string, number>}
+     */
+    let writing = new Map();
+    const GRANTED = 0;
     const counts = {
         hits: 0, misses: 0, cold: 0, moving: 0, unseen: 0, raisedWaiting: 0, reserved: 0,
         refused: 0, abandoned: 0, late: 0,
@@ -147,6 +169,23 @@ export function createReader({ shared, segments = [], keeper }){
     const bodyViews = [];
 
     /**
+     * The view of record `id`'s room, `length` bytes at `offset` of `view`:
+     * the one made last for the record while it is over the same bytes.
+     *
+     * @param {number} id @param {Uint8Array} view @param {number} offset @param {number} length
+     */
+    const viewOf = (id, view, offset, length)=>{
+        let body = bodyViews[id];
+        if (body === undefined || body.buffer !== view.buffer
+            || body.byteOffset !== view.byteOffset + offset || body.length !== length)
+        {
+            body = view.subarray(offset, offset + length);
+            bodyViews[id] = body;
+        }
+        return body;
+    };
+
+    /**
      * Reads the body of the name `found`, `length` units long, inside `read`,
      * where it is hot here: DONE with the value in `readValue`, or why not. A
      * hit makes no object of its own.
@@ -180,16 +219,7 @@ export function createReader({ shared, segments = [], keeper }){
             {
                 return UNSEEN;
             }
-            const offset = words[base + R_OFFSET];
-            const bodyLength = words[base + R_LENGTH];
-            let body = bodyViews[id];
-            if (body === undefined || body.buffer !== view.buffer
-                || body.byteOffset !== view.byteOffset + offset || body.length !== bodyLength)
-            {
-                body = view.subarray(offset, offset + bodyLength);
-                bodyViews[id] = body;
-            }
-            readValue = read(body);
+            readValue = read(viewOf(id, view, words[base + R_OFFSET], words[base + R_LENGTH]));
             index.stamp(id);
             return DONE;
         }
@@ -216,35 +246,38 @@ export function createReader({ shared, segments = [], keeper }){
     };
 
     /**
-     * Whether `place` is still a reservation its writer may write into: the
-     * keeper takes back one held past `abandonAfterMs`, and its room may be
-     * another body's by now (a place granted ahead and handed over late).
+     * Whether the place in `slot` is still a reservation its writer may write
+     * into: the keeper takes back one held past `abandonAfterMs`, and its room
+     * may be another body's by now (a place granted ahead and handed over late).
      *
-     * @param {Place} place
+     * @param {number} slot
      */
-    const stillReserved = place=>{
-        const word = Atomics.load(index.cover(place.id), index.at(place.id) + R_STATE);
-        return word === stateWord(WRITING, place.mark) || word === stateWord(RETIRED_WRITING, place.mark);
+    const stillReserved = slot=>{
+        const id = places[slot + P_ID];
+        const mark = places[slot + P_MARK];
+        const word = Atomics.load(index.cover(id), index.at(id) + R_STATE);
+        return word === stateWord(WRITING, mark) || word === stateWord(RETIRED_WRITING, mark);
     };
 
     /**
-     * Ends the reservation `place` with its state word `word` (a body
+     * Ends the reservation in `slot` with its state word `word` (a body
      * published, entered once; or gone, for an abandon): `ENDED`, or `LEFT`
      * where the name was written anew meanwhile and the newer write is the
      * name's, the record retired and only its writer let out of it; `LATE`
      * where the keeper took it back, its writer too late.
      *
-     * @param {Place} place @param {number} word
+     * @param {number} slot @param {number} word
      */
-    const finish = (place, word)=>{
-        const words = index.cover(place.id);
-        const at = index.at(place.id) + R_STATE;
-        const mine = stateWord(WRITING, place.mark);
+    const finish = (slot, word)=>{
+        const id = places[slot + P_ID];
+        const words = index.cover(id);
+        const at = index.at(id) + R_STATE;
+        const mine = stateWord(WRITING, places[slot + P_MARK]);
         if (Atomics.compareExchange(words, at, mine, word) === mine)
         {
             return ENDED;
         }
-        const retired = stateWord(RETIRED_WRITING, place.mark);
+        const retired = stateWord(RETIRED_WRITING, places[slot + P_MARK]);
         if (Atomics.compareExchange(words, at, retired, stateWord(RETIRED)) === retired)
         {
             return LEFT;
@@ -259,89 +292,117 @@ export function createReader({ shared, segments = [], keeper }){
      * which moves after the record is gone, so a keeper that sees it moved
      * finds the record gone.
      *
-     * @param {Place} place
+     * @param {number} slot
      */
-    const letGo = place=>{
+    const letGo = slot=>{
         counts.abandoned++;
-        if (finish(place, stateWord(GONE)) === ENDED)
+        if (finish(slot, stateWord(GONE)) === ENDED)
         {
             Atomics.add(index.words, H_LET_GO, 1);
         }
     };
 
     /**
-     * What `reserve` and `put` ask the keeper with: their options, the
-     * defaults filled in, and the segments this reader has heard of. No
-     * object is made for options not given.
-     *
-     * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
-     *     idle?: 'go' | 'stay', hold?: boolean } | undefined} options
-     */
-    const askOf = options=>{
-        if (options === undefined)
-        {
-            return { onlyCopy: false, disk: /** @type {const} */ ('kept'), idle: /** @type {const} */ ('go'),
-                known: heard };
-        }
-        const { onlyCopy = false, disk = 'kept', idle = 'go', hold = false } = options;
-        return hold ? { onlyCopy, disk, idle, known: heard, hold }
-            : { onlyCopy, disk, idle, known: heard };
-    };
-
-    /**
-     * The body written at `place` made readable: false where it came too
-     * late, the reservation taken back. Published entered, as a reader
+     * The body written at the place in `slot` made readable: false where it
+     * came too late, the reservation taken back. Published entered, as a reader
      * enters it, and stamped before it is left: a record no one is in can be
      * taken back and given to the next reservation, whose age a stamp landing
      * late would set to the last sweep's. A record retired meanwhile no name
      * leads to: nothing stamps it.
      *
-     * @param {Place} place @returns {boolean}
+     * @param {number} slot @returns {boolean}
      */
-    const publish = place=>{
-        const ended = finish(place, stateWord(HOT, 1));
+    const publish = slot=>{
+        const ended = finish(slot, stateWord(HOT, 1));
         if (ended === ENDED)
         {
-            index.stamp(place.id);
-            index.leave(place.id);
+            index.stamp(places[slot + P_ID]);
+            index.leave(places[slot + P_ID]);
         }
         return ended !== LATE;
     };
 
     /**
      * Room for `name`'s body from the keeper, an earlier reservation of the
-     * name here let go of first: the place, in a segment this reader can
-     * write, or null with why counted.
+     * name here let go of first: true with the place in `GRANTED`, in a
+     * segment this reader can write, or false with why counted.
      *
-     * @param {string} name @param {number} length
-     * @param {Parameters<typeof askOf>[0]} options
-     * @returns {Place | null}
+     * @param {string} name @param {number} length @param {number} flags
+     * @returns {boolean}
      */
-    const reserveRoom = (name, length, options)=>{
+    const reserveRoom = (name, length, flags)=>{
         // A second reserve of a name not committed yet replaces the first.
         self.abandon(name);
-        const place = keeper.reserve(name, length, askOf(options));
-        if (place === null)
+        if (!keeper.reserve(name, length, flags, heard, places))
         {
             counts.refused++;
-            return null;
+            return false;
         }
-        const view = views[place.segment];
+        const view = views[places[GRANTED + P_SEGMENT]];
         if (view === null || view === undefined)
         {
             // Placed where this reader cannot write: given back.
-            letGo(place);
+            letGo(GRANTED);
             counts.refused++;
-            return null;
+            return false;
         }
-        if (!stillReserved(place))
+        if (!stillReserved(GRANTED))
         {
             // Taken back before a byte was written: nothing to give back.
             counts.late++;
-            return null;
+            return false;
         }
         counts.reserved++;
-        return place;
+        return true;
+    };
+
+    /**
+     * The place just granted kept in a slot of its own under `name`, until
+     * its reservation ends (`endOf`): a view of it to write into, made once
+     * for its record's room and handed again to a read of it (`bodyViews`).
+     *
+     * @param {string} name @param {number} length @returns {Uint8Array}
+     */
+    const keep = (name, length)=>{
+        let slot = freeSlots.pop();
+        if (slot === undefined)
+        {
+            slot = slotsUsed++ * PLACE_WORDS;
+            if (slot + PLACE_WORDS > places.length)
+            {
+                const more = new Int32Array(places.length * 2);
+                more.set(places);
+                places = more;
+            }
+        }
+        places[slot + P_ID] = places[GRANTED + P_ID];
+        places[slot + P_SEGMENT] = places[GRANTED + P_SEGMENT];
+        places[slot + P_OFFSET] = places[GRANTED + P_OFFSET];
+        places[slot + P_MARK] = places[GRANTED + P_MARK];
+        writing.set(name, slot);
+        return viewOf(places[slot + P_ID], /** @type {Uint8Array} */ (views[places[slot + P_SEGMENT]]),
+            places[slot + P_OFFSET], length);
+    };
+
+    /**
+     * The slot of `name`'s reservation, taken off it and free for the next:
+     * -1 where `name` is not reserved here. Valid until the next reservation.
+     *
+     * @param {string} name
+     */
+    const endOf = name=>{
+        const slot = writing.get(name);
+        if (slot === undefined || slot < 0)
+        {
+            return -1;
+        }
+        writing.set(name, -1);
+        freeSlots.push(slot);
+        if (writing.size - (slotsUsed - 1 - freeSlots.length) > ENDED_MOST)
+        {
+            writing = new Map([...writing].filter(([, kept])=>kept >= 0));
+        }
+        return slot;
     };
 
     const self = {
@@ -481,24 +542,17 @@ export function createReader({ shared, segments = [], keeper }){
         /**
          * Room for `name`'s body: a view to write it into, or null where the
          * keeper has none. The body is not seen by anyone until `commit`.
+         * `flags`: what the body asks for (`reserveFlags`), none by default.
          *
-         * `disk` says where the body may go on the disk (`DiskPolicy`); `idle`
-         * whether an idle body goes by the keeper's idle rule (`'go'`) or stays
-         * until its room is wanted (`'stay'`).
-         *
-         * @param {string} name @param {number} length
-         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
-         *     idle?: 'go' | 'stay' }} [options]
+         * @param {string} name @param {number} length @param {number} [flags]
          */
-        reserve(name, length, options){
+        reserve(name, length, flags = 0){
             checkName(name);
-            const place = reserveRoom(name, length, options);
-            if (place === null)
+            if ((flags & F_HELD) !== 0)
             {
-                return null;
+                throw new RangeError('cache: a body is reserved, memory held (`hold`)');
             }
-            writing.set(name, place);
-            return /** @type {Uint8Array} */ (views[place.segment]).subarray(place.offset, place.offset + length);
+            return reserveRoom(name, length, flags) ? keep(name, length) : null;
         },
 
         /**
@@ -516,13 +570,7 @@ export function createReader({ shared, segments = [], keeper }){
          */
         hold(name, length){
             checkName(name);
-            const place = reserveRoom(name, length, { disk: 'never', hold: true });
-            if (place === null)
-            {
-                return null;
-            }
-            writing.set(name, place);
-            return /** @type {Uint8Array} */ (views[place.segment]).subarray(place.offset, place.offset + length);
+            return reserveRoom(name, length, F_NO_DISK | F_HELD) ? keep(name, length) : null;
         },
 
         /**
@@ -533,13 +581,12 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name @returns {boolean}
          */
         commit(name){
-            const place = writing.get(name);
-            if (place === undefined)
+            const slot = endOf(name);
+            if (slot < 0)
             {
                 throw new Error(`cache: ${name} was not reserved here`);
             }
-            writing.delete(name);
-            return publish(place);
+            return publish(slot);
         },
 
         /**
@@ -551,43 +598,43 @@ export function createReader({ shared, segments = [], keeper }){
          * @param {string} name
          */
         abandon(name){
-            const place = writing.get(name);
-            if (place === undefined)
+            const slot = endOf(name);
+            if (slot >= 0)
             {
-                return;
+                letGo(slot);
             }
-            writing.delete(name);
-            letGo(place);
         },
 
         /**
          * `reserve`, a copy of `bytes`, `commit`: false where there was no
          * room, or the commit came too late.
          *
-         * @param {string} name @param {Uint8Array} bytes
-         * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy,
-         *     idle?: 'go' | 'stay' }} [options]
+         * @param {string} name @param {Uint8Array} bytes @param {number} [flags]  as `reserve`'s
          */
-        put(name, bytes, options){
+        put(name, bytes, flags = 0){
             checkName(name);
+            if ((flags & F_HELD) !== 0)
+            {
+                throw new RangeError('cache: a body is put, memory held (`hold`)');
+            }
             // The bytes as long as they are now, which is what is copied.
             const taken = bytesOf(bytes, 'cache');
-            // `reserve` and `commit` without their view or their entry in
-            // `writing`: a put holds its reservation only for the copy.
-            const place = reserveRoom(name, taken.length, options);
-            if (place === null)
+            // `reserve` and `commit` without a slot or a view: a put holds
+            // its reservation only for the copy.
+            if (!reserveRoom(name, taken.length, flags))
             {
                 return false;
             }
             try
             {
-                /** @type {Uint8Array} */ (views[place.segment]).set(taken, place.offset);
+                /** @type {Uint8Array} */ (views[places[GRANTED + P_SEGMENT]]).set(taken,
+                    places[GRANTED + P_OFFSET]);
             }
             catch (e){
-                letGo(place);
+                letGo(GRANTED);
                 throw e;
             }
-            return publish(place);
+            return publish(GRANTED);
         },
 
         /** @param {string} name */

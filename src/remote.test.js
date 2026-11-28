@@ -13,16 +13,15 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cacheOf } from './cache.fixture.js';
+import { cacheOf, placeOf } from './cache.fixture.js';
 import { createChannel, openClient } from './channel.js';
 import { createLinkMemory, openLink } from './link.js';
 import { createReader } from './reader.js';
 import { answerKeeper, keeperWords, linkCarrier, openKeeperClient, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
+import { F_FOR_ROOM, F_HELD, F_NO_DISK, F_ONLY_COPY, F_THIS_RUN, P_SEGMENT, reserveFlags } from './shared.js';
 
 /** A reservation of no options, in any segment. */
-const ANY = { onlyCopy: false, known: Infinity };
-
 /**
  * A keeper served to a client on this thread over `carrier` ('channel' or
  * 'link'), its calls written down as the keeper had them, owners given out
@@ -40,9 +39,9 @@ async function served(carrier){
     let owners = 0;
     const answer = answerKeeper({
         keeper: {
-            reserve: (name, length, options)=>{
-                calls.push(['reserve', name, length, options]);
-                return cache.keeper.reserve(name, length, options);
+            reserve: (name, length, flags, known, place)=>{
+                calls.push(['reserve', name, length, flags, known]);
+                return cache.keeper.reserve(name, length, flags, known, place);
             },
             raise: (name, options)=>{
                 calls.push(['raise', name, options]);
@@ -92,21 +91,17 @@ async function served(carrier){
 
 for (const carrier of /** @type {const} */ (['channel', 'link']))
 {
-    test(`every op over a ${carrier}: what the keeper answers, its options as they were given`, async()=>{
+    test(`every op over a ${carrier}: what the keeper answers, its flags as they were given`, async()=>{
         const { cache, calls, client, reader, close } = await served(carrier);
         try
         {
-            const place = client.keeper.reserve('a/1', 1000, { onlyCopy: true, disk: 'run', idle: 'stay',
-                known: 1, hold: false });
+            const place = placeOf(client.keeper, 'a/1', 1000,
+                reserveFlags({ onlyCopy: true, disk: 'run', idle: 'stay' }), 1);
             assert.ok(place && Number.isInteger(place.id) && place.segment === 0);
-            assert.deepEqual(calls.at(-1), ['reserve', 'a/1', 1000, { onlyCopy: true, hold: false,
-                idle: 'stay', disk: 'run', known: 1 }]);
-            assert.equal(client.keeper.reserve('a/2', 10, { onlyCopy: false, known: Infinity, hold: true,
-                disk: 'never' })
-                ?.segment, 0);
-            assert.deepEqual(calls.at(-1)[3], { onlyCopy: false, hold: true, idle: 'go', disk: 'never',
-                known: Infinity }, 'no segments said: every one');
-            assert.equal(client.keeper.reserve('a/3', 1 << 30, ANY), null, 'refused: past the budget');
+            assert.deepEqual(calls.at(-1), ['reserve', 'a/1', 1000, F_ONLY_COPY | F_THIS_RUN | F_FOR_ROOM, 1]);
+            assert.equal(placeOf(client.keeper, 'a/2', 10, F_NO_DISK | F_HELD)?.segment, 0);
+            assert.deepEqual(calls.at(-1).slice(3), [F_NO_DISK | F_HELD, Infinity], 'no segments said: every one');
+            assert.equal(placeOf(client.keeper, 'a/3', 1 << 30), null, 'refused: past the budget');
 
             assert.equal(reader.put('b/é', Uint8Array.of(1, 2, 3)), true, 'a name past ASCII');
             assert.equal(cache.reader.with('b/é', body=>body[2]), 3, 'committed where the keeper put it');
@@ -121,8 +116,8 @@ for (const carrier of /** @type {const} */ (['channel', 'link']))
             assert.deepEqual(calls.slice(-2), [['raise', 'b/é', { known: Infinity }], ['drop', 'b/é']]);
             assert.equal(cache.reader.look('b/é'), null, 'dropped');
 
-            const later = await client.reserveLater('c/1', 64, { onlyCopy: true, disk: 'run', known: 1 });
-            assert.equal(later?.segment, 0);
+            const later = await client.reserveLater('c/1', 64, reserveFlags({ onlyCopy: true, disk: 'run' }), 1);
+            assert.equal(later?.[P_SEGMENT], 0);
             assert.equal(client.own('texels'), 'texels/1/');
             assert.equal(client.own('none'), null);
             assert.deepEqual(client.release('a/', 2), { bodies: 2, bytes: 2 ** 33 + 5, waiting: 1 },
@@ -199,7 +194,7 @@ test('an op it does not know is a failure, never another call; a request not of 
 test('a call not waited on that fails is said, not dropped; a closed carrier is not a failure', async()=>{
     const memory = createChannel({ slots: 2, slotBytes: 128 });
     const serving = serveKeeperChannel(memory, answerKeeper({ keeper: {
-        makeRoom: ()=>false, reserve: ()=>null, raise: ()=>{
+        makeRoom: ()=>false, reserve: ()=>false, raise: ()=>{
             throw new Error('the keeper is closed');
         }, drop: ()=>true } }));
     /** @type {unknown[]} */
@@ -213,24 +208,23 @@ test('a call not waited on that fails is said, not dropped; a closed carrier is 
     client.keeper.drop('y');
     await new Promise(resolve=>setTimeout(resolve, 20));
     assert.equal(failures.length, 1);
-    assert.throws(()=>client.keeper.reserve('z', 1, ANY), /closed/);
+    assert.throws(()=>placeOf(client.keeper, 'z', 1), /closed/);
 });
 
 test('a client refuses what the format cannot say, before anything is sent', async()=>{
     const memory = createChannel({ slots: 2, slotBytes: 64 });
-    const serving = serveKeeperChannel(memory, answerKeeper({ keeper: { reserve: ()=>null,
+    const serving = serveKeeperChannel(memory, answerKeeper({ keeper: { reserve: ()=>false,
         raise: ()=>false, drop: ()=>true, makeRoom: ()=>false } }));
     const client = openKeeperClient(openClient(memory));
     try
     {
-        assert.throws(()=>client.keeper.reserve('a', 2 ** 32, ANY), RangeError);
-        assert.throws(()=>client.keeper.reserve('a', -1, ANY), RangeError);
-        assert.throws(()=>client.keeper.reserve('a', 1, { ...ANY, disk: /** @type {any} */ ('somewhere') }),
-            RangeError);
+        assert.throws(()=>placeOf(client.keeper, 'a', 2 ** 32), RangeError);
+        assert.throws(()=>placeOf(client.keeper, 'a', -1), RangeError);
+        assert.throws(()=>placeOf(client.keeper, 'a', 1, 1 << 9), RangeError, 'a flag no reservation asks');
         assert.throws(()=>client.keeper.raise(/** @type {any} */ (null), { known: 1 }), TypeError);
-        assert.throws(()=>client.keeper.reserve('a'.repeat(100), 1, ANY), /a slot holds 64/,
+        assert.throws(()=>placeOf(client.keeper, 'a'.repeat(100), 1), /a slot holds 64/,
             'a name past what its carrier holds, said by the carrier');
-        assert.equal(client.keeper.reserve('a', 1, ANY), null, 'the next one goes');
+        assert.equal(placeOf(client.keeper, 'a', 1), null, 'the next one goes');
     }
     finally
     {

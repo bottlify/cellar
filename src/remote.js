@@ -28,7 +28,8 @@
  *
  *     op | a | b | c | name bytes | name...
  *
- *     RESERVE  a: length, b: known (-1: every segment), c: flags
+ *     RESERVE  a: length, b: known (-1: every segment), c: flags (`reserveFlags`, the
+ *              record's own; `F_HELD` for `hold`)
  *     RAISE    a: known (-1: every segment; the raise not waited on)
  *     DROP
  *     OWN      name: the kind of names an owner is given
@@ -53,6 +54,7 @@ import { ACCOUNT_UNIT } from './account.js';
 import { SPIN_MS, mayWait } from './bell.js';
 import { ChannelClosed, openServer } from './channel.js';
 import { LinkClosed } from './link.js';
+import { PLACE_WORDS, P_ID, P_MARK, P_OFFSET, P_SEGMENT, checkFlags, isFlags } from './shared.js';
 import { readText, writeText } from './text.js';
 
 /** The ops. */
@@ -73,14 +75,6 @@ const FAILED = -3;
 /** The words before a request's name, and of an answer before its text. */
 const HEAD_WORDS = 5;
 const HEAD = HEAD_WORDS * 4;
-
-/** A reservation's flags. */
-const ONLY_COPY = 1;
-const HOLD = 2;
-const STAY = 4;
-const DISK_SHIFT = 3;
-/** @type {readonly import('./keeper.js').DiskPolicy[]} */
-const DISKS = ['kept', 'run', 'never'];
 
 /** @typedef {{ words: Int32Array, bytes: Uint8Array }} Lying */
 
@@ -148,6 +142,8 @@ export function answerKeeper({ keeper, owners }){
     };
     /** @param {number} known */
     const knownOf = known=>(known < 0 ? Infinity : known);
+    /** Where the keeper answers a reserve. */
+    const place = new Int32Array(PLACE_WORDS);
     return (request, length, answer, answerRoom)=>{
         out = answer;
         room = answerRoom;
@@ -164,8 +160,7 @@ export function answerKeeper({ keeper, owners }){
         {
             return sayText(UNKNOWN, `remote keeper: no op ${op}`);
         }
-        if (op === RESERVE && (c & ~(ONLY_COPY | HOLD | STAY | 3 << DISK_SHIFT)
-            || (c >> DISK_SHIFT & 3) >= DISKS.length))
+        if (op === RESERVE && !isFlags(c))
         {
             return sayText(MALFORMED, `remote keeper: reservation flags ${c}`);
         }
@@ -174,11 +169,8 @@ export function answerKeeper({ keeper, owners }){
             const name = readText(request.bytes, HEAD, length - HEAD);
             if (op === RESERVE)
             {
-                const place = keeper.reserve(name, a >>> 0, { onlyCopy: (c & ONLY_COPY) !== 0,
-                    hold: (c & HOLD) !== 0, idle: (c & STAY) !== 0 ? 'stay' : 'go',
-                    disk: DISKS[c >> DISK_SHIFT & 3], known: knownOf(b) });
-                return place === null ? say(NONE)
-                    : say(OK, place.id, place.segment, place.offset, place.mark);
+                return keeper.reserve(name, a >>> 0, c, knownOf(b), place)
+                    ? say(OK, place[P_ID], place[P_SEGMENT], place[P_OFFSET], place[P_MARK]) : say(NONE);
             }
             if (op === RAISE)
             {
@@ -320,10 +312,27 @@ const answered = answer=>{
     return words;
 };
 
-/** @param {Uint8Array} answer @returns {import('./reader.js').Place | null} */
-const readPlace = answer=>{
+/**
+ * A reserve's answer into `place`: false where it was refused.
+ *
+ * @param {Uint8Array} answer @param {Int32Array} place
+ */
+const placeInto = (answer, place)=>{
     const words = answered(answer);
-    return words[0] === NONE ? null : { id: words[1], segment: words[2], offset: words[3] >>> 0, mark: words[4] };
+    if (words[0] === NONE)
+    {
+        return false;
+    }
+    place[P_ID] = words[1];
+    place[P_SEGMENT] = words[2];
+    place[P_OFFSET] = words[3];
+    place[P_MARK] = words[4];
+    return true;
+};
+/** @param {Uint8Array} answer */
+const placeLater = answer=>{
+    const place = new Int32Array(PLACE_WORDS);
+    return placeInto(answer, place) ? place : null;
 };
 /** @param {Uint8Array} answer */
 const readYes = answer=>answered(answer)[0] === OK;
@@ -390,23 +399,21 @@ export function openKeeperClient(carrier, { onFailure = e=>{
     /** @param {number | undefined} known */
     const knownOf = known=>(known === undefined || known === Infinity ? -1 : known);
     /**
-     * @param {string} name @param {number} length
-     * @param {{ onlyCopy?: boolean, disk?: import('./keeper.js').DiskPolicy, idle?: 'go' | 'stay',
-     *     known?: number, hold?: boolean }} options
+     * @param {string} name @param {number} length @param {number} flags
+     * @param {number | undefined} known
      */
-    const reserveOf = (name, length, { onlyCopy = false, disk = 'kept', idle = 'go', known, hold = false })=>{
-        const policy = DISKS.indexOf(disk);
-        if (policy < 0 || (idle !== 'go' && idle !== 'stay'))
-        {
-            throw new RangeError(`remote keeper: a disk policy of ${String(disk)}, idle ${String(idle)}`);
-        }
+    const reserveOf = (name, length, flags, known)=>{
+        checkFlags(flags);
         if (!Number.isInteger(length) || length < 0 || length > 0xffff_ffff)
         {
             throw new RangeError(`remote keeper: a body of ${length} bytes`);
         }
-        return write(RESERVE, name, length, knownOf(known), (onlyCopy ? ONLY_COPY : 0) | (hold ? HOLD : 0)
-            | (idle === 'stay' ? STAY : 0) | policy << DISK_SHIFT);
+        return write(RESERVE, name, length, knownOf(known), flags);
     };
+    /** The place a blocking reserve's answer goes to: its asker's, set at each. */
+    let into = /** @type {Int32Array} */ (new Int32Array(PLACE_WORDS));
+    const intoPlace = { read: (/** @type {Uint8Array} */ answer)=>placeInto(answer, into) };
+    const later = { read: placeLater };
     /** Sent and not waited on. @param {Uint8Array} sent */
     const unwaited = sent=>{
         carrier.call(sent, { read: answered }).catch(e=>{
@@ -419,22 +426,26 @@ export function openKeeperClient(carrier, { onFailure = e=>{
     return {
         /** @type {import('./reader.js').KeeperCalls} */
         keeper: {
-            reserve: (name, length, options)=>carrier.ask(reserveOf(name, length, options), { read: readPlace }),
+            reserve: (name, length, flags, known, place)=>{
+                const request = reserveOf(name, length, flags, known);
+                into = place;
+                return carrier.ask(request, intoPlace);
+            },
             raise: (name, { known })=>carrier.ask(write(RAISE, name, knownOf(known), 0, 0), { read: readYes }),
             raiseLater: name=>unwaited(write(RAISE, name, -1, 0, 0)),
             drop: name=>unwaited(write(DROP, name, 0, 0, 0)),
         },
 
         /**
-         * Room asked for without waiting: the place once granted, null where
-         * the keeper had none.
+         * Room asked for without waiting: the place once granted (`P_ID`...),
+         * a record of its own, null where the keeper had none.
          *
-         * @param {string} name @param {number} length
-         * @param {Parameters<typeof reserveOf>[2]} options
-         * @returns {Promise<import('./reader.js').Place | null>}
+         * @param {string} name @param {number} length @param {number} flags
+         * @param {number} [known]  the segments the asker has, every one by default
+         * @returns {Promise<Int32Array | null>}
          */
-        reserveLater: (name, length, options)=>carrier.call(reserveOf(name, length, options),
-            { read: readPlace }),
+        reserveLater: (name, length, flags, known)=>carrier.call(reserveOf(name, length, flags, known),
+            later),
 
         /**
          * Room in the keeper's account for `bytes` more (`Keeper.makeRoom`):

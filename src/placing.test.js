@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import { GRAIN, UNIT } from './buddy.js';
 import { cacheOf } from './cache.fixture.js';
 import { memoryDisk } from './disk.fixture.js';
+import { reserveFlags } from './shared.js';
 
 const KIB = 1024;
 const SEGMENT = 256 * KIB;
@@ -159,7 +160,7 @@ async function work(seed, budget, steps){
             const bytes = patternOf(sizeOf(random), ++serial);
             const only = random() < 0.3;
             letGo = [];
-            if (reader.put(name, bytes, { onlyCopy: only }))
+            if (reader.put(name, bytes, reserveFlags({ onlyCopy: only })))
             {
                 bodies.set(name, { bytes, only });
             }
@@ -173,7 +174,7 @@ async function work(seed, budget, steps){
             const bytes = patternOf(sizeOf(random), ++serial);
             const only = random() < 0.3;
             letGo = [];
-            const view = reader.reserve(name, bytes.length, { onlyCopy: only });
+            const view = reader.reserve(name, bytes.length, reserveFlags({ onlyCopy: only }));
             if (view !== null)
             {
                 // The name's body before is not its body any more.

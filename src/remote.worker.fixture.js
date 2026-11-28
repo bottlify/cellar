@@ -17,6 +17,7 @@ import { openClient } from './channel.js';
 import { openLink } from './link.js';
 import { createReader } from './reader.js';
 import { linkCarrier, openKeeperClient } from './remote.js';
+import { PLACE_WORDS, P_ID, P_MARK, P_OFFSET, P_SEGMENT, reserveFlags } from './shared.js';
 
 const { carrier, memory, shared, segments, account } = workerData;
 const port = /** @type {import('node:worker_threads').MessagePort} */ (parentPort);
@@ -70,17 +71,18 @@ const parts = {
         const prefix = /** @type {string} */ (client.own(kind));
         for (let n = 0; n < count; n++)
         {
-            reader.put(`${prefix}${n}`, bodyOf(100, n), { onlyCopy: true, disk: 'run' });
+            reader.put(`${prefix}${n}`, bodyOf(100, n), reserveFlags({ onlyCopy: true, disk: 'run' }));
         }
         reader.drop(`${prefix}0`);
         return { prefix, released: client.release(prefix, count - 1) };
     },
     // Room asked for, every request out at once, past the channel's slots.
     many: async({ count, length })=>{
-        const asked = Array.from({ length: count }, (_, n)=>client.reserveLater(`many/${n}`, length, {}));
+        const asked = Array.from({ length: count }, (_, n)=>client.reserveLater(`many/${n}`, length, 0));
         port.postMessage({ sent: count });
         const settled = await Promise.allSettled(asked);
-        return settled.map(one=>(one.status === 'fulfilled' ? { place: one.value }
+        return settled.map(one=>(one.status === 'fulfilled' ? { place: one.value && { id: one.value[P_ID],
+            segment: one.value[P_SEGMENT], offset: one.value[P_OFFSET], mark: one.value[P_MARK] } }
             : { failed: String(one.reason?.name ?? one.reason) }));
     },
     // Memory of another kind taken from the keeper's account, room asked of the keeper.
@@ -92,7 +94,7 @@ const parts = {
     after: ()=>{
         try
         {
-            client.keeper.reserve('after', 10, { onlyCopy: false, known: 1 });
+            client.keeper.reserve('after', 10, 0, 1, new Int32Array(PLACE_WORDS));
             return { thrown: null };
         }
         catch (e){
@@ -105,8 +107,9 @@ const parts = {
 // answered inside that wait.
 handlers.worker = {
     reserveNow: (/** @type {string} */ name)=>{
-        const place = client.keeper.reserve(name, 64, { onlyCopy: false, known: 1 });
-        return place && { segment: place.segment, offset: place.offset };
+        const place = new Int32Array(PLACE_WORDS);
+        return client.keeper.reserve(name, 64, 0, 1, place)
+            ? { segment: place[P_SEGMENT], offset: place[P_OFFSET] } : null;
     },
 };
 

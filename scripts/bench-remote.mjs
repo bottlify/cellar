@@ -27,6 +27,7 @@ import { createChannel, openClient } from '../src/channel.js';
 import { openKeeper } from '../src/keeper.js';
 import { createLinkMemory, openLink } from '../src/link.js';
 import { answerKeeper, keeperWords, linkCarrier, openKeeperClient, serveKeeperChannel } from '../src/remote.js';
+import { PLACE_WORDS } from '../src/shared.js';
 
 const BODY = 256;
 
@@ -50,6 +51,7 @@ if (isMainThread)
         throw new Error('run with --expose-gc --max-semi-space-size=128');
     }
     const keeper = await openKeeper({ budget: 64 << 20, segmentBytes: 16 << 20, disk: null });
+    const place = new Int32Array(PLACE_WORDS);
     const names = Array.from({ length: OPS }, (_, n)=>`r/${n}`);
     const answer = answerKeeper({ keeper });
     /** @type {Record<string, () => Promise<{ us: number[], worker: number[], keeper: number[] }>>} */
@@ -63,7 +65,7 @@ if (isMainThread)
                 const start = performance.now();
                 for (const name of names)
                 {
-                    keeper.reserve(name, BODY, { known: 1 });
+                    keeper.reserve(name, BODY, 0, 1, place);
                 }
                 const took = performance.now() - start;
                 const grew = process.memoryUsage().heapUsed - before;
@@ -155,7 +157,7 @@ else
     {
         client = openKeeperClient(openClient(memory));
     }
-    const options = { onlyCopy: false, known: 1 };
+    const place = new Int32Array(PLACE_WORDS);
     const port = /** @type {import('node:worker_threads').MessagePort} */ (parentPort);
     port.on('message', async()=>{
         const before = heap();
@@ -164,14 +166,14 @@ else
         {
             for (const name of names)
             {
-                await client.reserveLater(name, BODY, options);
+                await client.reserveLater(name, BODY, 0, 1);
             }
         }
         else
         {
             for (const name of names)
             {
-                client.keeper.reserve(name, BODY, options);
+                client.keeper.reserve(name, BODY, 0, 1, place);
             }
         }
         const took = performance.now() - start;
