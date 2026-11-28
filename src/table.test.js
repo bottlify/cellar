@@ -299,3 +299,49 @@ test('a table of slots is claimed, not published or advanced, and only it is cla
     assert.throws(()=>plain.slot(1), TypeError);
     assert.throws(()=>createTableMemory({ rows: 2 ** 24 + 1, columns: [], slots: true }), RangeError);
 });
+
+test('a counting column only grows, and an add to it makes nothing', async()=>{
+    const { bytesPerCall } = await import('./allocation.fixture.js');
+    const table = openTable(createTableMemory({ rows: 2, columns: ['id', 'bytes', 'writes'],
+        counting: ['bytes', 'writes'] }));
+    table.set(0, 0, -7);
+    table.add(0, 1, 2 ** 32 - 1);
+    table.add(0, 1, 3);
+    assert.equal(table.get(0, 1), 2 ** 32 + 2, 'across the carry into its high word');
+    assert.throws(()=>table.add(0, 1, -1), RangeError, 'a count never comes down');
+    assert.throws(()=>table.set(0, 1, 5), TypeError, 'nor is it set');
+    assert.equal(table.get(0, 0), -7, 'the other columns as before');
+    assert.deepEqual(table.row(0), { id: -7, bytes: 2 ** 32 + 2, writes: 0 });
+    // Answering the settled promise the measure's empty loop awaits: only the adds differ.
+    const settled = Promise.resolve();
+    const made = await bytesPerCall(()=>{
+        table.add(1, 1, 4096);
+        table.add(1, 2, 1);
+        return settled;
+    });
+    assert.ok(made < 4, `${made} bytes a writer's two adds`);
+    assert.throws(()=>createTableMemory({ rows: 1, columns: ['a'], counting: ['b'] }), RangeError);
+});
+
+test('readers on other threads see a counting cell whole across every carry, without a version',
+    { timeout: 30000 }, async()=>{
+    const memory = createTableMemory({ rows: 1, columns: ['n'], counting: ['n'] });
+    const table = openTable(memory);
+    const reader = onWorker(`
+        const table = openTable(data);
+        let last = 0;
+        let bad = 0;
+        for (let i = 0; i < 2_000_000; i++)
+        {
+            const value = table.get(0, 0);
+            // A multiple of 2^31 + 1, never less than seen: anything else is torn.
+            if (value < last || value % (2 ** 31 + 1) !== 0) bad++;
+            last = value;
+        }
+        parentPort.postMessage(bad);`, memory);
+    for (let i = 0; i < 4_000_000; i++)
+    {
+        table.add(0, 0, 2 ** 31 + 1);
+    }
+    assert.equal(await reader, 0);
+});

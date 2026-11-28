@@ -21,6 +21,16 @@
  * row is not read whole. The counts are atomic: a row filled before a count
  * was published is seen filled by a reader that read that count.
  *
+ * A counting column (`counting`) only grows: it is added to by an amount not
+ * below zero and never set, as a count of bytes or of calls is at every
+ * call. Its cell is two Uint32 words, low and high, with no BigInt made: an
+ * add that does not carry is one plain store of the low word, read whole by
+ * the standard; one that carries marks the high word busy, then stores the
+ * low word and the next high through `Atomics`; a reader takes high, low,
+ * high until the two highs are the same word and not busy. The high word
+ * only grows, so the same word seen twice is a high part written once, never
+ * one gone and come back.
+ *
  * A table of slots (`slots: true`) is the same rows claimed by any thread:
  * each row has a word of its own, its generation and whether it is free,
  * being claimed or held, changed only by compare-and-swap. A claim takes a
@@ -37,6 +47,10 @@ const WRITTEN = 1;
 const HEADER_BYTES = 8;
 /** The most a cell holds either way of zero: every integer up to it is exact. */
 const MOST = 2 ** 53;
+/** A counting cell's high word while its writer is between its words: no count within 2^53 has it. */
+const BUSY = 0x40000000;
+/** How long a reader looks at a counting cell whose words never agree before it says so. */
+const STUCK_MS = 1000;
 /** A slot's word: its generation above, its state in the two bits below. */
 const FREE = 0;
 const CLAIMING = 1;
@@ -48,7 +62,8 @@ const MAX_SLOTS = 1 << 24;
 /**
  * What a reader on another thread is handed: post it, then open it there.
  *
- * @typedef {{ buffer: SharedArrayBuffer, rows: number, columns: string[], slots?: boolean }} TableMemory
+ * @typedef {{ buffer: SharedArrayBuffer, rows: number, columns: string[], slots?: boolean,
+ *     counting?: string[] }} TableMemory
  */
 
 /**
@@ -74,19 +89,25 @@ const MAX_SLOTS = 1 << 24;
  */
 
 /**
- * @param {{ rows: number, columns: string[], slots?: boolean }} shape
- *     `slots`: rows claimed by any thread, `type` and `owner` columns before `columns`
+ * @param {{ rows: number, columns: string[], slots?: boolean, counting?: string[] }} shape
+ *     `slots`: rows claimed by any thread, `type` and `owner` columns before `columns`;
+ *     `counting`: the columns that only grow, by `add` of an amount not below zero
  * @returns {TableMemory}
  */
-export function createTableMemory({ rows, columns, slots = false }){
+export function createTableMemory({ rows, columns, slots = false, counting = [] }){
     const named = slots ? ['type', 'owner', ...columns] : columns.slice();
     if (!Number.isInteger(rows) || rows < 1 || named.length < 1 || (slots && rows > MAX_SLOTS))
     {
         throw new RangeError(`table: ${rows} rows of ${columns.length} columns`);
     }
+    const unknown = counting.find(name=>!columns.includes(name));
+    if (unknown !== undefined)
+    {
+        throw new RangeError(`table: no column ${unknown} to count`);
+    }
     const cells = HEADER_BYTES + rows * named.length * 8;
     return { buffer: new SharedArrayBuffer(cells + (slots ? rows * 4 : 0)), rows, columns: named,
-        ...(slots ? { slots } : {}) };
+        ...(slots ? { slots } : {}), ...(counting.length > 0 ? { counting: counting.slice() } : {}) };
 }
 
 /**
@@ -94,10 +115,14 @@ export function createTableMemory({ rows, columns, slots = false }){
  * @returns {Table}
  */
 export function openTable(memory){
-    const { buffer, rows, columns, slots = false } = memory;
+    const { buffer, rows, columns, slots = false, counting = [] } = memory;
     const width = columns.length;
     const counts = new Int32Array(buffer, 0, 2);
     const cells = new BigInt64Array(buffer, HEADER_BYTES, rows * width);
+    /** The same cells as low and high words, for the counting columns. */
+    const words = new Uint32Array(buffer, HEADER_BYTES, rows * width * 2);
+    /** By column: whether it only grows. */
+    const grows = Uint8Array.from(columns, name=>(counting.includes(name) ? 1 : 0));
     /** A slot table's words, a row each: generation and state. */
     const states = new Int32Array(buffer, HEADER_BYTES + cells.byteLength, slots ? rows : 0);
     /** @param {number} at @param {number} column */
@@ -110,8 +135,68 @@ export function openTable(memory){
         }
         Atomics.store(cells, cell, BigInt(value));
     };
+    /** A counting cell's count: its two words, read until they agree. @param {number} cell */
+    const count = cell=>{
+        const low = cell * 2;
+        for (let since = 0; ; since ||= performance.now())
+        {
+            const high = Atomics.load(words, low + 1);
+            const read = Atomics.load(words, low);
+            if (high !== BUSY && Atomics.load(words, low + 1) === high)
+            {
+                return high * 2 ** 32 + read;
+            }
+            if (since > 0 && performance.now() - since > STUCK_MS)
+            {
+                throw new Error(`table: cell ${cell} was left half-written`);
+            }
+        }
+    };
     /** @param {number} at @param {number} column */
-    const get = (at, column)=>Number(Atomics.load(cells, cellOf(at, column)));
+    const get = (at, column)=>(grows[column] === 1 ? count(cellOf(at, column))
+        : Number(Atomics.load(cells, cellOf(at, column))));
+    /**
+     * The writer's: `amount` more in the counting cell whose low word is at
+     * `low`, a plain store but where it carries. A function of its own, so
+     * that the path of every call is not the BigInt one's.
+     *
+     * @param {number} low @param {number} column @param {number} amount
+     */
+    const addCount = (low, column, amount)=>{
+        const sum = words[low] + Math.round(amount);
+        if (sum >= words[low] && sum <= 0xffffffff)
+        {
+            words[low] = sum;
+            return;
+        }
+        if (!(amount >= 0) || !Number.isFinite(amount))
+        {
+            throw new RangeError(`table: ${columns[column]} only grows, not by ${amount}`);
+        }
+        const high = words[low + 1] + Math.floor(sum / 2 ** 32);
+        if (high * 2 ** 32 > MOST)
+        {
+            throw new RangeError(`table: ${columns[column]} past 2^53`);
+        }
+        Atomics.store(words, low + 1, BUSY);
+        Atomics.store(words, low, sum >>> 0);
+        Atomics.store(words, low + 1, high);
+    };
+    /** The writer's: `amount` more in a cell of any sign. @param {number} cell @param {number} amount */
+    const addWide = (cell, amount)=>{
+        const by = Math.round(amount);
+        if (!Number.isInteger(by) || Math.abs(by) > MOST)
+        {
+            throw new RangeError(`table: ${amount} is not a number a cell holds`);
+        }
+        // One writer: what it added it may take back before anyone else stores.
+        const was = Number(Atomics.add(cells, cell, BigInt(by)));
+        if (Math.abs(was + by) > MOST)
+        {
+            Atomics.store(cells, cell, BigInt(was));
+            throw new RangeError(`table: ${was} and ${amount} is not a number a cell holds`);
+        }
+    };
     /** @param {number} at */
     const row = at=>{
         /** @type {Record<string, number>} */
@@ -178,22 +263,15 @@ export function openTable(memory){
         rows,
         width,
         columns,
-        set: (at, column, value)=>put(cellOf(at, column), Math.round(value)),
-        add: (at, column, amount)=>{
-            const by = Math.round(amount);
-            if (!Number.isInteger(by) || Math.abs(by) > MOST)
+        set: (at, column, value)=>{
+            if (grows[column] === 1)
             {
-                throw new RangeError(`table: ${amount} is not a number a cell holds`);
+                throw new TypeError(`table: ${columns[column]} only grows, by add`);
             }
-            const cell = cellOf(at, column);
-            // One writer: what it added it may take back before anyone else stores.
-            const was = Number(Atomics.add(cells, cell, BigInt(by)));
-            if (Math.abs(was + by) > MOST)
-            {
-                Atomics.store(cells, cell, BigInt(was));
-                throw new RangeError(`table: ${was} and ${amount} is not a number a cell holds`);
-            }
+            put(cellOf(at, column), Math.round(value));
         },
+        add: (at, column, amount)=>(grows[column] === 1 ? addCount(cellOf(at, column) * 2, column, amount)
+            : addWide(cellOf(at, column), amount)),
         get,
         use: count=>{
             unclaimed();
@@ -243,7 +321,15 @@ export function openTable(memory){
                 }
                 for (let column = 0; column < width; column++)
                 {
-                    put(cellOf(at, column), column === 0 ? type : column === 1 ? owner : 0);
+                    const cell = cellOf(at, column);
+                    if (grows[column] === 1)
+                    {
+                        // The row is no one's until it is held: its count starts again.
+                        Atomics.store(words, cell * 2 + 1, 0);
+                        Atomics.store(words, cell * 2, 0);
+                        continue;
+                    }
+                    put(cell, column === 0 ? type : column === 1 ? owner : 0);
                 }
                 Atomics.store(states, at, generation << 2 | HELD);
                 Atomics.add(counts, USED, 1);
