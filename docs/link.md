@@ -25,7 +25,7 @@ await link.serve();                           // until either side closes the li
 | `openLink(end, handlers, { words, spinMs, afterSend, onAfterSendFailure })` | Opens one side. `handlers[target][method]` answer the other side, a promise when it settles. |
 | `ask(target, method, args, timeoutMs)` | Calls and blocks until answered, handling every call sent meanwhile. |
 | `call(target, method, args)` | Calls and returns a promise, settled by `pump` or `serve`. |
-| `askBytes(request, read, timeoutMs)`, `callBytes(request, read)` | A call in place: blocks for its answer, or returns a promise of it; `read` reads the answer where it lies. |
+| `askBytes(request, read, timeoutMs)`, `callBytes(request, read)` | A call in place: blocks for its answer, or returns a promise of it; `read` reads the answer where it lies. `timeoutMs` is the call's in all: the wait for a free slot counts, and a call whose time runs out before it has one is not sent. |
 | `pump()` | Handles everything sent so far: calls, word calls, answers. |
 | `serve()` | Pumps on the event loop until the link closes. |
 | `bell` | This side's doorbell, for a thread that waits on the link with other work. |

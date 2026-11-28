@@ -789,3 +789,25 @@ test('a blocking call made while its side waits for room to send a record before
     assert.equal(answer.length, 1024);
     assert.match(String(answer.inner), /waits to send a record before it/);
 });
+
+test('a blocking call in place with a time waits that long in all, for its slot as for its answer',
+    { timeout: 20000 }, async()=>{
+    // The other side is in a worker that never answers a call in place: the
+    // one slot is out with a promise's call, and the next call's time runs
+    // out while it waits for the slot.
+    const { a, b } = createLinkMemory({ words: 1, slots: 1 });
+    const worker = kept(new Worker(`
+        const { workerData, parentPort } = require('node:worker_threads');
+        import(workerData.module).then(({ openLink })=>{
+            openLink(workerData.end, {});
+            parentPort.postMessage('open');
+            setTimeout(()=>{}, 60000);
+        });`, { eval: true, workerData: { module: LINK, end: a } }));
+    await new Promise(resolve=>worker.once('message', resolve));
+    const asking = open(b, {});
+    asking.callBytes([1, 0, 0, 0], answer=>answer[0]).catch(()=>{});
+    const started = performance.now();
+    assert.throws(()=>asking.askBytes([2, 0, 0, 0], answer=>answer[0], 200), /200 ms/);
+    const took = performance.now() - started;
+    assert.ok(took >= 190 && took < 5000, `${took.toFixed(0)} ms`);
+});

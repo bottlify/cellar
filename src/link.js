@@ -815,9 +815,10 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      * take - a wait this call is made inside of - is not freed by waiting:
      * every slot out is said.
      *
-     * @param {string} what
+     * @param {string} what  @param {number} [until]  a blocking call's deadline, waited to
+     * @param {number} [timeoutMs]  that call's time, which a slot not freed by then says
      */
-    const claim = what=>{
+    const claim = (what, until = Infinity, timeoutMs = Infinity)=>{
         if (closed())
         {
             throw new LinkClosed(what);
@@ -840,7 +841,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             }
             else
             {
-                waitFor(0, Infinity, what, Infinity, numbers[slot]);
+                waitFor(0, until, what, timeoutMs, numbers[slot]);
             }
         }
     };
@@ -870,14 +871,15 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      * Writes `request` into the next slot, once it is free: the slot.
      *
      * @param {ArrayLike<number>} request @param {string} what
+     * @param {number} [until] @param {number} [timeoutMs]  a blocking call's, as `claim` takes them
      */
-    const writeRequest = (request, what)=>{
+    const writeRequest = (request, what, until = Infinity, timeoutMs = Infinity)=>{
         const bytes = bytesOf(request, 'link');
         if (bytes.length > size * 4)
         {
             throw new RangeError(`link: ${what} of ${bytes.length} bytes, a slot holds ${size * 4}`);
         }
-        const slot = claim(what);
+        const slot = claim(what, until, timeoutMs);
         mySlots[slot].requestBytes.set(bytes);
         return { slot, length: bytes.length };
     };
@@ -1016,13 +1018,15 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
          * @returns {T}
          */
         askBytes(request, read, timeoutMs = Infinity){
-            const { slot, length } = writeRequest(request, 'a call in place');
+            // Its time is the call's in all: the wait for a slot, then for the answer.
+            const until = performance.now() + timeoutMs;
+            const { slot, length } = writeRequest(request, 'a call in place', until, timeoutMs);
             const n = sendInPlace(slot, length, WAITED);
             if (!callIn(n))
             {
                 try
                 {
-                    waitFor(0, performance.now() + timeoutMs, 'a call in place', timeoutMs, n);
+                    waitFor(0, until, 'a call in place', timeoutMs, n);
                 }
                 catch (e){
                     // Its answer, if one comes, goes to nobody.
