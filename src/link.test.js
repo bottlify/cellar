@@ -638,3 +638,95 @@ test('memory that is no link is refused', ()=>{
     assert.throws(()=>open({ ...a, words: new SharedArrayBuffer(64) }), /not a link/);
     assert.throws(()=>createLinkMemory({ words: -1 }), RangeError);
 });
+
+test('an answer in place is read before its slot is anyone else\'s: a call made inside the read is '
+    + 'refused, the answer read intact', ()=>{
+    const { a, b } = createLinkMemory({ words: 1, slots: 1 });
+    const server = open(a, {}, { words: (request, answer)=>{
+        answer[0] = request[0];
+    } });
+    const asking = open(b, {});
+    let nested = /** @type {any} */ (null);
+    const read = asking.askBytes([17, 0, 0, 0], answer=>{
+        const before = answer[0];
+        try
+        {
+            nested = asking.askBytes([42, 0, 0, 0], inner=>inner[0]);
+        }
+        catch (e){
+            nested = String(e);
+        }
+        return [before, answer[0]];
+    });
+    assert.deepEqual(read, [17, 17], 'the outer answer, as it was');
+    assert.match(nested, /every call in place is out/);
+    assert.equal(asking.askBytes([5, 0, 0, 0], answer=>answer[0]), 5, 'the slot free again after');
+    server.close();
+});
+
+test('a call in place whose slot was found free by waiting takes the slot of its own number, '
+    + 'whatever was called while it waited', async()=>{
+    const { a, b } = createLinkMemory({ words: 1, slots: 2 });
+    /** @type {number[]} */
+    const seen = [];
+    const server = open(a, {}, { words: (request, answer)=>{
+        seen.push(request[0] & 255);
+        answer[0] = request[0];
+    } });
+    /** @type {ReturnType<typeof openLink>} */
+    let asking;
+    let inner = 0;
+    asking = open(b, { back: { now: ()=>{
+        inner = asking.askBytes([33, 0, 0, 0], answer=>answer[0]);
+        return null;
+    } } });
+    // In before the calls in place: handled in the wait the third one makes for a slot.
+    const back = server.call('back', 'now');
+    const first = asking.callBytes([11, 0, 0, 0], answer=>answer[0]);
+    const second = asking.callBytes([22, 0, 0, 0], answer=>answer[0]);
+    const outer = asking.askBytes([44, 0, 0, 0], answer=>answer[0]);
+    server.pump();
+    assert.deepEqual([await first, await second, inner, outer], [11, 22, 33, 44]);
+    assert.deepEqual(seen, [11, 22, 33, 44], 'the server read each request once, in order');
+    assert.equal(await back, null);
+    server.close();
+});
+
+test('a word call\'s request is written where no call out lies, whatever it waits for to be sent',
+    async()=>{
+    const { a, b } = createLinkMemory({ words: 1, slots: 1 });
+    const server = open(a, {}, { words: (request, answer)=>{
+        answer[0] = request[0];
+    } });
+    const asking = open(b, {});
+    const first = asking.callBytes([17, 0, 0, 0], answer=>answer[0]);
+    asking.request[0] = 42;
+    asking.sendWords();
+    asking.waitWords();
+    assert.equal(asking.answer[0], 42);
+    assert.equal(await first, 17, 'the call out before it answered with its own request');
+    server.close();
+});
+
+test('a hook after a send that throws fails no call: the call is answered, the next has its slot, '
+    + 'the failure told', ()=>{
+    const { a, b } = createLinkMemory({ words: 1, slots: 1 });
+    const server = open(a, {}, { words: (request, answer)=>{
+        answer[0] = request[0] + 1;
+    } });
+    /** @type {unknown[]} */
+    const told = [];
+    let throws = 1;
+    const asking = open(b, {}, { afterSend: ()=>{
+        if (throws-- > 0)
+        {
+            throw new Error('hook failed');
+        }
+    }, onAfterSendFailure: e=>told.push(e) });
+    assert.equal(asking.askBytes([1, 0, 0, 0], answer=>answer[0]), 2);
+    assert.equal(asking.askBytes([2, 0, 0, 0], answer=>answer[0]), 3);
+    assert.equal(told.length, 1);
+    assert.match(String(told[0]), /hook failed/);
+    assert.equal(asking.diagnostics().afterSendFailures, 1);
+    server.close();
+});

@@ -80,11 +80,16 @@ const FAILED = 0;
 const REQUEST_BYTES = 1;
 const ANSWER_BYTES = 2;
 const SLOT_HEAD = 3;
-/** Who takes a slot's answer: nobody (free), a wait, a promise, the word call. */
+/**
+ * Who takes a slot's answer: nobody (free), a wait, a promise, the word call;
+ * or whoever reads it now, which a call made inside that read cannot wait
+ * for.
+ */
 const FREE = 0;
 const WAITED = 1;
 const LATER = 2;
 const WORD_CALL = 3;
+const READING = 4;
 
 /** A link's rings, each way, by default: what a call and its values fit in, many times over. */
 const LINK_BYTES = 1 << 20;
@@ -199,13 +204,21 @@ const sideWords = (size, slots)=>CALLS_HEAD + slots * (SLOT_HEAD + 2 * size);
  *
  * @param {LinkEnd} end
  * @param {Handlers} [handlers]
- * @param {{ words?: WordsHandler, spinMs?: number | (() => number), afterSend?: () => void }}
+ * @param {{ words?: WordsHandler, spinMs?: number | (() => number), afterSend?: () => void,
+ *     onAfterSendFailure?: (error: unknown) => void }}
  *     [options]  spinMs: how long a blocking wait looks before it sleeps, or what says so as
  *     each wait begins; by default as long as this side's waits learnt to (`createSpin`).
  *     afterSend: run after each send has rung the other side, where the other side must also
- *     be told another way (a word its running loop polls)
+ *     be told another way (a word its running loop polls). The send is made by then: a
+ *     throw from it fails no call, and is counted (`afterSendFailures`) and handed to
+ *     onAfterSendFailure, by default thrown where nothing catches it.
  */
-export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afterSend } = {}){
+export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afterSend,
+    onAfterSendFailure = e=>{
+        queueMicrotask(()=>{
+            throw e;
+        });
+    } } = {}){
     const outbound = openRing(end.out);
     const inbound = openRing(end.in);
     const bell = inbound.bell;
@@ -224,7 +237,18 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     /** Waits look this long, or as the side's waits learnt to (undefined). */
     const look = typeof spinMs === 'function' ? spinMs : ()=>spinMs;
     /** Its records and word sends, the word sends that woke the other side, its waits that slept. */
-    const counts = { sent: 0, woke: 0, slept: 0 };
+    const counts = { sent: 0, woke: 0, slept: 0, afterSendFailures: 0 };
+    /** `afterSend`, after a send made: what it throws is its own failure, not the call's. */
+    const told = ()=>{
+        try
+        {
+            afterSend?.();
+        }
+        catch (e){
+            counts.afterSendFailures++;
+            onAfterSendFailure(e);
+        }
+    };
     /** A word send, and whether it woke the other side. @param {boolean} notified */
     const sent = notified=>{
         counts.sent++;
@@ -232,7 +256,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         {
             counts.woke++;
         }
-        afterSend?.();
+        told();
     };
 
     let nextId = 1;
@@ -308,7 +332,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     const send = record=>{
         unsent.push(record);
         flush(canBlock && unsent.length === 1);
-        afterSend?.();
+        told();
     };
     /** Writes what goes to nobody once the other side closed the link. @param {() => void} write */
     const unlessClosed = write=>{
@@ -539,9 +563,19 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
     const laterResolves = /** @type {((value: any) => void)[]} */ (new Array(slots).fill(null));
     const laterRejects = /** @type {((reason: any) => void)[]} */ (new Array(slots).fill(null));
     let later = 0;
-    /** Whether the word call is out, and its number. */
+    /** Whether the word call is out, or being sent, and its number. */
     let wordsOut = false;
+    let wordsSending = false;
     let wordsNumber = 0;
+    /**
+     * The word call's request as written (`request`), and as it is sent: a
+     * slot is the other side's to read once its call is out, and the slot the
+     * next call takes may still hold one, so the request is written here and
+     * copied in once the slot is free; taken before the wait for it, as a
+     * call handled meanwhile may write the next.
+     */
+    const requestWords = new Int32Array(size);
+    const sendingWords = new Int32Array(size);
 
     /** Whether this side's call `n` is answered. @param {number} n */
     const callIn = n=>((Atomics.load(words, mine + ANSWERED) - n) | 0) > 0;
@@ -555,9 +589,9 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      */
     const finish = (slot, n, read)=>{
         const one = mySlots[slot];
-        owners[slot] = FREE;
         if (words[one.at + FAILED] !== 0)
         {
+            owners[slot] = FREE;
             // Its failure was sent before its answer: with the answer seen, it is in.
             if (!failures.has(n))
             {
@@ -572,7 +606,17 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         {
             one.answered = one.answerBytes.subarray(0, length);
         }
-        return read(one.answered);
+        // The answer lies in the slot until it is read: a call made inside
+        // the read is refused rather than written over it.
+        owners[slot] = READING;
+        try
+        {
+            return read(one.answered);
+        }
+        finally
+        {
+            owners[slot] = FREE;
+        }
     };
 
     /** Answers come for calls whose promise takes them: settled, oldest first. */
@@ -731,9 +775,14 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         {
             throw new LinkClosed(what);
         }
-        const slot = slotOf(callsSent);
-        while (owners[slot] !== FREE)
+        // The next call's slot, looked at again after every wait: a call
+        // handled while this one waited may have sent calls of its own.
+        for (let slot = slotOf(callsSent); ; slot = slotOf(callsSent))
         {
+            if (owners[slot] === FREE)
+            {
+                return slot;
+            }
             if (owners[slot] !== LATER || !canBlock)
             {
                 throw new Error(`link: ${what}: every call in place is out (${slots})`);
@@ -747,7 +796,6 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
                 waitFor(0, Infinity, what, Infinity, numbers[slot]);
             }
         }
-        return slot;
     };
 
     /**
@@ -758,6 +806,10 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      */
     const sendInPlace = (slot, length, owner)=>{
         const n = callsSent;
+        if (slot !== slotOf(n) || owners[slot] !== FREE)
+        {
+            throw new Error(`link: call ${n} sent from slot ${slot}, not its own free one`);
+        }
         words[mySlots[slot].at + REQUEST_BYTES] = length;
         owners[slot] = owner;
         numbers[slot] = n;
@@ -956,7 +1008,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
 
         /** This side's next word call's request words: written before `sendWords`. */
         get request(){
-            return mySlots[slotOf(callsSent)].request;
+            return requestWords;
         },
         /** The word call's answer words, once `answered` says it came: read before the next call. */
         get answer(){
@@ -969,13 +1021,23 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
          * waits. One at a time: another before this one's answer is taken throws.
          */
         sendWords(){
-            if (wordsOut)
+            if (wordsOut || wordsSending)
             {
                 throw new Error('link: a word call while another is out');
             }
-            const slot = claim('a word call');
-            wordsNumber = sendInPlace(slot, size * 4, WORD_CALL);
-            wordsOut = true;
+            sendingWords.set(requestWords);
+            wordsSending = true;
+            try
+            {
+                const slot = claim('a word call');
+                mySlots[slot].request.set(sendingWords);
+                wordsNumber = sendInPlace(slot, size * 4, WORD_CALL);
+                wordsOut = true;
+            }
+            finally
+            {
+                wordsSending = false;
+            }
         },
 
         /**
@@ -1027,11 +1089,12 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         answerWords,
 
         /**
-         * What this side sent, woke and slept (`counts`), and what it asked with
+         * What this side sent, woke and slept (`counts`), how often `afterSend` threw,
+         * and what it asked with
          * values, the most waited on first.
          *
-         * @returns {{ sent: number, woke: number, slept: number, calls: number, waitedMs: number,
-         *     asked: { name: string, count: number, waitedMs: number }[] }}
+         * @returns {{ sent: number, woke: number, slept: number, afterSendFailures: number,
+         *     calls: number, waitedMs: number, asked: { name: string, count: number, waitedMs: number }[] }}
          */
         diagnostics(){
             const rows = [...askedOf].map(([name, entry])=>({ name, ...entry }))
