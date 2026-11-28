@@ -352,8 +352,17 @@ test('a put makes no object of its own, its flags a word and its place the reade
         return undefined;
     }, { calls: 4000, empty });
     assert.ok(around > 0);
-    // The view a reserve hands out is about 96 bytes, and the read finds it.
-    assert.ok(reserved < 128, `${reserved.toFixed(1)} bytes a reserve, commit and read`);
+    // The view a reserve hands out, and the read finds it: what one view of
+    // shared memory costs moves with the engine (96 bytes on Node 22, more
+    // on Node 24), so the bound is that view, made here, and a little.
+    const shared = new SharedArrayBuffer(4096);
+    const view = await bytesPerCall(()=>{
+        n += new Uint8Array(shared, (n & 15) * 256, 256).length;
+        return undefined;
+    }, { calls: 4000, empty });
+    assert.ok(view > 0, `a view not measured (${view} bytes)`);
+    assert.ok(reserved < view + 32, `${reserved.toFixed(1)} bytes a reserve, commit and read, a view`
+        + ` ${view.toFixed(1)}`);
 });
 
 test('a reader that reserved many names keeps the reservations still open and the memory it'

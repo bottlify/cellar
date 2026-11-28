@@ -590,6 +590,31 @@ test('memory that is not a channel of this layout is refused at open, not read a
     assert.equal(openClient(memory).out(), 0);
 });
 
+/**
+ * The least a call answered later can make on this engine: its promise, one
+ * sleep on a word and the one reaction to it. What a promise costs moves with
+ * the engine (about 770 bytes on Node 22, more on Node 24), so a call's bound
+ * is against this, measured in the same run, never a number of bytes.
+ *
+ * @returns {Promise<number>}
+ */
+const answeredFloor = async()=>{
+    const word = new Int32Array(new SharedArrayBuffer(4));
+    const floor = await bytesPerCall(()=>{
+        /** @type {(value: number) => void} */
+        let resolve = ()=>{};
+        const promise = new Promise(settle=>{
+            resolve = settle;
+        });
+        const sleep = /** @type {any} */ (Atomics).waitAsync(word, 0, 0);
+        Atomics.notify(word, 0);
+        sleep.value.then(()=>resolve(4));
+        return promise;
+    });
+    assert.ok(floor > 0, `the floor not measured (${floor} bytes)`);
+    return floor;
+};
+
 test('a call answered makes its answer\'s promise and its one wait, not a pump a call', async()=>{
     // An async call, its taker's record and closures, a pump started for it
     // with its catch and finally, and a wait wrapped twice: 4.3 KB a call
@@ -611,7 +636,9 @@ test('a call answered makes its answer\'s promise and its one wait, not a pump a
         server.serve(handler);
         return answered;
     });
-    assert.ok(bytes < 1600, `${bytes.toFixed(0)} bytes a call`);
+    // 1.3 times the floor on Node 22; the pump a call made was over five times.
+    const floor = await answeredFloor();
+    assert.ok(bytes < 2 * floor, `${bytes.toFixed(0)} bytes a call, the floor ${floor.toFixed(0)}`);
     assert.equal(client.out(), 0);
 });
 
@@ -628,7 +655,10 @@ test('a serve on the event loop with a request waiting makes its answer\'s promi
     const settled = Promise.resolve();
     const bytes = await bytesPerCall(()=>Promise.all([client.call(message, options),
         server.serveAsync(handler)]), { empty: ()=>Promise.all([settled, settled]) });
-    assert.ok(bytes < 3200, `${bytes.toFixed(0)} bytes a call served`);
+    // A call and its serve, each a promise answered: 1.8 floors on Node 22;
+    // the serve that was async and wrapped a wait made about nine.
+    const floor = await answeredFloor();
+    assert.ok(bytes < 3 * floor, `${bytes.toFixed(0)} bytes a call served, the floor ${floor.toFixed(0)}`);
 });
 
 test('calls failed by a close reject, and the pump of answers starts again for the next', async()=>{
