@@ -205,3 +205,18 @@ test('a move or a release names a holder that is out, or is refused before any w
     assert.equal(account.release(who), 4096);
     assert.equal(account.release(who), 0, 'a holder released again gives nothing back');
 });
+
+test('a view of a holder released takes, gives and moves nothing: it is said, not done quietly', ()=>{
+    const memory = createAccountMemory({ limit: 1 << 20, kinds: { code: Infinity } });
+    const main = openAccount(memory);
+    const who = main.claim();
+    const gone = openAccount(memory, { holder: who });
+    assert.equal(gone.take(4096, 'code'), true);
+    assert.equal(main.release(who), 4096);
+    for (const call of [()=>gone.give(4096, 'code'), ()=>gone.take(4096, 'code'),
+        ()=>gone.overdraw(4096, 'code'), ()=>gone.move(4096, 'code', 0)])
+    {
+        assert.throws(call, /holder \d+ .*released/);
+    }
+    assert.equal(main.report().used, 0, 'nothing counted by the late calls');
+});

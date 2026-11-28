@@ -251,6 +251,19 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             }
         }
     };
+    /**
+     * This view's holder is out, or what it would take or give is no one's:
+     * a call after its release is said, never counted against whoever has
+     * the number next or nobody. (Once the number is claimed again, a late
+     * call reads as the new holder's - the contract: release only once
+     * nothing takes or gives for it.)
+     */
+    const out = ()=>{
+        if (holder !== RUN_HOLDER && load(HOLDERS_AT + holder * HOLDER_WORDS) === 0)
+        {
+            throw new RangeError(`account: holder ${holder} was released`);
+        }
+    };
     /** @param {number} kind @param {number} units */
     const tryTake = (kind, units)=>{
         const kindHeld = KINDS_AT + kind * KIND_WORDS;
@@ -308,6 +321,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
         memory,
         holder,
         take(bytes, kind){
+            out();
             const at = indexOf(kind);
             const units = unitsOf(bytes);
             if (units === 0 || tryTake(at, units))
@@ -333,6 +347,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             return false;
         },
         overdraw(bytes, kind){
+            out();
             const at = indexOf(kind);
             const units = unitsOf(bytes);
             add(KINDS_AT + at * KIND_WORDS + K_HELD, units);
@@ -344,6 +359,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             onOverdrawn({ kind, bytes, used: load(USED) * ACCOUNT_UNIT, limit: bytesOrNone(load(LIMIT)) });
         },
         give(bytes, kind){
+            out();
             const at = indexOf(kind);
             const given = takeFrom(holderWord(holder, at), unitsOf(bytes));
             if (given > 0)
@@ -352,6 +368,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             }
         },
         move(bytes, kind, to){
+            out();
             if (named(to, true) === holder)
             {
                 return;
