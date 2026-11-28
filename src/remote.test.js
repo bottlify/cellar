@@ -121,11 +121,11 @@ for (const carrier of /** @type {const} */ (['channel', 'link']))
             assert.equal(later?.[P_SEGMENT], 0);
             assert.equal(client.own('texels'), 'texels/1/');
             assert.equal(client.own('none'), null);
-            assert.deepEqual(client.release('a/', 2), { bodies: 2, bytes: 2 ** 33 + 5, waiting: 1 },
-                'a count past 32 bits whole; the hold taken back at once, the reservation waits');
+            assert.deepEqual(client.release('a/', 2), { bodies: 2, bytes: 2 ** 33 + 5, waiting: 0 },
+                'a count past 32 bits whole; the hold and the reservation taken back at once');
             assert.equal(client.release('gone/', 0), null);
             assert.deepEqual(await client.releaseLater('c/', 7), { bodies: 1, bytes: 2 ** 33 + 5,
-                waiting: 1 });
+                waiting: 0 });
             assert.deepEqual(calls.at(-1), ['release', 'c/', 7]);
             assert.equal(client.room(5000), true, 'the account has room already');
             assert.deepEqual(calls.at(-1), ['room', 8192], 'asked in whole units of 4 KiB');

@@ -1322,6 +1322,33 @@ export async function openKeeper(options){
         }
     };
 
+    /**
+     * Takes reservation `id` back, its state `word` (writing, or retired
+     * writing): its writer is taken for gone, what it would commit now fails,
+     * the mark being no reservation's any more, and its room is given back.
+     * False where the word moved meanwhile (the writer committed).
+     *
+     * @param {number} id @param {number} word
+     */
+    const takeBack = (id, word)=>{
+        const writing = stateOf(word) === WRITING;
+        if (Atomics.compareExchange(words, index.at(id) + R_STATE, word, stateWord(writing ? GONE : RETIRED))
+            !== word)
+        {
+            return false;
+        }
+        if (writing)
+        {
+            giveBack(id);
+            set(id, R_FLAGS, 0);
+        }
+        else
+        {
+            takeRetired(id);
+        }
+        return true;
+    };
+
     // --- disk ---------------------------------------------------------------
 
     /** @param {DiskFile} file */
@@ -2423,8 +2450,9 @@ export async function openKeeper(options){
         /**
          * Lets go of every body under the names that begin with `prefix`, as
          * an owner that goes takes what it held with it: what was there, and
-         * how many of those are still read or written (they go once no one
-         * reads them, as a `drop` of each would leave them).
+         * how many of those are still read (they go once no one reads them,
+         * as a `drop` of each would leave them). What it reserved and never
+         * committed, or holds, is taken back at once.
          *
          * @param {string} prefix
          * @returns {{ bodies: number, bytes: number, waiting: number }}
@@ -2443,19 +2471,13 @@ export async function openKeeper(options){
                 }
                 bodies++;
                 bytes += get(id, R_LENGTH);
-                // Memory held is its owner's alone and nobody reads it: the
-                // owner going is its holder going, so its room comes back now,
-                // as a reservation abandoned does - the sweep never takes it.
-                if (state === WRITING && (get(id, R_FLAGS) & F_HELD) !== 0)
+                // A reservation the owner made and never committed, and memory
+                // it held, are its alone and nobody reads them: the owner
+                // going is their writer going, so their room comes back now,
+                // as one held past abandonAfterMs does, and a late commit fails.
+                if ((state === WRITING || state === RETIRED_WRITING) && takeBack(id, stateWordOf(id)))
                 {
-                    const word = stateWordOf(id);
-                    if (Atomics.compareExchange(words, index.at(id) + R_STATE, word,
-                        stateWord(GONE)) === word)
-                    {
-                        giveBack(id);
-                        set(id, R_FLAGS, 0);
-                        continue;
-                    }
+                    continue;
                 }
                 // A name written anew is another record's now: its old body
                 // goes when its readers leave, by no drop.
@@ -2495,21 +2517,9 @@ export async function openKeeper(options){
                     && (get(id, R_FLAGS) & F_HELD) === 0
                     && age(at, get(id, R_TICK)) >= abandonAfterMs)
                 {
-                    // Its writer is taken for gone: what it would commit now
-                    // fails, the mark being no reservation's any more.
-                    const taken = stateWord(state === WRITING ? GONE : RETIRED);
-                    if (Atomics.compareExchange(words, index.at(id) + R_STATE, word, taken) === word)
+                    if (takeBack(id, word))
                     {
                         counts.takenBack++;
-                        if (state === WRITING)
-                        {
-                            giveBack(id);
-                            set(id, R_FLAGS, 0);
-                        }
-                        else
-                        {
-                            takeRetired(id);
-                        }
                     }
                     continue;
                 }

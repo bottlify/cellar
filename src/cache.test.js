@@ -964,7 +964,7 @@ test('a reservation let go of without a body is counted as its room goes back', 
 });
 
 test('an owner\'s names are let go together: what was under its prefix, and what is still read goes '
-    + 'once no one reads it; names of another prefix stay', async()=>{
+    + 'once no one reads it; what it reserved comes back at once; names of another prefix stay', async()=>{
     const { keeper, reader } = await cacheOf();
     for (const name of ['texels/1/a', 'texels/1/b', 'texels/10/a', 'texels/2/a', 'reads/x'])
     {
@@ -979,10 +979,12 @@ test('an owner\'s names are let go together: what was under its prefix, and what
     reader.with('texels/1/a', ()=>{
         released = keeper.release('texels/1/');
     });
-    assert.deepEqual(released, { bodies: 3, bytes: 2500, waiting: 2 },
-        'the one read and the one written wait for their readers and writer');
+    assert.deepEqual(released, { bodies: 3, bytes: 2500, waiting: 1 },
+        'the one read waits for its reader; the one reserved is taken back');
     assert.equal(reader.look('texels/1/b'), null, 'one no one held is gone at once');
-    assert.equal(reader.commit('texels/1/c'), true);
+    assert.equal(keeper.under('texels/1/').placedBytes, grainsOf(1000), 'the reservation\'s room back');
+    assert.equal(reader.commit('texels/1/c'), false, 'its owner went: a late commit fails');
+    assert.equal(reader.look('texels/1/c'), null);
     keeper.sweep();
     assert.deepEqual(keeper.under('texels/1/'), { bodies: 0, bytes: 0, hotBytes: 0, placedBytes: 0 },
         'no tail once they are let go of');
