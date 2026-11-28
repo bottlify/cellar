@@ -91,6 +91,9 @@ const LATER = 2;
 const WORD_CALL = 3;
 const READING = 4;
 
+/** How long a writer waits for room before it looks at what came in again. */
+const ROOM_LOOK_MS = 1;
+
 /** A link's rings, each way, by default: what a call and its values fit in, many times over. */
 const LINK_BYTES = 1 << 20;
 
@@ -281,7 +284,42 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      */
     const unsent = [];
     let unsentAt = 0;
+    /** Whether a flush is writing: one called from inside it, by what it handles while it waits, leaves the rest to it. */
+    let flushing = false;
     const partWords = new DataView(outbound.bytes.buffer);
+    /**
+     * Room for `length` bytes in the ring this side writes, waited for where
+     * the thread may block: the other side may itself be waiting for room in
+     * this side's ring, or be in this thread, so while there is none this
+     * side reads what came in and serves a side of this thread in place.
+     *
+     * @param {number} length
+     */
+    const roomFor = length=>{
+        for (;;)
+        {
+            const at = outbound.reserve(length);
+            if (at >= 0)
+            {
+                return at;
+            }
+            const served = servedHere(end.out.control);
+            if (pump() > 0 || served > 0)
+            {
+                continue;
+            }
+            if (served === 0)
+            {
+                throw new Error(`link: a record of ${length} bytes: the other side is in this`
+                    + ' thread and read nothing');
+            }
+            const waited = outbound.reserveWaiting(length, ROOM_LOOK_MS);
+            if (waited >= 0)
+            {
+                return waited;
+            }
+        }
+    };
     /**
      * Writes what waits to be written; a ring the other side closed takes
      * nothing more, and what waited goes to nobody.
@@ -289,6 +327,11 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      * @param {boolean} block
      */
     const flush = block=>{
+        if (flushing)
+        {
+            return;
+        }
+        flushing = true;
         try
         {
             for (; unsent.length > 0; unsent.shift(), unsentAt = 0)
@@ -305,7 +348,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
                         {
                             return;
                         }
-                        at = outbound.reserveWaiting(head + length);
+                        at = roomFor(head + length);
                     }
                     if (head > 0)
                     {
@@ -326,6 +369,10 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
                 unsentAt = 0;
             }
             throw e;
+        }
+        finally
+        {
+            flushing = false;
         }
     };
     /** @param {Uint8Array} record */
@@ -841,6 +888,7 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
      *
      * @param {number} id @param {string} target @param {string} method @param {any[]} args
      * @param {(value: any) => void} resolve @param {(error: Error) => void} reject
+     * @returns {Uint8Array}  the call's record
      */
     const sendCall = (id, target, method, args, resolve, reject)=>{
         const what = `${target}.${method}`;
@@ -851,7 +899,9 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
                 throw new RingClosed();
             }
             waiting.set(id, { resolve, reject, what });
-            send(encodeValue([CALL, id, target, method, args]));
+            const record = encodeValue([CALL, id, target, method, args]);
+            send(record);
+            return record;
         }
         catch (e){
             waiting.delete(id);
@@ -890,13 +940,21 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             const started = performance.now();
             /** @type {{ value?: any, error?: Error }} */
             const got = {};
-            sendCall(id, target, method, args, value=>{
+            const record = sendCall(id, target, method, args, value=>{
                 got.value = value;
             }, error=>{
                 got.error = error;
             });
             try
             {
+                // Made by what this side handles while it waits for room to
+                // send a record before it: it goes out only once that one
+                // has, which is after this wait.
+                if (flushing && unsent.includes(record))
+                {
+                    throw new Error(`link: ${target}.${method}: asked while this side waits to send`
+                        + ' a record before it, which it cannot send until this is answered');
+                }
                 waitFor(id, started + timeoutMs, `${target}.${method}`, timeoutMs);
             }
             finally

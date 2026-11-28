@@ -730,3 +730,62 @@ test('a hook after a send that throws fails no call: the call is answered, the n
     assert.equal(asking.diagnostics().afterSendFailures, 1);
     server.close();
 });
+
+test('a value longer than the ring crosses to a side of the same thread, and back, as the writer '
+    + 'waits for room', { timeout: 20000 }, async()=>{
+    // Both sides in one worker: the side waiting for room in its ring is the
+    // only one that can read it, by serving the other in place.
+    const worker = kept(new Worker(`
+        const { parentPort, workerData } = require('node:worker_threads');
+        import(workerData).then(({ createLinkMemory, openLink })=>{
+            const { a, b } = createLinkMemory({ capacity: 256 });
+            const server = openLink(a, { echo: { back: value=>value + '!' } });
+            const asking = openLink(b, {});
+            const long = 'x'.repeat(1024);
+            parentPort.postMessage(asking.ask('echo', 'back', [long]) === long + '!');
+            server.close();
+        });`, { eval: true, workerData: LINK }));
+    const answer = await Promise.race([new Promise(resolve=>worker.once('message', resolve)),
+        new Promise(resolve=>setTimeout(()=>resolve('held'), 10000))]);
+    assert.equal(answer, true, 'crossed, not held for good');
+});
+
+test('two blocked sides each sending a value longer than the ring both cross: each reads the other '
+    + 'while it waits for room', { timeout: 30000 }, async()=>{
+    const { a, b } = createLinkMemory({ capacity: 256 });
+    const body = `
+        const long = 'y'.repeat(2048);
+        return link.ask('echo', 'back', [long]) === long + '!';`;
+    const handlers = `{ echo: { back: value=>value + '!' } }`;
+    const both = Promise.all([blockingThread(a, body, handlers), blockingThread(b, body, handlers)]);
+    const answer = await Promise.race([both,
+        new Promise(resolve=>setTimeout(()=>resolve('held'), 15000))]);
+    assert.deepEqual(answer, [true, true], 'both crossed, not held for good');
+});
+
+test('a blocking call made while its side waits for room to send a record before it fails, said, '
+    + 'rather than wait for good', { timeout: 20000 }, async()=>{
+    const worker = kept(new Worker(`
+        const { parentPort, workerData } = require('node:worker_threads');
+        import(workerData).then(({ createLinkMemory, openLink })=>{
+            const { a, b } = createLinkMemory({ capacity: 256 });
+            let asking;
+            let inner = null;
+            // The server calls back as it reads the long value: the asking
+            // side handles that while it waits for room, and asks in turn.
+            const server = openLink(a, { echo: { back: value=>value.length } });
+            asking = openLink(b, { nested: { now: ()=>{
+                try { inner = asking.ask('echo', 'back', ['z']); }
+                catch (e) { inner = String(e.message); }
+                return null;
+            } } });
+            server.call('nested', 'now');
+            const length = asking.ask('echo', 'back', ['x'.repeat(1024)]);
+            parentPort.postMessage({ length, inner });
+            server.close();
+        });`, { eval: true, workerData: LINK }));
+    const answer = /** @type {any} */ (await Promise.race([new Promise(resolve=>worker.once('message', resolve)),
+        new Promise(resolve=>setTimeout(()=>resolve('held'), 10000))]));
+    assert.equal(answer.length, 1024);
+    assert.match(String(answer.inner), /waits to send a record before it/);
+});

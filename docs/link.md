@@ -56,6 +56,8 @@ if (link.answered()) use(link.answer[0]);
 
 The other side answers every call in place with a `words(request, answer, length)` handler run by `pump`, so also inside any wait: the slot's words, and the request's byte count; it returns the answer's byte count (the whole slot where it returns nothing). Or it takes the call itself with `takeWords()` (the request, or null) and answers it later with `reply` and `answerWords(failure, length)`. The two sides' calls nest: one side's call can be out while it answers the other's. A handler that throws, or `answerWords(failure)`, fails the call; the asker's `askBytes`, its promise, `answered` or `waitWords` throws the failure. Calls in place and value calls are each in order, not in order with each other.
 
+A value longer than a ring holds crosses in parts. A side that waits for room to write the next part reads what came in meanwhile, and serves a side of its own thread in place, so two sides sending long values to each other, or a link with both sides in one thread, both get through. What it handles while it waits may call back: a call that hands back a promise goes out after the record; one that blocks for its answer could only go out after the record and is refused with an error that says so.
+
 `afterSend` runs after every send has rung the other side, for a side whose peer must also be told another way, such as a word its running loop polls. The send is made by then, so what `afterSend` throws fails no call: it is counted (`diagnostics().afterSendFailures`) and handed to `onAfterSendFailure`, by default thrown where nothing catches it.
 
 ## Waiting, threads and closing
