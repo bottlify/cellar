@@ -843,6 +843,34 @@ test('a disk that fails to open a file as the keeper opens has every file it ope
         assert.deepEqual([...open], []);
     });
 
+test('ready settles once the pack opened ahead is open: true where bodies can go to the disk, false'
+    + ' with no disk or where the pack failed to open', async()=>{
+    const memory = memoryDisk();
+    /** @type {(() => void)[]} */
+    const later = [];
+    const slow = { ...memory, open: (/** @type {string} */ name)=>(name.startsWith('pack-')
+        ? new Promise(resolve=>later.push(()=>resolve(memory.open(name)))) : memory.open(name)) };
+    const keeper = await openKeeper({ budget: 256 * KIB, segmentBytes: 64 * KIB, disk: slow,
+        coldAfterMs: 0, now: ()=>0 });
+    let settled = false;
+    const ready = keeper.ready().then(answer=>{
+        settled = true;
+        return answer;
+    });
+    await settle();
+    assert.equal(settled, false, 'the pack still opening');
+    later.forEach(open=>open());
+    assert.equal(await ready, true);
+    assert.equal(await (await openKeeper({ budget: 256 * KIB, disk: null })).ready(), false, 'no disk');
+    const failing = crashDisk();
+    failing.failing.open.add('pack-0');
+    const refused = await openKeeper({ budget: 256 * KIB, disk: failing });
+    assert.equal(await refused.ready(), false, 'the pack refused');
+    assert.ok(refused.figures().diskFailures > 0);
+    keeper.close();
+    assert.equal(await keeper.ready(), false, 'closed');
+});
+
 test('a keeper closed twice, a pack opening between, lets go of each file once', async()=>{
     const base = memoryDisk();
     /** @type {string[]} */

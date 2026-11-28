@@ -2233,6 +2233,20 @@ export async function openKeeper(options){
         segmentBuffers: ()=>segments.map(one=>(one === null ? null : one.buffer)),
 
         /**
+         * Settles once no pack is opening: true where a body can go to the
+         * disk now (a pack is open to append to, or opened ahead), false
+         * where there is no disk, it is closed, or the pack failed to open
+         * (`diskFailures`). The packs open behind a promise, as files do on
+         * OPFS: what a run puts and saves before then stays in memory alone.
+         *
+         * @returns {Promise<boolean>}
+         */
+        ready: async()=>{
+            await nextPack?.catch(()=>{});
+            return disk !== null && (pack >= 0 || readyPack !== null);
+        },
+
+        /**
          * Room for `name`'s body of `length` bytes, in a segment below
          * `known`: true with the record, where to write and the reservation's
          * mark in `place` (`P_ID`...), or false with why counted. The writer
