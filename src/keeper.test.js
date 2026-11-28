@@ -1440,6 +1440,34 @@ test('a pass compacts a mebibyte at most past its first body; the next sweep mov
     }
 });
 
+test('a pack let go of is reclaimed once its file is gone: until then, and where the disk fails to'
+    + ' remove it, it is going, in the figures', async()=>{
+    for (const fails of [false, true])
+    {
+        const disk = crashDisk();
+        const { reader, keeper, step } = await cacheOf({ disk, packBytes: 16 * KIB });
+        reader.put('a', bodyOf(12 * KIB, 1));
+        step(150);
+        await settle();
+        reader.put('b', bodyOf(12 * KIB, 2));
+        step(150);
+        await settle();
+        // a written anew: pack-0 holds nothing live, and the save lets it go.
+        reader.put('a', bodyOf(12 * KIB, 3));
+        if (fails)
+        {
+            disk.failing.remove.add('pack-0');
+        }
+        keeper.save();
+        assert.deepEqual([keeper.figures().packsRemoved, keeper.figures().going,
+            keeper.figures().reclaimedBytes], [1, 1, 0], 'let go of, its file not gone yet');
+        await settle();
+        assert.deepEqual([keeper.figures().going, keeper.figures().reclaimedBytes],
+            fails ? [1, 0] : [0, 12 * KIB], fails ? 'left to the next run' : 'gone');
+        assert.equal(disk.current().has('pack-0'), fails);
+    }
+});
+
 test('a keeper opening an index lets go of the packs no body of it is in: what the run before'
     + ' wrote for itself', async()=>{
     const disk = memoryDisk();

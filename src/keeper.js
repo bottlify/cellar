@@ -1560,9 +1560,10 @@ export async function openKeeper(options){
     const removePack = number=>{
         const file = packs.get(number);
         const remover = disk;
+        /** What its file held as this run knew it: reclaimed once the file is gone. */
+        const bytes = filled.get(number) ?? 0;
         packs.delete(number);
         live.delete(number);
-        counts.reclaimedBytes += filled.get(number) ?? 0;
         filled.delete(number);
         durable.delete(number);
         if (number === pack)
@@ -1575,6 +1576,7 @@ export async function openKeeper(options){
         const gone = ()=>{
             going.delete(number);
             packsChanged = true;
+            counts.reclaimedBytes += bytes;
         };
         if (remover?.remove === undefined)
         {
@@ -2769,6 +2771,8 @@ export async function openKeeper(options){
                 indexBytes: shared.records.byteLength + shared.names.byteLength
                     + index.table().byteLength,
                 packs: packs.size,
+                // Let go of, the file not gone yet: removal pending, or failed and left to the next run.
+                going: going.size,
                 diskBytes: [...filled.values()].reduce((sum, bytes)=>sum + bytes, 0),
                 liveDiskBytes: [...live.values()].reduce((sum, bytes)=>sum + bytes, 0),
                 ...counts,
