@@ -87,46 +87,37 @@ test('a cell is an integer either way of zero: a value set is rounded, one not f
     assert.throws(()=>table.add(0, 0, Infinity), RangeError);
 });
 
-test('a cell its writer left between its two words is said, not read as a number', ()=>{
-    const memory = createTableMemory({ rows: 1, columns: ['n'] });
-    const table = openTable(memory);
-    table.set(0, 0, 7);
-    // What a writer that stopped after marking the high word busy leaves.
-    new Uint32Array(memory.buffer, 8)[1] = 0x40000000;
-    assert.throws(()=>table.get(0, 0), /half-written/);
-});
-
-test('a cell whose high word changes twice between a reader\'s two looks at it is not read torn',
+test('a cell read while its writer stores twice is one value the writer stored, never a mix',
     ()=>{
-    // -1, 5 and -3 have high words 0xffffffff, 0, 0xffffffff: a reader that
-    // looked at the high word, then the low one, then the high one again, with
-    // the writer storing 5 and then -3 between, saw the same high word twice.
-    const table = openTable(createTableMemory({ rows: 1, columns: ['delta'] }));
-    table.set(0, 0, -1);
-    const load = Atomics.load;
-    let looks = 0;
-    /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ index)=>{
-        const value = load(array, index);
-        if (++looks === 1)
-        {
-            table.set(0, 0, 5);
-        }
-        else if (looks === 2)
-        {
-            table.set(0, 0, -3);
-        }
-        return value;
-    };
-    let read;
-    try
+    // Two writes between a reader's looks that leave the high word as it was:
+    // -1, 5, -3 (highs 0xffffffff, 0, 0xffffffff) and 1, 2^32 + 2, 3 (0, 1,
+    // 0). Two 32-bit words checked high, low, high handed the reader -4294967291
+    // and 2; a version in a finite word only moves the chance.
+    for (const [first, ...then] of [[-1, 5, -3], [1, 2 ** 32 + 2, 3]])
     {
-        read = table.get(0, 0);
+        const table = openTable(createTableMemory({ rows: 1, columns: ['delta'] }));
+        table.set(0, 0, first);
+        const load = Atomics.load;
+        let looks = 0;
+        /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ index)=>{
+            const value = load(array, index);
+            if (looks < then.length)
+            {
+                table.set(0, 0, then[looks++]);
+            }
+            return value;
+        };
+        let read;
+        try
+        {
+            read = table.get(0, 0);
+        }
+        finally
+        {
+            /** @type {any} */ (Atomics).load = load;
+        }
+        assert.ok([first, ...then].includes(read), `${read} is a value the writer stored`);
     }
-    finally
-    {
-        /** @type {any} */ (Atomics).load = load;
-    }
-    assert.ok([-1, 5, -3].includes(read), `${read} is a value the writer stored`);
 });
 
 test('a value past 2^53 either way is refused, not stored for a reader to stall on', ()=>{

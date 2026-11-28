@@ -10,20 +10,16 @@
  * columns named once when the memory is made, and two counts: the rows that
  * carry something, and the rows ever taken from the ring.
  *
- * A cell is an integer, exact within 2^53 either way, in two Uint32 words
- * (low, high; two's complement); a fraction goes in units its column's
- * name says (nanoseconds, parts per million), rounded. One thread writes a
- * table with plain stores: an add that does not carry stores the low word,
- * read whole by the standard (ECMA-262 `IsNoTearConfiguration`). The high
- * word holds the value's high part in its low 23 bits and, above them, a
- * version the writer moves on each change of that part: a write to it marks
- * the word busy, then stores both through `Atomics`; a reader takes high,
- * low, high until the two highs are the same word and not busy. Without the
- * version, two writes between a reader's looks that left the high part as it
- * was (-1, 5, -3) read as the first high part and the second low word; with
- * it, that takes 128 changes of the high part between two loads. A row is
- * not read whole. The counts are atomic: a row filled before a count was
- * published is seen filled by a reader that read that count.
+ * A cell is an integer within 2^53 either way, a 64-bit word stored and
+ * loaded through `Atomics`; a fraction goes in units its column's name says
+ * (nanoseconds, parts per million), rounded. An atomic access of a
+ * `BigInt64Array` element is read whole by the standard, where a plain one
+ * is not (ECMA-262 `IsNoTearConfiguration`), and two 32-bit words with a
+ * check between them are not whole either: a writer that stores twice
+ * between a reader's looks and leaves the high word as it was (-1, 5, -3)
+ * hands it a value no write made, whatever version a finite word counts. A
+ * row is not read whole. The counts are atomic: a row filled before a count
+ * was published is seen filled by a reader that read that count.
  *
  * A table of slots (`slots: true`) is the same rows claimed by any thread:
  * each row has a word of its own, its generation and whether it is free,
@@ -39,18 +35,8 @@
 const USED = 0;
 const WRITTEN = 1;
 const HEADER_BYTES = 8;
-/** A high word no value within 2^53 has: the writer is between the words. */
-const BUSY = 0x40000000;
-/** A high word's value part, 23 bits of two's complement: every high part within 2^53. */
-const PART = 0x7fffff;
-/** A high word's version, below BUSY and above the value part. */
-const VERSION = 0x800000;
-const VERSIONS = 0x3f800000;
+/** The most a cell holds either way of zero: every integer up to it is exact. */
 const MOST = 2 ** 53;
-/** 2^53's high part. */
-const TOP = MOST / 2 ** 32;
-/** How long a reader looks at a cell whose words never agree before it says so. */
-const STUCK_MS = 1000;
 /** A slot's word: its generation above, its state in the two bits below. */
 const FREE = 0;
 const CLAIMING = 1;
@@ -111,47 +97,21 @@ export function openTable(memory){
     const { buffer, rows, columns, slots = false } = memory;
     const width = columns.length;
     const counts = new Int32Array(buffer, 0, 2);
-    const words = new Uint32Array(buffer, HEADER_BYTES, rows * width * 2);
+    const cells = new BigInt64Array(buffer, HEADER_BYTES, rows * width);
     /** A slot table's words, a row each: generation and state. */
-    const states = new Int32Array(buffer, HEADER_BYTES + words.byteLength, slots ? rows : 0);
-    /** A cell's low word. @param {number} at @param {number} column */
-    const cellOf = (at, column)=>(at * width + column) * 2;
+    const states = new Int32Array(buffer, HEADER_BYTES + cells.byteLength, slots ? rows : 0);
+    /** @param {number} at @param {number} column */
+    const cellOf = (at, column)=>at * width + column;
     /** The writer's: the cell at `cell` holds `value`. @param {number} cell @param {number} value */
     const put = (cell, value)=>{
         if (!Number.isInteger(value) || Math.abs(value) > MOST)
         {
             throw new RangeError(`table: ${value} is not a number a cell holds`);
         }
-        const part = Math.floor(value / 2 ** 32) & PART;
-        const was = words[cell + 1];
-        if ((was & PART) !== part)
-        {
-            Atomics.store(words, cell + 1, BUSY);
-            Atomics.store(words, cell, value >>> 0);
-            Atomics.store(words, cell + 1, (was + VERSION & VERSIONS | part) >>> 0);
-            return;
-        }
-        words[cell] = value >>> 0;
+        Atomics.store(cells, cell, BigInt(value));
     };
-    /** A high word's value part, its sign carried. @param {number} high */
-    const partOf = high=>(high << 9) >> 9;
     /** @param {number} at @param {number} column */
-    const get = (at, column)=>{
-        const cell = cellOf(at, column);
-        for (let since = 0; ; since ||= performance.now())
-        {
-            const high = Atomics.load(words, cell + 1);
-            const low = Atomics.load(words, cell);
-            if (high !== BUSY && Atomics.load(words, cell + 1) === high)
-            {
-                return partOf(high) * 2 ** 32 + low;
-            }
-            if (since > 0 && performance.now() - since > STUCK_MS)
-            {
-                throw new Error(`table: row ${at} column ${column} was left half-written`);
-            }
-        }
-    };
+    const get = (at, column)=>Number(Atomics.load(cells, cellOf(at, column)));
     /** @param {number} at */
     const row = at=>{
         /** @type {Record<string, number>} */
@@ -220,15 +180,19 @@ export function openTable(memory){
         columns,
         set: (at, column, value)=>put(cellOf(at, column), Math.round(value)),
         add: (at, column, amount)=>{
-            const cell = cellOf(at, column);
-            const low = words[cell] + Math.round(amount);
-            // Only 2^53's high part can be stepped past in the low word alone.
-            if (low >= 0 && low <= 0xffffffff && (words[cell + 1] & PART) !== TOP)
+            const by = Math.round(amount);
+            if (!Number.isInteger(by) || Math.abs(by) > MOST)
             {
-                words[cell] = low;
-                return;
+                throw new RangeError(`table: ${amount} is not a number a cell holds`);
             }
-            put(cell, partOf(words[cell + 1]) * 2 ** 32 + low);
+            const cell = cellOf(at, column);
+            // One writer: what it added it may take back before anyone else stores.
+            const was = Number(Atomics.add(cells, cell, BigInt(by)));
+            if (Math.abs(was + by) > MOST)
+            {
+                Atomics.store(cells, cell, BigInt(was));
+                throw new RangeError(`table: ${was} and ${amount} is not a number a cell holds`);
+            }
         },
         get,
         use: count=>{
