@@ -419,14 +419,20 @@ export function openKeeperClient(carrier, { onFailure = e=>{
     const intoPlace = { read: (/** @type {Uint8Array} */ answer)=>placeInto(answer, into) };
     const later = { read: placeLater };
     /** Sent and not waited on. @param {Uint8Array} sent */
-    const unwaited = sent=>{
-        carrier.call(sent, { read: answered }).catch(e=>{
-            if (!closedBy(e))
-            {
-                onFailure(e);
-            }
-        });
-    };
+    const unwaited = sent=>carrier.call(sent, { read: answered }).catch(e=>{
+        if (!closedBy(e))
+        {
+            onFailure(e);
+        }
+    });
+    /**
+     * The names a raise not waited on is out for: a reader that misses a cold
+     * body again before it is brought back asks nothing more, where every miss
+     * was a call queued behind the last.
+     *
+     * @type {Set<string>}
+     */
+    const raising = new Set();
     return {
         /** @type {import('./reader.js').KeeperCalls} */
         keeper: {
@@ -444,7 +450,14 @@ export function openKeeperClient(carrier, { onFailure = e=>{
                 }
             },
             raise: (name, { known })=>carrier.ask(write(RAISE, name, knownOf(known), 0, 0), { read: readYes }),
-            raiseLater: name=>unwaited(write(RAISE, name, -1, 0, 0)),
+            raiseLater: name=>{
+                if (raising.has(name))
+                {
+                    return;
+                }
+                raising.add(name);
+                unwaited(write(RAISE, name, -1, 0, 0)).finally(()=>raising.delete(name));
+            },
             // Waited on: whoever drops a name and asks for it next must find it
             // gone, as it would on the keeper's own thread.
             drop: name=>{

@@ -279,3 +279,33 @@ test('a reserve made while a blocking one waits, by a call its carrier serves me
     assert.equal(inner[0], 1, 'the call served meanwhile was answered first, into its place');
     assert.equal(outer[0], 2, 'the waiting reserve\'s answer is in its own place');
 });
+
+test('a raise not waited on is sent once for a name while one is in flight, and again once it is in',
+    async()=>{
+    /** @type {(() => void)[]} */
+    const settle = [];
+    let sent = 0;
+    /** @type {import('./remote.js').Carrier} */
+    const carrier = {
+        ask: ()=>{
+            throw new Error('not here');
+        },
+        call: (_request, { read })=>{
+            sent++;
+            return new Promise(resolve=>{
+                settle.push(()=>resolve(read(new Uint8Array(new Int32Array([0, 0, 0, 0, 0]).buffer))));
+            });
+        },
+    };
+    const client = openKeeperClient(carrier);
+    for (let i = 0; i < 5; i++)
+    {
+        client.keeper.raiseLater('cold/a');
+    }
+    client.keeper.raiseLater('cold/b');
+    assert.equal(sent, 2, 'one a name in flight');
+    settle.splice(0).forEach(done=>done());
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    client.keeper.raiseLater('cold/a');
+    assert.equal(sent, 3, 'asked again once the first is in');
+});
