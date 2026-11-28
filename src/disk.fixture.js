@@ -208,3 +208,39 @@ export function directoryDisk(directory){
         remove: name=>fs.rmSync(path.join(directory, name), { force: true }),
     };
 }
+
+/**
+ * A disk that refuses, as a synchronous OPFS handle does, a view of a
+ * buffer that can grow or be resized: what it reads and writes lies in
+ * memory of a fixed length.
+ *
+ * @returns {ReturnType<typeof memoryDisk>}
+ */
+export function fixedViewsDisk(){
+    const inner = memoryDisk();
+    /** @param {ArrayBufferView} view */
+    const check = view=>{
+        const buffer = /** @type {any} */ (view.buffer);
+        if (buffer.growable === true || buffer.resizable === true)
+        {
+            throw new TypeError('a view of a growable buffer is refused');
+        }
+    };
+    return {
+        ...inner,
+        async open(name){
+            const file = await inner.open(name);
+            return {
+                ...file,
+                read(view, options){
+                    check(view);
+                    return file.read(view, options);
+                },
+                write(view, options){
+                    check(view);
+                    return file.write(view, options);
+                },
+            };
+        },
+    };
+}

@@ -125,6 +125,16 @@ const COMPACT_PASS_BYTES = 1 << 20;
 /** What `append` answers where it wrote nothing: no pack open yet, or the disk refused. */
 const NOT_YET = -1;
 const REFUSED = -2;
+/** What `append` answers where the pack it copied from held less than asked, or threw. */
+const SOURCE_SHORT = -3;
+const SOURCE_FAILED = -4;
+/**
+ * The most a disk read or write of memory that may grow takes at once: such
+ * memory (an own segment's) goes through a fixed buffer of the keeper's in
+ * pieces of this, as a host's disk refuses a view of it, and so does a body
+ * moved from pack to pack - one bound, however large the body.
+ */
+const IO_PIECE = 1 << 20;
 
 /**
  * A file on the disk as the keeper uses it: the shape of a
@@ -1680,14 +1690,119 @@ export async function openKeeper(options){
     };
 
     /**
-     * Appends `bytes` to the pack bodies go to, flushed where asked: where it
-     * wrote them (in `pack`), or `NOT_YET` where the next pack is not open
-     * yet, or `REFUSED` where the disk failed, counted.
-     *
-     * @param {Uint8Array} bytes @param {boolean} flush
+     * Fixed memory the disk reads and writes go through where theirs may
+     * grow, at most `IO_PIECE`, made once it is first wanted.
      */
-    const append = (bytes, flush)=>{
-        const length = bytes.length;
+    let ioScratch = new Uint8Array(0);
+    /** @param {number} length */
+    const pieceOf = length=>{
+        const bytes = Math.min(length, IO_PIECE);
+        if (ioScratch.length < bytes)
+        {
+            ioScratch = new Uint8Array(Math.min(IO_PIECE, Math.max(bytes, ioScratch.length * 2)));
+        }
+        return ioScratch.subarray(0, bytes);
+    };
+    /** Whether a view's memory is of a fixed length, as a host's disk takes. @param {Uint8Array} view */
+    const fixedMemory = view=>{
+        const buffer = /** @type {any} */ (view.buffer);
+        return buffer.growable !== true && buffer.resizable !== true;
+    };
+    /**
+     * Writes `view` to `file` at `at`: at once where its memory is fixed, in
+     * pieces through the keeper's own otherwise. Whether all of it was.
+     *
+     * @param {DiskFile} file @param {number} at @param {Uint8Array} view
+     */
+    const writeTo = (file, at, view)=>{
+        if (fixedMemory(view))
+        {
+            return file.write(view, { at }) === view.length;
+        }
+        for (let done = 0; done < view.length;)
+        {
+            const piece = pieceOf(view.length - done);
+            piece.set(view.subarray(done, done + piece.length));
+            if (file.write(piece, { at: at + done }) !== piece.length)
+            {
+                return false;
+            }
+            done += piece.length;
+        }
+        return true;
+    };
+    /**
+     * Reads into `view` from `file` at `at`, as `writeTo` writes: the bytes read.
+     *
+     * @param {DiskFile} file @param {number} at @param {Uint8Array} view
+     */
+    const readFrom = (file, at, view)=>{
+        if (fixedMemory(view))
+        {
+            return file.read(view, { at });
+        }
+        let done = 0;
+        while (done < view.length)
+        {
+            const piece = pieceOf(view.length - done);
+            const read = file.read(piece, { at: at + done });
+            view.set(piece.subarray(0, read), done);
+            done += read;
+            if (read < piece.length)
+            {
+                break;
+            }
+        }
+        return done;
+    };
+    /**
+     * Copies `length` bytes of pack `from` at `fromAt` to `file` at `at`, a
+     * piece at a time: true where all of them were written, `SOURCE_SHORT`
+     * or `SOURCE_FAILED` where the pack read held fewer or threw, false where
+     * the write did not take them.
+     *
+     * @param {DiskFile} file @param {number} at @param {DiskFile} from
+     * @param {number} fromAt @param {number} length
+     */
+    const copyTo = (file, at, from, fromAt, length)=>{
+        for (let done = 0; done < length;)
+        {
+            const piece = pieceOf(length - done);
+            let read = -1;
+            try
+            {
+                read = from.read(piece, { at: fromAt + done });
+            }
+            catch
+            {
+                return SOURCE_FAILED;
+            }
+            if (read !== piece.length)
+            {
+                return SOURCE_SHORT;
+            }
+            if (file.write(piece, { at: at + done }) !== piece.length)
+            {
+                return false;
+            }
+            done += piece.length;
+        }
+        return true;
+    };
+
+    /**
+     * Appends a body of `length` bytes to the pack bodies go to, flushed
+     * where asked: from `view`, or from pack `from` at `fromAt`. Where it
+     * wrote them (in `pack`), or `NOT_YET` where the next pack is not open
+     * yet, `REFUSED` where the disk failed, counted, and `SOURCE_SHORT` or
+     * `SOURCE_FAILED` where the pack copied from held less or threw. Where it
+     * wrote them only once they are all written: a body cut short is no
+     * body, and the next is written over it.
+     *
+     * @param {number} length @param {boolean} flush @param {Uint8Array | null} view
+     * @param {DiskFile | null} [from] @param {number} [fromAt]
+     */
+    const append = (length, flush, view, from = null, fromAt = 0)=>{
         if (pack < 0 || packTop + length > packBytes)
         {
             // Past the packs a run reads back, the disk is full: an index of
@@ -1711,7 +1826,13 @@ export async function openKeeper(options){
         {
             // A disk that wrote less than asked holds no body: what it wrote is
             // written over by the next one.
-            if (file.write(bytes, { at: packTop }) !== length)
+            const written = view !== null ? writeTo(file, packTop, view)
+                : copyTo(file, packTop, /** @type {DiskFile} */ (from), fromAt, length);
+            if (written === SOURCE_SHORT || written === SOURCE_FAILED)
+            {
+                return written;
+            }
+            if (written !== true)
             {
                 counts.diskFailures++;
                 refused = true;
@@ -1749,7 +1870,7 @@ export async function openKeeper(options){
         const length = get(id, R_LENGTH);
         const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[get(id, R_SEGMENT)]);
         const offset = get(id, R_OFFSET);
-        const at = append(one.bytes.subarray(offset, offset + length), flush);
+        const at = append(length, flush, one.bytes.subarray(offset, offset + length));
         if (at < 0)
         {
             return false;
@@ -2021,8 +2142,8 @@ export async function openKeeper(options){
         let read = -1;
         try
         {
-            read = /** @type {DiskFile} */ (packs.get(get(id, R_PACK))).read(one.bytes.subarray(offset,
-                offset + length), { at: get(id, R_PACK_OFFSET) });
+            read = readFrom(/** @type {DiskFile} */ (packs.get(get(id, R_PACK))), get(id, R_PACK_OFFSET),
+                one.bytes.subarray(offset, offset + length));
         }
         catch
         {
@@ -2056,9 +2177,6 @@ export async function openKeeper(options){
     };
 
     // --- room on the disk ---------------------------------------------------
-
-    /** Bytes a body is read into on its way from one pack to another. */
-    let carry = new Uint8Array(0);
 
     /**
      * Takes every body out of pack `number`, so the next save lets go of it:
@@ -2106,48 +2224,27 @@ export async function openKeeper(options){
             {
                 return;
             }
-            /** @type {Uint8Array} */
-            let bytes;
-            if (state === HOT)
+            // A hot body is not written while it is hot: memory holds the
+            // copy's bytes. A cold one goes from pack to pack a piece at a time.
+            const one = state === HOT ? segments[get(id, R_SEGMENT)] : null;
+            const at = one ? append(length, (flags & F_ONLY_COPY) !== 0,
+                one.bytes.subarray(get(id, R_OFFSET), get(id, R_OFFSET) + length))
+                : append(length, (flags & F_ONLY_COPY) !== 0, null, from, get(id, R_PACK_OFFSET));
+            if (at === SOURCE_SHORT && (flags & F_ONLY_COPY) === 0)
             {
-                // A hot body is not written while it is hot: memory holds the copy's bytes.
-                const one = /** @type {NonNullable<typeof segments[0]>} */ (segments[get(id, R_SEGMENT)]);
-                bytes = one.bytes.subarray(get(id, R_OFFSET), get(id, R_OFFSET) + length);
+                // The pack holds less than the index says: the body is gone.
+                forgetDisk(id);
+                set(id, R_FLAGS, 0);
+                store(id, GONE);
+                counts.lostOnDisk++;
+                continue;
             }
-            else
+            if (at === SOURCE_SHORT || at === SOURCE_FAILED)
             {
-                if (carry.length < length)
-                {
-                    carry = new Uint8Array(length);
-                }
-                bytes = carry.subarray(0, length);
-                /** Bytes read, -1 where the disk threw. */
-                let read = -1;
-                try
-                {
-                    read = from.read(bytes, { at: get(id, R_PACK_OFFSET) });
-                }
-                catch
-                {
-                    // A disk that threw: counted below.
-                }
-                if (read >= 0 && read !== length && (flags & F_ONLY_COPY) === 0)
-                {
-                    // The pack holds less than the index says: the body is gone.
-                    forgetDisk(id);
-                    set(id, R_FLAGS, 0);
-                    store(id, GONE);
-                    counts.lostOnDisk++;
-                    continue;
-                }
-                if (read !== length)
-                {
-                    counts.diskFailures++;
-                    setAside.add(number);
-                    return;
-                }
+                counts.diskFailures++;
+                setAside.add(number);
+                return;
             }
-            const at = append(bytes, (flags & F_ONLY_COPY) !== 0);
             if (at < 0)
             {
                 return;
@@ -3005,9 +3102,8 @@ export async function openKeeper(options){
             changed.clear();
             slots.length = 0;
             readyPack = null;
-            // A body as large as the largest moved between packs: no pack is
-            // emptied any more.
-            carry = new Uint8Array(0);
+            // The disk's pieces: nothing is read or written any more.
+            ioScratch = new Uint8Array(0);
             return whole;
         },
 
@@ -3054,6 +3150,8 @@ export async function openKeeper(options){
                     own.reduce((sum, one)=>sum + one.bytes.length - one.length, 0)),
                 indexBytes: shared.records.byteLength + shared.names.byteLength
                     + index.table().byteLength,
+                // The fixed memory disk reads and writes of growable memory go through.
+                ioScratchBytes: ioScratch.length,
                 packs: packs.size,
                 // Let go of, the file not gone yet: removal pending, or failed and left to the next run.
                 going: going.size,

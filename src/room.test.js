@@ -15,6 +15,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cacheOf } from './cache.fixture.js';
+import { fixedViewsDisk } from './disk.fixture.js';
 import { createAccountMemory, openAccount } from './account.js';
 import { reserveFlags } from './shared.js';
 
@@ -137,4 +138,47 @@ test('an own segment the engine would not make once is made again when a large b
     {
         /** @type {any} */ (globalThis).SharedArrayBuffer = Real;
     }
+});
+
+test('a body of its own segment goes to a disk that takes only views of fixed memory, and comes back',
+    async()=>{
+    const { reader, keeper, step } = await cacheOf({ budget: 256 * KIB, segmentBytes: 64 * KIB,
+        disk: fixedViewsDisk() });
+    const body = Uint8Array.from({ length: 40000 }, (_, i)=>i * 7);
+    assert.equal(reader.put('big', body, ONLY), true);
+    assert.equal(reader.put('small', bytes(5000, 9), ONLY), true);
+    step(200);
+    step(200);
+    assert.deepEqual([reader.look('big'), reader.look('small')], ['cold', 'cold']);
+    assert.equal(keeper.figures().diskFailures, 0);
+    assert.equal(keeper.raise('big'), true);
+    assert.deepEqual(reader.with('big', read=>read.slice()), body);
+});
+
+test('a body moved from one pack to another passes through memory of a fixed bound, not its own length',
+    async()=>{
+    // A pack mostly dead: a cold only copy of 1.5 MiB in it is moved to the
+    // next pack by the sweep, read and written through the keeper's memory.
+    const MIB = 1024 * KIB;
+    const { reader, keeper, step } = await cacheOf({ budget: 16 * MIB, segmentBytes: MIB,
+        disk: fixedViewsDisk(), packBytes: 8 * MIB });
+    const body = Uint8Array.from({ length: 1.5 * MIB }, (_, i)=>i * 13);
+    assert.equal(reader.put('dead', bytes(6.5 * MIB)), true);
+    assert.equal(reader.put('big', body, ONLY), true);
+    step(200);
+    step(200);
+    assert.deepEqual([reader.look('dead'), reader.look('big')], ['cold', 'cold']);
+    // The next pack opens behind a promise, as on OPFS.
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    assert.equal(reader.put('next', bytes(MIB, 4)), true, 'the next pack');
+    step(200);
+    step(200);
+    assert.equal(reader.look('next'), 'cold');
+    reader.drop('dead');
+    const moved = keeper.figures().compactedBytes;
+    step(200);
+    assert.ok(keeper.figures().compactedBytes > moved, 'the sweep moved the only copy');
+    assert.ok(keeper.figures().ioScratchBytes <= MIB, `${keeper.figures().ioScratchBytes} bytes`);
+    assert.equal(keeper.raise('big'), true);
+    assert.deepEqual(reader.with('big', read=>read.slice()), body);
 });
