@@ -658,3 +658,38 @@ test('a blocking ask to a server on the same thread is served in place, not wait
         'no wait on this thread: the serving side is taken to be elsewhere');
 });
 
+
+test('an ask that finds every slot out to a server of its own thread has it make room, in order',
+    async()=>{
+    for (const slots of [1, 2])
+    {
+        const memory = createChannel({ slots, slotBytes: 8 });
+        const server = openServer(memory);
+        /** @type {number[]} */
+        const seen = [];
+        const handler = (/** @type {Uint8Array} */ request)=>{
+            seen.push(request[0]);
+            return Uint8Array.of(request[0] * 2);
+        };
+        const served = server.serveAsync(handler);
+        const client = openClient(memory);
+        const calls = Array.from({ length: slots }, (_, i)=>client.call([i + 1]));
+        assert.deepEqual([...client.ask([9], { timeoutMs: 1000 })], [18], `${slots} slots`);
+        assert.deepEqual(await Promise.all(calls.map(async call=>[...await call])),
+            Array.from({ length: slots }, (_, i)=>[(i + 1) * 2]));
+        assert.deepEqual(seen, [...Array.from({ length: slots }, (_, i)=>i + 1), 9], 'in order');
+        await served;
+        server.close();
+    }
+});
+
+test('a serve on the event loop with a time that is no time is refused and leaves nothing waiting',
+    async()=>{
+    const memory = createChannel({ slots: 1, slotBytes: 8 });
+    const server = openServer(memory);
+    await assert.rejects(server.serveAsync(()=>Uint8Array.of(1), { timeoutMs: NaN }), RangeError);
+    const client = openClient(memory);
+    assert.throws(()=>client.ask([1], { timeoutMs: 50 }), /no answer in 50 ms/,
+        'no server of this thread is left to answer in place');
+    server.close();
+});

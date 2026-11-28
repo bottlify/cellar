@@ -556,7 +556,9 @@ export function openClient(memory, options = {}){
             const deadline = deadlineOf(timeoutMs);
             for (sendQueued(); queued.length > 0 || (asked - read) >>> 0 >= slots; sendQueued())
             {
-                if (Atomics.load(words, ANSWERED) === read
+                // A server of this thread waiting in `serveAsync` makes room only here.
+                if (Atomics.load(words, ANSWERED) === read && servedHere(memory) <= 0
+                    && Atomics.load(words, ANSWERED) === read
                     && !end.waitFor(ANSWERED, read, CLIENT_SLEEPS, deadline))
                 {
                     throw new Error(`channel: no room in ${timeoutMs} ms`);
@@ -764,8 +766,11 @@ export function openServer(memory, options = {}){
                 {
                     return Promise.resolve(answerAll(handler));
                 }
+                // The deadline first: a time that is no time throws before a
+                // serve here is left waiting with no wait to end it.
+                const deadline = deadlineOf(options?.timeoutMs);
                 const waited = serveHere(memory, ()=>answerAll(handler));
-                return end.waitForAsync(ASKED, taken, SERVER_SLEEPS, deadlineOf(options?.timeoutMs))
+                return end.waitForAsync(ASKED, taken, SERVER_SLEEPS, deadline)
                     .finally(waited)
                     .then(moved=>(moved ? answerAll(handler) : 0));
             }
