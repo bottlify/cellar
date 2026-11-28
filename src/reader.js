@@ -175,6 +175,17 @@ export function createReader({ shared, segments = [], keeper }){
      * @type {(Uint8Array | undefined)[]}
      */
     const bodyViews = [];
+    /**
+     * The records a view in `bodyViews` was made over each segment's memory
+     * for, by its buffer: the ones a segment let go of drops (`adopt`), where
+     * walking every record's view made each of the segments a large body has
+     * of its own cost the whole cache (58 us a large body put, read and
+     * dropped, 416 us beside 10000 bodies read). A record is listed once a
+     * buffer, when its view first lies over it.
+     *
+     * @type {Map<ArrayBufferLike, number[]>}
+     */
+    const viewsOver = new Map();
 
     /**
      * The view of record `id`'s room, `length` bytes at `offset` of `view`:
@@ -187,6 +198,18 @@ export function createReader({ shared, segments = [], keeper }){
         if (body === undefined || body.buffer !== view.buffer
             || body.byteOffset !== view.byteOffset + offset || body.length !== length)
         {
+            if (body?.buffer !== view.buffer)
+            {
+                const over = viewsOver.get(view.buffer);
+                if (over === undefined)
+                {
+                    viewsOver.set(view.buffer, [id]);
+                }
+                else
+                {
+                    over.push(id);
+                }
+            }
             body = view.subarray(offset, offset + length);
             bodyViews[id] = body;
         }
@@ -437,13 +460,14 @@ export function createReader({ shared, segments = [], keeper }){
                 views[message.segment] = message.buffer ? new Uint8Array(message.buffer) : null;
                 if (before)
                 {
-                    for (let id = 0; id < bodyViews.length; id++)
+                    for (const id of viewsOver.get(before.buffer) ?? [])
                     {
                         if (bodyViews[id]?.buffer === before.buffer)
                         {
                             bodyViews[id] = undefined;
                         }
                     }
+                    viewsOver.delete(before.buffer);
                 }
                 while (heard < views.length && views[heard] !== undefined)
                 {
