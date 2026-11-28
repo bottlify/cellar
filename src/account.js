@@ -150,7 +150,8 @@ export function createAccountMemory({ limit, kinds }){
  *     holder holds handed to holder `to`, the sum unchanged
  * @property {() => number} claim  a holder no one holds (`RUN_HOLDER` where every one is)
  * @property {(holder: number) => number} release  every kind `holder` holds
- *     given back at once: the bytes
+ *     given back at once: the bytes. Only once nothing takes or gives for it:
+ *     its number is the next claim's.
  * @property {(kind: string) => number} heldBy  what this view's holder holds of `kind`
  * @property {(bytes: number, kind?: string) => boolean} fits  whether `bytes`
  *     more would fit now (of `kind`, its ceiling as well)
@@ -275,8 +276,11 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
     /** @param {number} units */
     const bytesOrNone = units=>(units === NONE ? null : units * ACCOUNT_UNIT);
     /**
-     * Takes up to `units` from word `at`, never past what it holds: a give
-     * that comes after its holder was released takes nothing from the others.
+     * Takes up to `units` from word `at`, never past what it holds. A holder
+     * is released only once nothing takes or gives for it (`release`): a
+     * view of it used after that counts against whoever claims its number
+     * next, which no check here could tell from that holder's own give
+     * without the two being one atomic word.
      *
      * @param {number} at @param {number} units
      */
