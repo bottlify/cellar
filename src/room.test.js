@@ -182,3 +182,47 @@ test('a body moved from one pack to another passes through memory of a fixed bou
     assert.equal(keeper.raise('big'), true);
     assert.deepEqual(reader.with('big', read=>read.slice()), body);
 });
+
+test('a body of its own segment cut short on the disk is no body there: it stays, and once saved '
+    + 'whole a keeper opened again reads it back', async()=>{
+    // 2.5 MiB, written in pieces of at most 1 MiB; the second piece cut in half.
+    const MIB = 1024 * KIB;
+    const inner = fixedViewsDisk();
+    let cut = false;
+    let pieces = 0;
+    /** @type {import('./keeper.js').Disk} */
+    const disk = {
+        ...inner,
+        async open(name){
+            const file = await inner.open(name);
+            return { ...file, write(view, where){
+                if (cut && name.startsWith('pack') && ++pieces === 2)
+                {
+                    return file.write(view.subarray(0, view.length >> 1), where);
+                }
+                return file.write(view, where);
+            } };
+        },
+    };
+    const body = Uint8Array.from({ length: 2.5 * MIB }, (_, i)=>i * 17 + (i >> 12));
+    const first = await cacheOf({ budget: 16 * MIB, segmentBytes: MIB, disk });
+    cut = true;
+    assert.equal(first.reader.put('big', body, ONLY), true);
+    first.step(200);
+    first.step(200);
+    assert.equal(first.reader.look('big'), 'hot', 'an only copy the disk did not take whole stays');
+    assert.ok(first.keeper.figures().diskFailures > 0, 'the cut said');
+    cut = false;
+    // The pack the cut body was refused by is left; the next opens behind a promise.
+    for (let tries = 0; tries < 10 && first.reader.look('big') === 'hot'; tries++)
+    {
+        await new Promise(resolve=>setTimeout(resolve, 0));
+        first.step(200);
+    }
+    assert.equal(first.reader.look('big'), 'cold', 'written whole once the disk takes it');
+    assert.equal(first.keeper.save(), true);
+    first.keeper.close();
+    const second = await cacheOf({ budget: 16 * MIB, segmentBytes: MIB, disk });
+    assert.deepEqual(second.reader.with('big', read=>read.slice(), { wait: true }), body,
+        'read back whole by a keeper opened again');
+});
