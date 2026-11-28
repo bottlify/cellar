@@ -1331,12 +1331,18 @@ export async function openKeeper(options){
      * Takes reservation `id` back, its state `word` (writing, or retired
      * writing): its writer is taken for gone, what it would commit now fails,
      * the mark being no reservation's any more, and its room is given back.
-     * False where the word moved meanwhile (the writer committed).
+     * False where the word moved meanwhile (the writer committed). The word
+     * is the one its caller looked at: one loaded again here could be a body
+     * committed and read since, which is no reservation to take back.
      *
      * @param {number} id @param {number} word
      */
     const takeBack = (id, word)=>{
         const writing = stateOf(word) === WRITING;
+        if (!writing && stateOf(word) !== RETIRED_WRITING)
+        {
+            throw new Error(`cache: record ${id} taken back from state ${stateOf(word)}, not a writer's`);
+        }
         if (Atomics.compareExchange(words, index.at(id) + R_STATE, word, stateWord(writing ? GONE : RETIRED))
             !== word)
         {
@@ -2464,12 +2470,15 @@ export async function openKeeper(options){
          */
         release(prefix){
             checkName(prefix);
+            // Reservations let go of, this owner's among them: their room back now.
+            takeLetGo();
             let bodies = 0;
             let bytes = 0;
             let waiting = 0;
             for (let id = 0; id < words[H_COUNT]; id++)
             {
-                const state = stateOf(stateWordOf(id));
+                const word = stateWordOf(id);
+                let state = stateOf(word);
                 if (state === GONE || !namedUnder(id, prefix))
                 {
                     continue;
@@ -2480,9 +2489,18 @@ export async function openKeeper(options){
                 // it held, are its alone and nobody reads them: the owner
                 // going is their writer going, so their room comes back now,
                 // as one held past abandonAfterMs does, and a late commit fails.
-                if ((state === WRITING || state === RETIRED_WRITING) && takeBack(id, stateWordOf(id)))
+                if (state === WRITING || state === RETIRED_WRITING)
                 {
-                    continue;
+                    if (takeBack(id, word))
+                    {
+                        continue;
+                    }
+                    // Committed since it was looked at, and maybe read: a body now.
+                    state = stateOf(stateWordOf(id));
+                    if (state === GONE)
+                    {
+                        continue;
+                    }
                 }
                 // A name written anew is another record's now: its old body
                 // goes when its readers leave, by no drop.

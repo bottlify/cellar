@@ -14,7 +14,7 @@ import { bodyOf, cacheOf, placeOf } from './cache.fixture.js';
 import { BASE, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, HOT, H_COUNT, R_FLAGS, R_LENGTH, R_NAME,
-    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, hashName, reserveFlags, viewIndex,
+    R_NAME_LENGTH, R_PACK, R_PACK_OFFSET, R_STATE, hashName, reserveFlags, viewIndex,
 } from './shared.js';
 
 const KIB = 1024;
@@ -2462,4 +2462,51 @@ test('a body being raised whose copy a failed flush let go of while room was mad
     const failures = keeper.figures().diskFailures;
     assert.equal(reader.with('block', ()=>1, { wait: true }), undefined);
     assert.equal(keeper.figures().diskFailures, failures, 'nothing left to read from no pack');
+});
+
+test('an owner released while its writer commits and a reader enters leaves the body to that '
+    + 'reader, not taken back from under it', async()=>{
+    // release looks at a record's state once; a commit and a reader's entry
+    // between that look and the take-back must not free the body read.
+    const { keeper, reader } = await cacheOf();
+    const view = /** @type {Uint8Array} */ (reader.reserve('p/a', 4096));
+    view.fill(17);
+    const index = viewIndex(keeper.shared);
+    const id = index.find('p/a');
+    const load = Atomics.load;
+    let moved = false;
+    /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ at)=>{
+        const value = load(array, at);
+        if (!moved && array.buffer === index.cover(id).buffer && at === index.at(id) + R_STATE)
+        {
+            moved = true;
+            /** @type {any} */ (Atomics).load = load;
+            assert.equal(reader.commit('p/a'), true);
+            assert.equal(index.enter(id), true, 'a reader in');
+        }
+        return value;
+    };
+    let left;
+    try
+    {
+        left = keeper.release('p/');
+    }
+    finally
+    {
+        /** @type {any} */ (Atomics).load = load;
+    }
+    assert.equal(moved, true);
+    assert.deepEqual(left, { bodies: 1, bytes: 4096, waiting: 1 }, 'waiting for its reader');
+    assert.equal(reader.put('q', new Uint8Array(4096).fill(42)), true);
+    assert.equal(view[0], 17, 'the body read is still its own');
+    index.leave(id);
+});
+
+test('a release takes back at once what a reservation let go of left, as a reserve would', async()=>{
+    const { keeper, reader } = await cacheOf();
+    assert.ok(reader.reserve('p/a', 4096));
+    reader.abandon('p/a');
+    assert.equal(keeper.figures().placedBytes, 4096, 'let go of, its room not taken back yet');
+    keeper.release('p/');
+    assert.equal(keeper.figures().placedBytes, 0);
 });
