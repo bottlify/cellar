@@ -25,6 +25,7 @@ export function memoryDisk({ remove = true } = {}){
         ...remove ? { remove: (/** @type {string} */ name)=>{
             files.delete(name);
         } } : {},
+        names: ()=>files.keys(),
         async open(name){
             if (!files.has(name))
             {
@@ -104,6 +105,7 @@ export function crashDisk(start = new Map(), { remove = true } = {}){
     };
     /** @type {import('./keeper.js').Disk} */
     const disk = {
+        names: ()=>held.keys(),
         async open(name){
             if (failing.open.has(name))
             {

@@ -2081,13 +2081,32 @@ test('pack numbers are given from past the highest either index file names, not 
     assert.deepEqual(packsOf(disk.current()).files, ['pack-2', 'pack-7', 'pack-8'], 'pack-8 opened ahead');
     later.keeper.close();
 
-    // A file a crash left before any index listed it: its number given again, what it held cut.
+    // A file a crash left before any index listed it, on a disk that cannot
+    // say what it holds: its number given again, what it held cut.
     const left = crashDisk(new Map([['pack-0', bodyOf(50 * KIB, 5)]]));
-    const again = await cacheOf({ disk: left });
+    const again = await cacheOf({ disk: { ...left, names: undefined } });
     again.reader.put('a', bodyOf(4000, 6));
     again.step(150);
     again.keeper.close();
     assert.equal(left.current().get('pack-0')?.length, 4000);
+});
+
+test('a pack file no index names is let go of as the keeper opens, where the disk says what it'
+    + ' holds: removed, or cut where it cannot be removed, and its number not given again', async()=>{
+    for (const remove of [true, false])
+    {
+        const left = crashDisk(new Map([['index-a', baseOf(3, 2, [1], [['x', 1, 100]])],
+            ['pack-1', bodyOf(100, 3)], ['pack-4', bodyOf(50 * KIB, 5)], ['pack-x', bodyOf(10, 1)]]),
+        { remove });
+        const run = await cacheOf({ disk: left });
+        await settle();
+        assert.equal(run.keeper.figures().strayPacks, 1);
+        assert.deepEqual(run.reader.with('x', body=>[...body], { wait: true }), [...bodyOf(100, 3)]);
+        assert.equal(left.current().get('pack-4')?.length, remove ? undefined : 0, 'its bytes gone');
+        assert.ok(left.current().has('pack-5'), 'the next pack opened past it');
+        assert.ok(left.current().has('pack-x'), 'a file of no pack\'s name is not the keeper\'s');
+        run.keeper.close();
+    }
 });
 
 test('readSaved trusts no more than a keeper opening the index: an entry of 0.9.0 at a negative offset'

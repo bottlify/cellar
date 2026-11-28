@@ -150,6 +150,8 @@ const REFUSED = -2;
  * @typedef {Object} Disk
  * @property {(name: string) => DiskFile | Promise<DiskFile>} open  made where missing
  * @property {(name: string) => void | Promise<void>} [remove]
+ * @property {() => Iterable<string> | Promise<Iterable<string>>} [names]  the files it holds:
+ *     where given, a pack file no index names is let go of as the keeper opens
  */
 
 /**
@@ -334,7 +336,7 @@ export async function openKeeper(options){
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
         segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
         reclaimedBytes: 0, evicted: 0, lostAtClose: 0, takenBack: 0, oldestListed: 0,
-        released: 0, releasedBytes: 0, peakSegmentBytes: 0, roomAsked: 0, roomMade: 0, roomRefused: 0,
+        released: 0, releasedBytes: 0, strayPacks: 0, peakSegmentBytes: 0, roomAsked: 0, roomMade: 0, roomRefused: 0,
     };
 
     /**
@@ -2089,19 +2091,43 @@ export async function openKeeper(options){
             slots.push({ file: await disk.open(name), end: 0, onlyCopies: new Set() });
         }
         const read = slots.map((slot, at)=>readIndex(slot.file, INDEX_FILES[at]));
+        /** The packs either file names. @type {Set<number>} */
+        const named = new Set();
         read.forEach((state, at)=>{
             slots[at].onlyCopies = state?.onlyCopies ?? new Set();
-            // Numbers given from past the highest either file names, not from
-            // the count the run before reached: a pack let go of gives its
-            // number back, so the numbers a run reads never run out.
-            /** @param {number} number */
-            const named = number=>{
-                nextPackNumber = Math.max(nextPackNumber, number + 1);
-            };
-            state?.packs.forEach(named);
-            state?.onlyCopies.forEach(named);
-            state?.entries.forEach(entry=>named(entry.pack));
+            state?.packs.forEach(number=>named.add(number));
+            state?.onlyCopies.forEach(number=>named.add(number));
+            state?.entries.forEach(entry=>named.add(entry.pack));
         });
+        // A pack file no index names: a run that ended before a save listed a
+        // pack it opened left it, and what it holds is no one's.
+        /** @type {number[]} */
+        const strays = [];
+        for (const name of await disk.names?.() ?? [])
+        {
+            const number = Number(name.slice(name.indexOf('-') + 1));
+            if (packFile(number) === name && !named.has(number))
+            {
+                strays.push(number);
+            }
+        }
+        // Numbers given from past the highest either file names or a file
+        // holds, not from the count the run before reached: a pack let go of
+        // gives its number back, so the numbers a run reads never run out.
+        for (const number of [...named, ...strays])
+        {
+            nextPackNumber = Math.max(nextPackNumber, number + 1);
+        }
+        for (const number of strays)
+        {
+            if (disk.remove === undefined)
+            {
+                // Cut where it cannot be removed: opened for it.
+                packs.set(number, await disk.open(packFile(number)));
+            }
+            removePack(number);
+            counts.strayPacks++;
+        }
         const chosen = newerIndex(read);
         const saved = read[chosen];
         if (saved === null || saved === undefined)
