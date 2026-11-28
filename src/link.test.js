@@ -709,7 +709,7 @@ test('a word call\'s request is written where no call out lies, whatever it wait
 });
 
 test('a hook after a send that throws fails no call: the call is answered, the next has its slot, '
-    + 'the failure told', ()=>{
+    + 'the failure told', async()=>{
     const { a, b } = createLinkMemory({ words: 1, slots: 1 });
     const server = open(a, {}, { words: (request, answer)=>{
         answer[0] = request[0] + 1;
@@ -725,10 +725,39 @@ test('a hook after a send that throws fails no call: the call is answered, the n
     }, onAfterSendFailure: e=>told.push(e) });
     assert.equal(asking.askBytes([1, 0, 0, 0], answer=>answer[0]), 2);
     assert.equal(asking.askBytes([2, 0, 0, 0], answer=>answer[0]), 3);
+    assert.equal(told.length, 0, 'told after the send, not inside it');
+    await Promise.resolve();
     assert.equal(told.length, 1);
     assert.match(String(told[0]), /hook failed/);
     assert.equal(asking.diagnostics().afterSendFailures, 1);
     server.close();
+});
+
+test('a handler of a failed hook that throws fails no call either: its throw is its own, not the '
+    + 'send\'s', { timeout: 20000 }, async()=>{
+    const worker = kept(new Worker(`
+        const { parentPort, workerData } = require('node:worker_threads');
+        import(workerData).then(({ createLinkMemory, openLink })=>{
+            const { a, b } = createLinkMemory({ words: 1, slots: 1 });
+            const server = openLink(a, {}, { words: (request, answer)=>{
+                answer[0] = request[0] + 1;
+            } });
+            const asking = openLink(b, {}, {
+                afterSend: ()=>{ throw new Error('hook'); },
+                onAfterSendFailure: ()=>{ throw new Error('handler'); },
+            });
+            const answers = [];
+            for (let n = 1; n <= 3; n++)
+            {
+                try { answers.push(asking.askBytes([n, 0, 0, 0], answer=>answer[0])); }
+                catch (e) { answers.push(String(e.message)); }
+            }
+            parentPort.postMessage({ answers, failures: asking.diagnostics().afterSendFailures });
+        });`, { eval: true, workerData: LINK }));
+    const said = /** @type {any} */ (await new Promise(resolve=>worker.once('message', resolve)));
+    assert.deepEqual(said, { answers: [2, 3, 4], failures: 3 }, 'every call answered, its slot free');
+    const thrown = await new Promise(resolve=>worker.once('error', resolve));
+    assert.match(String(thrown), /handler/, 'the handler\'s throw is said where nothing catches it');
 });
 
 test('a value longer than the ring crosses to a side of the same thread, and back, as the writer '
@@ -773,7 +802,8 @@ test('a blocking call made while its side waits for room to send a record before
             let inner = null;
             // The server calls back as it reads the long value: the asking
             // side handles that while it waits for room, and asks in turn.
-            const server = openLink(a, { echo: { back: value=>value.length } });
+            let echoed = 0;
+            const server = openLink(a, { echo: { back: value=>(echoed++, value.length) } });
             asking = openLink(b, { nested: { now: ()=>{
                 try { inner = asking.ask('echo', 'back', ['z']); }
                 catch (e) { inner = String(e.message); }
@@ -781,13 +811,18 @@ test('a blocking call made while its side waits for room to send a record before
             } } });
             server.call('nested', 'now');
             const length = asking.ask('echo', 'back', ['x'.repeat(1024)]);
-            parentPort.postMessage({ length, inner });
+            // What is left to come in, come in: a refused call would be here.
+            const after = asking.ask('echo', 'back', ['after']);
+            server.pump();
+            parentPort.postMessage({ length, inner, after, echoed });
             server.close();
         });`, { eval: true, workerData: LINK }));
     const answer = /** @type {any} */ (await Promise.race([new Promise(resolve=>worker.once('message', resolve)),
         new Promise(resolve=>setTimeout(()=>resolve('held'), 10000))]));
     assert.equal(answer.length, 1024);
     assert.match(String(answer.inner), /waits to send a record before it/);
+    assert.equal(answer.after, 5, 'the next call goes out');
+    assert.equal(answer.echoed, 2, 'the refused call never ran on the other side');
 });
 
 test('a blocking call in place with a time waits that long in all, for its slot as for its answer',

@@ -214,13 +214,12 @@ const sideWords = (size, slots)=>CALLS_HEAD + slots * (SLOT_HEAD + 2 * size);
  *     afterSend: run after each send has rung the other side, where the other side must also
  *     be told another way (a word its running loop polls). The send is made by then: a
  *     throw from it fails no call, and is counted (`afterSendFailures`) and handed to
- *     onAfterSendFailure, by default thrown where nothing catches it.
+ *     onAfterSendFailure in a microtask, by default thrown there, where nothing catches it:
+ *     neither runs inside a send, so neither can leave a record or a slot half made.
  */
 export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afterSend,
     onAfterSendFailure = e=>{
-        queueMicrotask(()=>{
-            throw e;
-        });
+        throw e;
     } } = {}){
     const outbound = openRing(end.out);
     const inbound = openRing(end.in);
@@ -249,7 +248,8 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         }
         catch (e){
             counts.afterSendFailures++;
-            onAfterSendFailure(e);
+            // Not inside the send: what the handler does, a throw included, is its own.
+            queueMicrotask(()=>onAfterSendFailure(e));
         }
     };
     /** A word send, and whether it woke the other side. @param {boolean} notified */
@@ -960,25 +960,26 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
          * @returns {any}
          */
         ask(target, method, args = [], timeoutMs = Infinity){
+            // Made by what this side handles while it waits for room to send
+            // a record: this one would go out only after that one, which is
+            // after this wait. Refused before it is sent, so the other side
+            // never runs a call its caller was told failed.
+            if (flushing)
+            {
+                throw new Error(`link: ${target}.${method}: asked while this side waits to send`
+                    + ' a record before it, which it cannot send until this is answered');
+            }
             const id = nextId++;
             const started = performance.now();
             /** @type {{ value?: any, error?: Error }} */
             const got = {};
-            const record = sendCall(id, target, method, args, value=>{
+            sendCall(id, target, method, args, value=>{
                 got.value = value;
             }, error=>{
                 got.error = error;
             });
             try
             {
-                // Made by what this side handles while it waits for room to
-                // send a record before it: it goes out only once that one
-                // has, which is after this wait.
-                if (flushing && unsent.includes(record))
-                {
-                    throw new Error(`link: ${target}.${method}: asked while this side waits to send`
-                        + ' a record before it, which it cannot send until this is answered');
-                }
                 waitFor(id, started + timeoutMs, `${target}.${method}`, timeoutMs);
             }
             finally
