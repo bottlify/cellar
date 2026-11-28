@@ -154,6 +154,17 @@ test('an add that would step past 2^53 by any amount is refused and stores nothi
     assert.equal(table.get(0, 1), 2 ** 53);
     table.add(0, 1, 0);
     assert.equal(table.get(0, 1), 2 ** 53, 'nothing added is no step past it');
+    // Two parts whose sum rounds to 2^53 as a double: 2^53 + 1 in words.
+    const parts = openTable(createTableMemory({ rows: 1, columns: ['count'], counting: ['count'] }));
+    parts.add(0, 0, 2);
+    assert.throws(()=>parts.add(0, 0, 2 ** 53 - 1), RangeError, '2 and 2^53 - 1');
+    assert.equal(parts.get(0, 0), 2, 'left as it was');
+    parts.add(0, 0, 2 ** 53 - 2);
+    assert.equal(parts.get(0, 0), 2 ** 53, 'and to 2^53 exactly');
+    const wide = openTable(createTableMemory({ rows: 1, columns: ['wide'] }));
+    wide.add(0, 0, 2);
+    assert.throws(()=>wide.add(0, 0, 2 ** 53 - 1), RangeError, 'a wide cell alike');
+    assert.equal(wide.get(0, 0), 2);
 });
 
 test('a reader on another thread sees a counter added to across the carry into its high word',

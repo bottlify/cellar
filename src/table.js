@@ -177,14 +177,21 @@ export function openTable(memory){
         {
             throw new RangeError(`table: ${columns[column]} only grows, not by ${amount}`);
         }
-        // In words, not a double: 2^53 + 1 is 2^53 there.
-        const high = words[low + 1] + Math.floor(sum / 2 ** 32);
-        if (high > HIGH_MOST || (high === HIGH_MOST && sum % 2 ** 32 !== 0))
+        // Summed word by word, every part exact: the sum as one double rounds
+        // past 2^53 (2 and 2^53 - 1 come to 2^53 there, not 2^53 + 1).
+        const by = Math.round(amount);
+        if (by > MOST)
+        {
+            throw new RangeError(`table: ${columns[column]} past 2^53`);
+        }
+        const lows = words[low] + by % 2 ** 32;
+        const high = words[low + 1] + Math.floor(by / 2 ** 32) + Math.floor(lows / 2 ** 32);
+        if (high > HIGH_MOST || (high === HIGH_MOST && lows % 2 ** 32 !== 0))
         {
             throw new RangeError(`table: ${columns[column]} past 2^53`);
         }
         Atomics.store(words, low + 1, BUSY);
-        Atomics.store(words, low, sum >>> 0);
+        Atomics.store(words, low, lows >>> 0);
         Atomics.store(words, low + 1, high);
     };
     /** The writer's: `amount` more in a cell of any sign. @param {number} cell @param {number} amount */
