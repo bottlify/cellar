@@ -21,7 +21,7 @@ const place = await client.reserveLater('texels/1/a', 4096, { onlyCopy: true, di
 | `serveKeeperChannel(memory, answer)` | Serves a channel on the event loop until either side closes it; `ended` once it is, every request sent before the close answered. Where the thread may block, it looks for the next request briefly before it waits on the event loop. |
 | `keeperWords(answer)` | The handler of a link's calls in place (`openLink`'s `words`) on the Keeper's side. |
 | `linkCarrier(link)` | A link's asking side as the client's carrier: its calls in place (`askBytes`, `callBytes`). |
-| `openKeeperClient(carrier, { onFailure })` | `keeper` (`KeeperCalls` for `createReader`), `reserveLater`, `own`, `release`, `releaseLater`. |
+| `openKeeperClient(carrier, { onFailure })` | `keeper` (`KeeperCalls` for `createReader`), `reserveLater`, `own`, `release`, `releaseLater`, `room` (the Keeper's `makeRoom`, an [account](account.md)'s `room` on this thread). |
 
 ## Which carrier
 
@@ -41,6 +41,7 @@ Little-endian 32-bit words. A request is five words, then the name in UTF-8, exa
 | drop | 3 | | | | the body's |
 | own | 4 | | | | the kind of names |
 | release | 5 | bodies held | | | the owner's prefix |
+| room | 6 | units of 4 KiB wanted ([account](account.md)) | | | none |
 
 Reservation flags: 1 only copy, 2 hold, 4 idle `stay`, bits 3-4 the disk policy (0 `kept`, 1 `run`, 2 `never`).
 
@@ -49,7 +50,7 @@ An answer is five words, the first its status:
 | Status | | Words after |
 | ---: | --- | --- |
 | 0 | ok | reserve: id, segment, offset, mark; own: the prefix's byte count, then its bytes; release: bodies, bytes (low, high), waiting |
-| 1 | none | reserve refused, raise false, own or release with nothing to give |
+| 1 | none | reserve refused, raise false, own or release with nothing to give, room none made |
 | -1 | unknown op | the byte count of what is said, then its text |
 | -2 | malformed | the same: a request shorter than its words, a name of another length than it says, flags or a disk policy it does not know |
 | -3 | failed | the same: the Keeper threw, or an owner's request where no owners are served |

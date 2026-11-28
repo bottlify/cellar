@@ -12,12 +12,13 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
+import { openAccount } from './account.js';
 import { openClient } from './channel.js';
 import { openLink } from './link.js';
 import { createReader } from './reader.js';
 import { linkCarrier, openKeeperClient } from './remote.js';
 
-const { carrier, memory, shared, segments } = workerData;
+const { carrier, memory, shared, segments, account } = workerData;
 const port = /** @type {import('node:worker_threads').MessagePort} */ (parentPort);
 /** @type {import('./link.js').Link | null} */
 let link = null;
@@ -81,6 +82,11 @@ const parts = {
         const settled = await Promise.allSettled(asked);
         return settled.map(one=>(one.status === 'fulfilled' ? { place: one.value }
             : { failed: String(one.reason?.name ?? one.reason) }));
+    },
+    // Memory of another kind taken from the keeper's account, room asked of the keeper.
+    grow: ({ bytes })=>{
+        const guest = openAccount(account, { room: client.room });
+        return { taken: guest.take(bytes, 'guest'), report: guest.report() };
     },
     // A blocking call after the keeper's side went.
     after: ()=>{

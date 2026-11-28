@@ -11,9 +11,12 @@
  * (channels) and both ways with values (links), tables of numbers one
  * thread stores and any reads, and a cache of bodies in shared memory read
  * in place by name, under one budget, idle ones on the disk (OPFS), its
- * keeper reached from any thread by one binary protocol (remote keeper).
+ * keeper reached from any thread by one binary protocol (remote keeper);
+ * and the account that budget is, which counts the memory others hold
+ * beside it, any thread taking from it and giving back.
  */
 
+export { ACCOUNT_UNIT, RUN_HOLDER, createAccountMemory, openAccount, openCharge } from './account.js';
 export { INDEX_FILES, openKeeper, packFile, readSaved } from './keeper.js';
 export { grainsOf } from './buddy.js';
 export { createReader } from './reader.js';
@@ -28,6 +31,9 @@ export { textOf } from './text.js';
 export { createJournalMemory, openJournal } from './journal.js';
 export { createTableMemory, openTable } from './table.js';
 
+/** @typedef {import('./account.js').Account} Account */
+/** @typedef {import('./account.js').AccountMemory} AccountMemory */
+/** @typedef {import('./account.js').AccountReport} AccountReport */
 /** @typedef {import('./keeper.js').Keeper} Keeper */
 /** @typedef {import('./keeper.js').KeeperOptions} KeeperOptions */
 /** @typedef {import('./keeper.js').Disk} Disk */

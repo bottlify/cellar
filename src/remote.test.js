@@ -52,6 +52,10 @@ async function served(carrier){
                 calls.push(['drop', name]);
                 return cache.keeper.drop(name);
             },
+            makeRoom: bytes=>{
+                calls.push(['room', bytes]);
+                return cache.keeper.makeRoom(bytes);
+            },
         },
         owners: {
             own: kind=>(kind === 'none' ? null : `${kind}/${++owners}/`),
@@ -127,6 +131,8 @@ for (const carrier of /** @type {const} */ (['channel', 'link']))
             assert.deepEqual(await client.releaseLater('c/', 7), { bodies: 1, bytes: 2 ** 33 + 5,
                 waiting: 1 });
             assert.deepEqual(calls.at(-1), ['release', 'c/', 7]);
+            assert.equal(client.room(5000), true, 'the account has room already');
+            assert.deepEqual(calls.at(-1), ['room', 8192], 'asked in whole units of 4 KiB');
         }
         finally
         {
@@ -152,7 +158,7 @@ test('an op it does not know is a failure, never another call; a request not of 
     const answer = answerKeeper({ keeper: { reserve: (...args)=>{
         calls.push(['reserve', ...args]);
         return cache.keeper.reserve(...args);
-    }, raise: ()=>false, drop: name=>{
+    }, raise: ()=>false, makeRoom: ()=>false, drop: name=>{
         calls.push(['drop', name]);
         return true;
     } } });
@@ -193,7 +199,7 @@ test('an op it does not know is a failure, never another call; a request not of 
 test('a call not waited on that fails is said, not dropped; a closed carrier is not a failure', async()=>{
     const memory = createChannel({ slots: 2, slotBytes: 128 });
     const serving = serveKeeperChannel(memory, answerKeeper({ keeper: {
-        reserve: ()=>null, raise: ()=>{
+        makeRoom: ()=>false, reserve: ()=>null, raise: ()=>{
             throw new Error('the keeper is closed');
         }, drop: ()=>true } }));
     /** @type {unknown[]} */
@@ -213,7 +219,7 @@ test('a call not waited on that fails is said, not dropped; a closed carrier is 
 test('a client refuses what the format cannot say, before anything is sent', async()=>{
     const memory = createChannel({ slots: 2, slotBytes: 64 });
     const serving = serveKeeperChannel(memory, answerKeeper({ keeper: { reserve: ()=>null,
-        raise: ()=>false, drop: ()=>true } }));
+        raise: ()=>false, drop: ()=>true, makeRoom: ()=>false } }));
     const client = openKeeperClient(openClient(memory));
     try
     {

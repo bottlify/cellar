@@ -16,13 +16,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Worker } from 'node:worker_threads';
-import { cacheOf } from './cache.fixture.js';
+import { bodyOf, cacheOf } from './cache.fixture.js';
+import { createAccountMemory, openAccount } from './account.js';
 import { createChannel } from './channel.js';
 import { createLinkMemory, openLink } from './link.js';
 import { answerKeeper, keeperWords, serveKeeperChannel } from './remote.js';
 import { memoryDisk } from './disk.fixture.js';
 
-const MIB = 1024 * 1024;
+const KIB = 1024;
+const MIB = 1024 * KIB;
 
 /**
  * A keeper on this thread and a worker reading it over `carrier`: `run(part,
@@ -77,7 +79,8 @@ async function across(carrier, { cache: options = {}, slots = 16, closeAfter = I
         serving = link;
     }
     worker = new Worker(new URL('./remote.worker.fixture.js', import.meta.url), { workerData: {
-        carrier, memory, shared: cache.keeper.shared, segments: cache.keeper.segmentBuffers() } });
+        carrier, memory, shared: cache.keeper.shared, segments: cache.keeper.segmentBuffers(),
+        account: options.account } });
     const messages = /** @type {any[]} */ ([]);
     /** @type {(() => void) | null} */
     let heard = null;
@@ -139,6 +142,38 @@ for (const carrier of /** @type {const} */ (['channel', 'link']))
             assert.deepEqual(owner.released, { bodies: 3, bytes: 300, waiting: 0 },
                 'the three it still held');
             assert.equal(other.cache.keeper.under('texels/').bodies, 0);
+        }
+        finally
+        {
+            await other.end();
+        }
+    });
+}
+
+for (const carrier of /** @type {const} */ (['channel', 'link']))
+{
+    test(`the keeper's account from a worker over a ${carrier}: a take that does not fit has `
+        + 'cold bodies go here, and both threads see one account', { timeout: 60_000 }, async()=>{
+        const account = createAccountMemory({ limit: 512 * KIB, kinds: { cache: 256 * KIB, guest: Infinity } });
+        const other = await across(carrier, { cache: { account, disk: null } });
+        try
+        {
+            for (let n = 0; n < 16; n++)
+            {
+                assert.equal(other.cache.reader.put(`b/${n}`, bodyOf(16 * KIB, n)), true);
+            }
+            const fits = await other.run('grow', { bytes: 256 * KIB });
+            assert.equal(fits.taken, true);
+            assert.equal(other.cache.keeper.figures().roomAsked, 0, 'within the limit: none asked');
+            const grown = await other.run('grow', { bytes: 128 * KIB });
+            assert.equal(grown.taken, true, 'room made across');
+            assert.deepEqual(grown.report, openAccount(account).report(), 'one account, the same words');
+            assert.equal(grown.report.kinds.guest.bytes, 384 * KIB);
+            assert.equal(grown.report.kinds.cache.bytes, 128 * KIB);
+            assert.equal(other.cache.keeper.figures().roomMade, 1);
+            const refused = await other.run('grow', { bytes: 256 * KIB });
+            assert.equal(refused.taken, false, 'past what can be made: refused');
+            assert.equal(refused.report.refused, 1);
         }
         finally
         {

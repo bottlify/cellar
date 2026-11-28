@@ -33,13 +33,15 @@
  *     DROP
  *     OWN      name: the kind of names an owner is given
  *     RELEASE  name: the owner's prefix, a: the bodies it says it held
+ *     ROOM     a: the units of 4 KiB the account wants room for (`makeRoom`), no name
  *
  * An answer: five words, the first its status, or a failure.
  *
  *     OK    RESERVE: id, segment, offset, mark; RAISE: -; DROP: -
  *           OWN: the prefix's byte count, then its bytes
- *           RELEASE: bodies, bytes (low, high words), waiting
- *     NONE  RESERVE refused, RAISE false, OWN or RELEASE nothing to give
+ *           RELEASE: bodies, bytes (low, high words), waiting; ROOM: -
+ *     NONE  RESERVE refused, RAISE false, OWN or RELEASE nothing to give,
+ *           ROOM none made
  *     UNKNOWN, MALFORMED, FAILED  the request refused, or the keeper threw:
  *           the second word the byte count of what is said of it, then its bytes
  *
@@ -47,6 +49,7 @@
  * failure, never taken for another call.
  */
 
+import { ACCOUNT_UNIT } from './account.js';
 import { SPIN_MS, mayWait } from './bell.js';
 import { ChannelClosed, openServer } from './channel.js';
 import { LinkClosed } from './link.js';
@@ -58,6 +61,7 @@ export const RAISE = 2;
 export const DROP = 3;
 export const OWN = 4;
 export const RELEASE = 5;
+export const ROOM = 6;
 
 /** The answers' statuses. */
 const OK = 0;
@@ -107,7 +111,7 @@ const lyingOf = view=>{
  * (none: an owner's request is a failure).
  *
  * @typedef {Object} KeeperServed
- * @property {Pick<import('./keeper.js').Keeper, 'reserve' | 'raise' | 'drop'>} keeper
+ * @property {Pick<import('./keeper.js').Keeper, 'reserve' | 'raise' | 'drop' | 'makeRoom'>} keeper
  * @property {{ own: (kind: string) => string | null,
  *     release: (prefix: string, held: number) => { bodies: number, bytes: number, waiting: number } | null }}
  *     [owners]
@@ -156,7 +160,7 @@ export function answerKeeper({ keeper, owners }){
         const a = words[1];
         const b = words[2];
         const c = words[3];
-        if (op < RESERVE || op > RELEASE)
+        if (op < RESERVE || op > ROOM)
         {
             return sayText(UNKNOWN, `remote keeper: no op ${op}`);
         }
@@ -184,6 +188,10 @@ export function answerKeeper({ keeper, owners }){
             {
                 keeper.drop(name);
                 return say(OK);
+            }
+            if (op === ROOM)
+            {
+                return say(keeper.makeRoom((a >>> 0) * ACCOUNT_UNIT) ? OK : NONE);
             }
             if (!owners)
             {
@@ -427,6 +435,15 @@ export function openKeeperClient(carrier, { onFailure = e=>{
          */
         reserveLater: (name, length, options)=>carrier.call(reserveOf(name, length, options),
             { read: readPlace }),
+
+        /**
+         * Room in the keeper's account for `bytes` more (`Keeper.makeRoom`):
+         * true where it has it now. An account's `room` on this thread.
+         *
+         * @param {number} bytes @returns {boolean}
+         */
+        room: bytes=>carrier.ask(write(ROOM, '', Math.min(0xffff_ffff, Math.ceil(bytes / ACCOUNT_UNIT)),
+            0, 0), { read: readYes }),
 
         /**
          * Names of the keeper's for one owner of `kind`: their prefix, or null

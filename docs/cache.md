@@ -125,7 +125,7 @@ Only one Keeper may manage a directory. OPFS sync handles lock files; custom Dis
 
 | Setting | Constraint |
 | --- | --- |
-| `budget` | Finite nonnegative byte budget for hot bodies. |
+| `budget` | Finite nonnegative byte budget for hot bodies, in an account of the Keeper's own; with `account` ([Account](account.md)), the segments are its kind (`kind`, `cache` by default), bounded by its ceiling or the account's limit, and `makeRoom` lets bodies go for the account's other kinds. |
 | `segmentBytes` | Power of two, 4 KiB to 1 GiB. |
 | `packBytes` | Positive, below 2 GiB. |
 | Body length | Positive integer, within the budget and below 2 GiB (`refusedLarge`). A body larger than `packBytes` takes a pack of its own on the disk. |

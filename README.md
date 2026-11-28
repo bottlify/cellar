@@ -9,6 +9,7 @@ Built for [Bottlify](https://github.com/bottlify/bottlify), and useful wherever 
 | Primitive | What it does |
 | --- | --- |
 | [Cache](docs/cache.md) | Shared bodies by name, read in place, one memory budget, optional disk storage. |
+| [Account](docs/account.md) | One budget for every byte: the cache's segments and the memory it does not place (a WebAssembly memory, compiled code), by kind and by holder; a take that does not fit has cold bodies go first. |
 | [Remote keeper](docs/remote.md) | The cache's keeper from another thread: one binary protocol over a channel or a link. |
 | [Channel](docs/channel.md) | Blocking or asynchronous RPC between two threads. |
 | [Link](docs/link.md) | Calls both ways with values; a waiting side answers the other's calls meanwhile, and small word calls take turns in place. |
@@ -103,7 +104,7 @@ For browser isolation, a common starting configuration is `Cross-Origin-Opener-P
 
 ## Documentation and examples
 
-[Cache](docs/cache.md) · [Remote keeper](docs/remote.md) · [Channel](docs/channel.md) · [Link](docs/link.md) · [Ring](docs/ring.md) · [Journal](docs/journal.md) · [Table](docs/table.md) · [Bell and Doorbell](docs/bell.md) · [Benchmarks](docs/benchmarks.md)
+[Cache](docs/cache.md) · [Account](docs/account.md) · [Remote keeper](docs/remote.md) · [Channel](docs/channel.md) · [Link](docs/link.md) · [Ring](docs/ring.md) · [Journal](docs/journal.md) · [Table](docs/table.md) · [Bell and Doorbell](docs/bell.md) · [Benchmarks](docs/benchmarks.md)
 
 [How Cellar works, drawn](examples/README.md) - diagrams and runnable examples.
 

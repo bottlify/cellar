@@ -10,7 +10,10 @@
  * comes here only for room to write a body into (`reserve`), for a cold body
  * to be brought back (`raise`) and to drop a name.
  *
- * The hot part is segments of shared memory, as many as the budget holds. A
+ * The hot part is segments of shared memory, as many as the budget holds:
+ * the account's (`account.js`), the program's one, where the segments are
+ * one kind beside the memory others hold, and a take of theirs that does not
+ * fit has the keeper let cold bodies go for it (`makeRoom`). A
  * segment of `segmentBytes` is shared by bodies, each placed in a block of a
  * power of two and taking its length rounded to a grain of it (`buddy.js`); a
  * body over a quarter of that (`large`) has a segment of its own instead, of
@@ -37,6 +40,7 @@
  * only once the disk holds it.
  */
 
+import { createAccountMemory, openAccount } from './account.js';
 import { UNIT, blockOf, checkSegmentBytes, createBuddy, grainsOf } from './buddy.js';
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
@@ -152,7 +156,11 @@ const REFUSED = -2;
 
 /**
  * @typedef {Object} KeeperOptions
- * @property {number} budget  bytes of segments at most
+ * @property {number} [budget]  bytes of segments at most, in an account of the
+ *     keeper's own; with `account`, the account's bound on its kind
+ * @property {import('./account.js').AccountMemory} [account]  the account the
+ *     segments are taken from, as `kind`, beside what else it counts
+ * @property {string} [kind]  the segments' kind in it: `cache` unless said
  * @property {number} [segmentBytes]
  * @property {Disk | null} [disk]
  * @property {number} [packBytes]
@@ -174,7 +182,7 @@ const REFUSED = -2;
  */
 export async function openKeeper(options){
     const {
-        budget, segmentBytes = 16 * MIB, packBytes = 64 * MIB,
+        segmentBytes = 16 * MIB, packBytes = 64 * MIB, kind = 'cache',
         coldAfterMs = 30_000, goneAfterMs = 7 * 24 * 3600_000, releaseAfterMs = 10_000,
         abandonAfterMs = 300_000, announce = ()=>{}, now = ()=>performance.now(),
     } = options;
@@ -192,9 +200,20 @@ export async function openKeeper(options){
     }
     checkSegmentBytes(segmentBytes);
     // NaN compares false to every sum: no limit at all.
-    if (typeof budget !== 'number' || !(budget >= 0) || !Number.isFinite(budget))
+    const own = options.account === undefined;
+    if (own && (typeof options.budget !== 'number' || !(options.budget >= 0)
+        || !Number.isFinite(options.budget)))
     {
-        throw new RangeError(`cache: a budget of ${budget} bytes`);
+        throw new RangeError(`cache: a budget of ${options.budget} bytes`);
+    }
+    /** What the segments are taken from: the keeper takes no room of its own, it cools for it. */
+    const account = openAccount(options.account
+        ?? createAccountMemory({ limit: Infinity, kinds: { [kind]: /** @type {number} */ (options.budget) } }));
+    /** The most the segments may hold: their kind's ceiling, or the account's limit. */
+    const budget = account.bound(kind);
+    if (!Number.isFinite(budget))
+    {
+        throw new RangeError(`cache: the account bounds ${kind} by nothing: a keeper needs a bound`);
     }
     // A body's place in a segment and in a pack is a 32-bit word of its record.
     if (!(packBytes > 0 && packBytes < 2 ** 31))
@@ -232,7 +251,7 @@ export async function openKeeper(options){
     const segments = [];
     /** The numbers of the shared segments not let go, in order: what is placed in. @type {number[]} */
     const liveSegments = [];
-    /** Bytes of every segment holding memory: what the budget is weighed against. */
+    /** Bytes of every segment holding memory, as the account holds them of `kind`. */
     let heldBytes = 0;
     /**
      * The packs on the disk by number, `pack-<number>`. A number is not given
@@ -301,7 +320,7 @@ export async function openKeeper(options){
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
         segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
         reclaimedBytes: 0, evicted: 0, lostAtClose: 0, takenBack: 0, oldestListed: 0,
-        released: 0, releasedBytes: 0, peakSegmentBytes: 0,
+        released: 0, releasedBytes: 0, peakSegmentBytes: 0, roomAsked: 0, roomMade: 0, roomRefused: 0,
     };
 
     /**
@@ -609,18 +628,24 @@ export async function openKeeper(options){
     };
 
     /**
-     * Memory of `bytes` more is held from now on, or none where the engine
-     * will not give it: as a budget spent, room is found by cooling, counted.
+     * Memory of `bytes` more is held from now on, or none where the account
+     * has no room or the engine will not give it: as a budget spent, room is
+     * found by cooling, counted.
      *
      * @template T @param {() => T} make @param {number} bytes @returns {T | null}
      */
     const take = (make, bytes)=>{
+        if (!account.take(bytes, kind))
+        {
+            return null;
+        }
         let made;
         try
         {
             made = make();
         }
         catch {
+            account.give(bytes, kind);
             counts.segmentFailures++;
             return null;
         }
@@ -631,7 +656,7 @@ export async function openKeeper(options){
 
     /** A new shared segment, announced, or -1 past the budget. */
     const makeSegment = ()=>{
-        const buffer = heldBytes + segmentBytes > budget ? null
+        const buffer = !account.fits(segmentBytes, kind) ? null
             : take(()=>sharedBuffer(segmentBytes), segmentBytes);
         if (buffer === null)
         {
@@ -651,6 +676,7 @@ export async function openKeeper(options){
         const bytes = segmentAt(at).bytes.length;
         segments[at] = null;
         heldBytes -= bytes;
+        account.give(bytes, kind);
         counts.segmentsLetGo++;
         counts.letGoBytes += bytes;
         tell({ segment: at, buffer: null });
@@ -710,11 +736,11 @@ export async function openKeeper(options){
      * spare stays: a thread that has heard of it is placed there, and one
      * made for a reserve is one the asking thread may not have heard of.
      *
-     * @param {number} idleMs
+     * @param {number} idleMs @param {boolean} [spareToo]  the spare as well (`makeRoom`)
      */
-    const letGoEmpty = idleMs=>{
+    const letGoEmpty = (idleMs, spareToo = false)=>{
         const at = tick();
-        let spare = false;
+        let spare = spareToo;
         let kept = 0;
         for (const s of liveSegments)
         {
@@ -784,13 +810,13 @@ export async function openKeeper(options){
         {
             return -1;
         }
-        if (heldBytes + bytes > budget)
+        if (!account.fits(bytes, kind))
         {
             letGoEmpty(0);
         }
         const one = segmentAt(at);
         const buffer = /** @type {import('./shared.js').Growable} */ (one.buffer);
-        if (heldBytes + bytes > budget || take(()=>growTo(buffer, bytes), bytes) === null)
+        if (take(()=>growTo(buffer, bytes), bytes) === null)
         {
             return -1;
         }
@@ -813,7 +839,7 @@ export async function openKeeper(options){
             return placeOwn(length, limit);
         }
         const found = placeIn(length, limit);
-        if (found >= 0 || heldBytes + segmentBytes > budget)
+        if (found >= 0 || !account.fits(segmentBytes, kind))
         {
             return found;
         }
@@ -1099,6 +1125,52 @@ export async function openKeeper(options){
                 return found;
             }
         }
+    };
+
+    /**
+     * Room in the account for `bytes` more of what it holds beside the
+     * segments: empty segments let go, then the bodies no one reads, the least
+     * recently read first, cooled with every other of their segment, so that
+     * the segment goes (a body in a segment of its own goes with it); one
+     * that cannot leave keeps its segment. True where the account has the
+     * room now.
+     *
+     * @param {number} bytes
+     */
+    const makeRoom = bytes=>{
+        if (account.fits(bytes))
+        {
+            return true;
+        }
+        counts.roomAsked++;
+        letGoEmpty(0, true);
+        /** Shared segments found holding a body that cannot leave. @type {Set<number>} */
+        const held = new Set();
+        listOldest();
+        for (let id = nextOldest(Infinity, -1); !account.fits(bytes) && id >= 0; id = nextOldest(Infinity, -1))
+        {
+            const segment = get(id, R_SEGMENT);
+            const buddy = segmentAt(segment).buddy;
+            if (buddy === null)
+            {
+                cool(id);
+                continue;
+            }
+            if (held.has(segment))
+            {
+                continue;
+            }
+            const inside = buddy.ownersWithin(0, segmentBytes);
+            if (!inside.every(other=>canLeave(other, -1)) || !vacate(inside))
+            {
+                held.add(segment);
+                continue;
+            }
+            letGoEmpty(0, true);
+        }
+        const made = account.fits(bytes);
+        counts[made ? 'roomMade' : 'roomRefused']++;
+        return made;
     };
 
     /**
@@ -1978,6 +2050,15 @@ export async function openKeeper(options){
 
     const keeper = {
         shared,
+
+        /**
+         * Room for `bytes` more in the account, beside the segments: what a
+         * take of another kind that did not fit asks for (`openAccount`'s
+         * `room`); true where the account has it now.
+         *
+         * @param {number} bytes
+         */
+        makeRoom,
         /** Segments by number, null for one let go, for a thread joining later. */
         segmentBuffers: ()=>segments.map(one=>(one === null ? null : one.buffer)),
 
@@ -2559,6 +2640,7 @@ export async function openKeeper(options){
                 diskBytes: [...filled.values()].reduce((sum, bytes)=>sum + bytes, 0),
                 liveDiskBytes: [...live.values()].reduce((sum, bytes)=>sum + bytes, 0),
                 ...counts,
+                account: account.report(),
             };
         },
     };
