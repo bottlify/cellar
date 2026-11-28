@@ -410,7 +410,11 @@ export function openKeeperClient(carrier, { onFailure = e=>{
         }
         return write(RESERVE, name, length, knownOf(known), flags);
     };
-    /** The place a blocking reserve's answer goes to: its asker's, set at each. */
+    /**
+     * The place a blocking reserve's answer goes to: its asker's, set at each
+     * and put back after, as a call a link serves while one waits may reserve
+     * too.
+     */
     let into = /** @type {Int32Array} */ (new Int32Array(PLACE_WORDS));
     const intoPlace = { read: (/** @type {Uint8Array} */ answer)=>placeInto(answer, into) };
     const later = { read: placeLater };
@@ -428,8 +432,16 @@ export function openKeeperClient(carrier, { onFailure = e=>{
         keeper: {
             reserve: (name, length, flags, known, place)=>{
                 const request = reserveOf(name, length, flags, known);
+                const waiting = into;
                 into = place;
-                return carrier.ask(request, intoPlace);
+                try
+                {
+                    return carrier.ask(request, intoPlace);
+                }
+                finally
+                {
+                    into = waiting;
+                }
             },
             raise: (name, { known })=>carrier.ask(write(RAISE, name, knownOf(known), 0, 0), { read: readYes }),
             raiseLater: name=>unwaited(write(RAISE, name, -1, 0, 0)),

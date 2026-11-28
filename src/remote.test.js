@@ -238,3 +238,44 @@ test('a client refuses what the format cannot say, before anything is sent', asy
         serving.close();
     }
 });
+
+test('a reserve made while a blocking one waits, by a call its carrier serves meanwhile, does not '
+    + 'take the waiting one\'s place', ()=>{
+    // A link serves the keeper's side's calls while this side waits; one of
+    // them may reserve too. Each answer goes to its own asker's place.
+    let next = 0;
+    const answer = answerKeeper({ keeper: {
+        reserve: (_name, _length, _flags, _known, place)=>{
+            place.fill(0);
+            place[0] = ++next;
+            return true;
+        },
+        raise: ()=>true, drop: ()=>true, makeRoom: ()=>true,
+    } });
+    const out = new Uint8Array(4096);
+    /** @type {() => void} */
+    let meanwhile = ()=>{};
+    /** @type {import('./remote.js').Carrier} */
+    const carrier = {
+        ask: (request, { read })=>{
+            const copy = new Uint8Array(request.length + 3 & ~3).subarray(0, request.length);
+            copy.set(request);
+            const served = meanwhile;
+            meanwhile = ()=>{};
+            served();
+            const length = answer({ words: new Int32Array(copy.buffer), bytes: copy }, request.length,
+                { words: new Int32Array(out.buffer), bytes: out }, out.length);
+            return read(out.subarray(0, length));
+        },
+        call: async()=>{
+            throw new Error('not here');
+        },
+    };
+    const client = openKeeperClient(carrier);
+    const outer = new Int32Array(8);
+    const inner = new Int32Array(8);
+    meanwhile = ()=>client.keeper.reserve('inner', 16, reserveFlags(), Infinity, inner);
+    assert.equal(client.keeper.reserve('outer', 16, reserveFlags(), Infinity, outer), true);
+    assert.equal(inner[0], 1, 'the call served meanwhile was answered first, into its place');
+    assert.equal(outer[0], 2, 'the waiting reserve\'s answer is in its own place');
+});
