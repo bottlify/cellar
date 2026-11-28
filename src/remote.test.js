@@ -117,6 +117,12 @@ for (const carrier of /** @type {const} */ (['channel', 'link']))
             assert.deepEqual(calls.slice(-2), [['raise', 'b/é', { known: Infinity }], ['drop', 'b/é']]);
             assert.equal(cache.reader.look('b/é'), null, 'dropped');
 
+            // A drop is seen by the one who made it at once, as on the keeper's own thread.
+            assert.equal(reader.put('d/1', Uint8Array.of(9)), true);
+            reader.drop('d/1');
+            assert.equal(reader.look('d/1'), null, 'dropped here before anything else is asked');
+            assert.equal(reader.with('d/1', body=>body[0]), undefined);
+
             const later = await client.reserveLater('c/1', 64, reserveFlags({ onlyCopy: true, disk: 'run' }), 1);
             assert.equal(later?.[P_SEGMENT], 0);
             assert.equal(client.own('texels'), 'texels/1/');
@@ -192,7 +198,7 @@ test('an op it does not know is a failure, never another call; a request not of 
     }
 });
 
-test('a call not waited on that fails is said, not dropped; a closed carrier is not a failure', async()=>{
+test('a call not waited on that fails is said, not dropped; a closed carrier is not a failure, and a drop is waited on', async()=>{
     const memory = createChannel({ slots: 2, slotBytes: 128 });
     const serving = serveKeeperChannel(memory, answerKeeper({ keeper: {
         makeRoom: ()=>false, reserve: ()=>false, raise: ()=>{
@@ -206,7 +212,7 @@ test('a call not waited on that fails is said, not dropped; a closed carrier is 
     assert.match(String(failures[0]), /the keeper is closed/);
     serving.close();
     await serving.ended;
-    client.keeper.drop('y');
+    assert.throws(()=>client.keeper.drop('y'), /closed/, 'a drop is waited on, as a reserve is');
     await new Promise(resolve=>setTimeout(resolve, 20));
     assert.equal(failures.length, 1);
     assert.throws(()=>placeOf(client.keeper, 'z', 1), /closed/);

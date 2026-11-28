@@ -354,8 +354,8 @@ const closedBy = e=>e instanceof ChannelClosed || e instanceof LinkClosed;
 /**
  * The asking side of a remote keeper: the calls a reader on this thread makes
  * of the keeper (`keeper`, for `createReader`), and those an owner of names
- * makes. Calls not waited on (`raiseLater`, `drop`) that fail other than by
- * the carrier closing are handed to `onFailure`, by default thrown where
+ * makes. A call not waited on (`raiseLater`) that fails other than by
+ * the carrier closing is handed to `onFailure`, by default thrown where
  * nothing catches them.
  *
  * @param {Carrier} carrier
@@ -433,7 +433,11 @@ export function openKeeperClient(carrier, { onFailure = e=>{
             },
             raise: (name, { known })=>carrier.ask(write(RAISE, name, knownOf(known), 0, 0), { read: readYes }),
             raiseLater: name=>unwaited(write(RAISE, name, -1, 0, 0)),
-            drop: name=>unwaited(write(DROP, name, 0, 0, 0)),
+            // Waited on: whoever drops a name and asks for it next must find it
+            // gone, as it would on the keeper's own thread.
+            drop: name=>{
+                carrier.ask(write(DROP, name, 0, 0, 0), { read: answered });
+            },
         },
 
         /**

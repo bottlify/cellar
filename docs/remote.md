@@ -55,7 +55,7 @@ An answer is five words, the first its status:
 | -2 | malformed | the same: a request shorter than its words, a name of another length than it says, flags or a disk policy it does not know |
 | -3 | failed | the same: the Keeper threw, or an owner's request where no owners are served |
 
-An unknown op or a malformed request is refused and nothing is done for it; the client throws the failure where it asked. A call not waited on (`raiseLater`, `drop`) that fails goes to `onFailure`, by default thrown where nothing catches it; one that fails because the carrier closed is not a failure, since nothing is left to answer.
+An unknown op or a malformed request is refused and nothing is done for it; the client throws the failure where it asked. A drop is waited on, so whoever drops a name and asks for it next finds it gone, as on the keeper's own thread. A call not waited on (`raiseLater`) that fails goes to `onFailure`, by default thrown where nothing catches it; one that fails because the carrier closed is not a failure, since nothing is left to answer.
 
 A name of ASCII is written and read without an object of its own; a fixed answer is read where it lies. A blocking reserve writes its answer into the asker's `place` and makes no object; `reserveLater` answers a place of its own (`Int32Array` of `PLACE_WORDS`), as a promise does. A request and its answer lie on a four-byte boundary, as both carriers' slots do. Calls keep the order they were made in over both carriers: a channel full of requests copies a call and sends it when a slot frees, before anything asked after it. A name longer than the carrier holds (a channel's `slotBytes`, or a link's `words` times four, less the five words) is refused by the carrier when it is sent.
 

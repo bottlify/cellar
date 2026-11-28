@@ -30,8 +30,8 @@ import {
 import { bytesOf } from './bytes.js';
 
 /**
- * What the reader asks the keeper: `reserve` and `raise` answer at once,
- * across a link by a blocking call; `raiseLater` and `drop` are not waited on.
+ * What the reader asks the keeper: `reserve`, `raise` and `drop` answer at
+ * once, across a link by a blocking call; `raiseLater` is not waited on.
  * A reserve asks with its flags (`reserveFlags`) and the segments this reader
  * has, and is answered in the words of the reader's own place (`P_ID`...):
  * true where room was granted.
