@@ -135,20 +135,29 @@ export const hostCases = {
         let verdict;
         try
         {
+            // A body in a shared segment (a fixed buffer) and one in a
+            // segment of its own (a growable one, which a handle refuses a
+            // view of: it goes through the keeper's own fixed memory).
             const body = bodyOf(5000, 7);
+            const large = bodyOf(40000, 9);
             reader.put('doc', body, F_ONLY_COPY);
-            // Idle past coldAfterMs, it goes once the keeper's first pack is
+            reader.put('large', large, F_ONLY_COPY);
+            // Idle past coldAfterMs, they go once the keeper's first pack is
             // open: opening one on OPFS answers a promise some turns later.
-            for (let tries = 0; tries < 100 && reader.look('doc') === 'hot'; tries++)
+            for (let tries = 0; tries < 100
+                && (reader.look('doc') === 'hot' || reader.look('large') === 'hot'); tries++)
             {
                 await new Promise(resolve=>setTimeout(resolve, 20));
                 step(1000);
             }
-            const look = reader.look('doc');
+            const looks = [reader.look('doc'), reader.look('large')];
             const back = reader.with('doc', got=>got.slice(), { wait: true });
-            const said = [`idle, the body was ${look}; read back ${back?.length ?? 'nothing'}`];
-            verdict = look === 'cold' && back !== undefined && same(back, body) ? { said }
-                : { said, fail: 'the only copy did not go to OPFS and come back whole' };
+            const backLarge = reader.with('large', got=>got.slice(), { wait: true });
+            const said = [`idle, the bodies were ${looks.join(' and ')}; read back`
+                + ` ${back?.length ?? 'nothing'} and ${backLarge?.length ?? 'nothing'}`];
+            verdict = looks.every(look=>look === 'cold') && back !== undefined && same(back, body)
+                && backLarge !== undefined && same(backLarge, large) ? { said }
+                : { said, fail: 'an only copy did not go to OPFS and come back whole' };
         }
         finally
         {
