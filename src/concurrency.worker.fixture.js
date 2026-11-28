@@ -18,6 +18,12 @@
  * writes, each write one version up; every thread reads them. A version read
  * below one this thread read or wrote before is a stale record the index led
  * to: a body written over since.
+ *
+ * And it puts names once (`u<thread>-<n>-...`, long), reads them and drops
+ * them: they leave the index at a sweep, their records go to other names
+ * and the keeper packs the names while this thread remembers where they lay.
+ * A body read for one that names another is a record or a place the reader
+ * took for its name's after it went to another name.
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
@@ -26,7 +32,7 @@ import { openKeeperClient } from './remote.js';
 import { createReader } from './reader.js';
 import { hashName } from './shared.js';
 
-const { channel, shared, segments, seed, operations, least, pool, thread, threads, owned } = workerData;
+const { channel, shared, segments, seed, operations, least, unique, pool, thread, threads, owned } = workerData;
 const reader = createReader({ shared, segments, keeper: openKeeperClient(openClient(channel)).keeper });
 parentPort?.on('message', message=>reader.adopt(message));
 
@@ -87,7 +93,19 @@ const check = (name, body)=>{
     return null;
 };
 
-const counts = { reads: 0, hits: 0, writes: 0, written: 0, drops: 0, ownHits: 0 };
+const counts = { reads: 0, hits: 0, writes: 0, written: 0, drops: 0, ownHits: 0, onceWritten: 0, onceRead: 0 };
+/** Names put once and not dropped yet, the newest last. @type {string[]} */
+const once = [];
+/** Long, so that the names dropped soon outweigh the names held and are packed. */
+const ONCE_TAIL = '-'.repeat(96);
+let onceNext = 0;
+/**
+ * The `n`th name this thread puts once: all of one length, so that a record
+ * and a place in the names left by one are another's of the same length.
+ *
+ * @param {number} n
+ */
+const onceName = n=>`u${thread}-${String(n).padStart(7, '0')}${ONCE_TAIL}`;
 /** @type {string[]} */
 const failures = [];
 /** The highest version this thread read or wrote of each owned name. @type {Map<string, number>} */
@@ -125,7 +143,8 @@ const write = (name, version, length)=>{
  * how many reads find a body hot is the machine's timing, not the code's, so
  * a thread goes on past `operations` until they did.
  */
-const enough = ()=>counts.hits >= least && counts.written >= least && counts.ownHits >= least;
+const enough = ()=>counts.hits >= least && counts.written >= least && counts.ownHits >= least
+    && counts.onceWritten >= unique;
 for (let op = 0; op < operations || !enough(); op++)
 {
     if (op % 64 === 0)
@@ -183,7 +202,7 @@ for (let op = 0; op < operations || !enough(); op++)
             }
         }
     }
-    else if (roll < 92)
+    else if (roll < 88)
     {
         counts.writes++;
         // One write in eight a body of 20 to 48 KiB: in the gate's segments
@@ -194,11 +213,41 @@ for (let op = 0; op < operations || !enough(); op++)
             counts.written++;
         }
     }
-    else
+    else if (roll < 92)
     {
         counts.drops++;
         reader.drop(name);
     }
+    else if (roll < 96 || once.length === 0)
+    {
+        const named = onceName(onceNext++);
+        if (write(named, 1, 16 + (next() % 512)))
+        {
+            counts.onceWritten++;
+            once.push(named);
+        }
+    }
+    else
+    {
+        // Read once more, the record and the place of its name remembered
+        // since it was put, then dropped; one dropped before is read too.
+        const at = next() % once.length;
+        const named = once[at];
+        for (const read of [named, onceName(next() % onceNext)])
+        {
+            const failure = reader.with(read, body=>check(read, body));
+            if (failure !== undefined)
+            {
+                counts.onceRead++;
+                if (failure !== null)
+                {
+                    failures.push(failure);
+                }
+            }
+        }
+        reader.drop(named);
+        once.splice(at, 1);
+    }
 }
-parentPort?.postMessage({ done: true, counts, failures: failures.slice(0, 20),
+parentPort?.postMessage({ done: true, counts, once, failures: failures.slice(0, 20),
     failed: failures.length, reader: reader.figures() });

@@ -11,8 +11,9 @@
  * them and lets segments go. No thread may read a body that is not its name's
  * or that changes while it is inside, nor a name's version older than one it
  * saw (`concurrency.worker.fixture.js`); the keeper's figures show the moves
- * happened, the table grew and records went back to be taken by other names
- * under them, so the gate cannot pass on a cache that moved nothing. Once the threads are gone every name is dropped, and no
+ * happened, the table was made anew, names put once left the index and were
+ * packed and records went back to be taken by other names under them, so
+ * the gate cannot pass on a cache that moved nothing. Once the threads are gone every name is dropped, and no
  * room may be left held: a body or a reservation the keeper lost track of.
  */
 
@@ -31,6 +32,11 @@ const POOL = 120;
 const OWNED = 150;
 /** Hot reads, writes and hot reads of owned names each thread makes at least: a fourth of 1000 and one. */
 const LEAST = 251;
+/**
+ * Names each thread puts once and drops at least: of 100 units or so, as
+ * many as make the names dropped outweigh those held some times over.
+ */
+const UNIQUE = 800;
 
 /**
  * Runs the threads over a keeper of `options` and checks what every gate
@@ -41,9 +47,12 @@ const LEAST = 251;
 async function gate(options){
     /** @type {Worker[]} */
     const workers = [];
+    /** Tables the keeper made anew, larger or of names left, the threads took meanwhile. */
+    let tables = 0;
     const keeper = await openKeeper({
         budget: 512 * KIB, disk: memoryDisk(), ...options,
         announce: message=>{
+            tables += message.table === undefined ? 0 : 1;
             for (const worker of workers)
             {
                 worker.postMessage(message);
@@ -52,6 +61,9 @@ async function gate(options){
     });
     await new Promise(resolve=>setTimeout(resolve, 0));
     const sweeping = setInterval(()=>keeper.sweep(), 1);
+    // Saved as a run saves: a name dropped that was on the disk leaves the
+    // index once its going is saved.
+    const saving = setInterval(()=>keeper.save(), 20);
     const links = [];
     const done = [];
     for (let t = 0; t < THREADS; t++)
@@ -60,7 +72,7 @@ async function gate(options){
         links.push(serveKeeperChannel(memory, answerKeeper({ keeper })));
         const worker = new Worker(new URL('./concurrency.worker.fixture.js', import.meta.url), {
             workerData: { channel: memory, shared: keeper.shared, segments: keeper.segmentBuffers(),
-                seed: 0x9e3779b9 + t * 7919, operations: 6000, least: LEAST, pool: POOL, thread: t,
+                seed: 0x9e3779b9 + t * 7919, operations: 6000, least: LEAST, unique: UNIQUE, pool: POOL, thread: t,
                 threads: THREADS, owned: OWNED },
         });
         workers.push(worker);
@@ -82,6 +94,7 @@ async function gate(options){
     }
     finally {
         clearInterval(sweeping);
+        clearInterval(saving);
         for (const link of links)
         {
             link.close();
@@ -97,14 +110,19 @@ async function gate(options){
     assert.ok(sum('hits') > 1000, `hits ${sum('hits')}`);
     assert.ok(sum('written') > 1000, `written ${sum('written')}`);
     assert.ok(sum('ownHits') > 1000, `owned names read ${sum('ownHits')}`);
-    assert.ok(figures.replaced > 10, `written anew while read ${figures.replaced}`);
-    assert.ok(figures.records > 512, `records ${figures.records}: the first table never grew`);
-    assert.ok(figures.records < figures.names + figures.replaced,
-        `records ${figures.records} for ${figures.names} names and ${figures.replaced} rewrites: none taken again`);
+    // How often a write meets a read is the scheduler's: the path ran, and
+    // cache.test.js drives it by hand. So do the records taken again.
+    assert.ok(figures.replaced > 0, `written anew while read ${figures.replaced}`);
+    assert.ok(tables > 0, 'the first table was never made anew');
+    // The names put once left the index and were packed while read.
+    assert.ok(figures.namesPacked > 0, `names packed ${figures.namesPacked}`);
+    assert.ok(figures.freeRecords > 0 || figures.records < sum('onceWritten'),
+        `records ${figures.records} for ${sum('onceWritten')} names put once: none taken again`);
 
     // Every name dropped, the threads gone: nothing may stay placed.
     const names = [...Array.from({ length: POOL }, (_, i)=>`n${i}`),
-        ...Array.from({ length: THREADS * OWNED }, (_, i)=>`o${i % THREADS}-${Math.floor(i / THREADS)}`)];
+        ...Array.from({ length: THREADS * OWNED }, (_, i)=>`o${i % THREADS}-${Math.floor(i / THREADS)}`),
+        ...results.flatMap(result=>result.once)];
     for (const name of names)
     {
         keeper.drop(name);
