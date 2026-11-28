@@ -241,3 +241,25 @@ test('the room lists of the shared segments are counted beside their memory, nin
     assert.equal(keeper.figures().metadataBytes % each, 0);
     assert.ok(keeper.figures().metadataBytes > 4 * each, 'a segment grown is one more');
 });
+
+test('a sweep cools a bounded part of the idle bodies, the rest at the sweeps after: none left moving',
+    async()=>{
+    const MIB = 1024 * KIB;
+    const { reader, keeper, step } = await cacheOf({ budget: 64 * MIB, segmentBytes: 16 * MIB,
+        disk: fixedViewsDisk(), coldAfterMs: 100 });
+    for (let n = 0; n < 4096; n++)
+    {
+        assert.equal(reader.put(`b/${n}`, bytes(4096, n)), true);
+    }
+    await new Promise(resolve=>setTimeout(resolve, 0));
+    step(200);
+    const first = keeper.figures().cold;
+    assert.ok(first > 0 && first <= 1025, `${first} of 4096 cooled by one sweep, 4 MiB and one body`);
+    const looks = Array.from({ length: 4096 }, (_, n)=>reader.look(`b/${n}`));
+    assert.ok(looks.every(look=>look === 'hot' || look === 'cold'), 'nothing left moving between sweeps');
+    for (let sweeps = 0; sweeps < 8 && keeper.figures().cold < 4096; sweeps++)
+    {
+        step(200);
+    }
+    assert.equal(keeper.figures().cold, 4096, 'the rest at the sweeps after');
+});

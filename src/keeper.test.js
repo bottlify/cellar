@@ -1443,7 +1443,12 @@ test('a pass compacts a mebibyte at most past its first body; the next sweep mov
     {
         reader.put(`a${i}`, bodyOf(512 * KIB, i));
     }
-    step(100);
+    // A sweep cools 4 MiB past its first body: the rest at the next.
+    for (let sweeps = 0; sweeps < 4 && keeper.figures().cold < 15; sweeps++)
+    {
+        step(100);
+    }
+    assert.equal(keeper.figures().cold, 15);
     await settle();
     // Past what pack-0 has left: pack-1 is the one bodies go to.
     reader.put('b', bodyOf(600 * KIB, 99));

@@ -121,6 +121,15 @@ const COMPACT_LIVE = 1 / 4;
  * 64 MiB a quarter live is 16 MiB moved. The rest moves at the next sweep.
  */
 const COMPACT_PASS_BYTES = 1 << 20;
+/**
+ * The bytes of idle bodies a sweep cools past its first: a sweep is the
+ * keeper's thread's, between the calls it answers, and cooling costs about 2
+ * ms a MiB of small bodies (20000 bodies of 4 KiB held it 112 ms). The rest
+ * cool at the sweeps after, each started and finished in its own sweep, so
+ * none is left moving between them. Room wanted now (`room`, `makeRoom`)
+ * cools what it needs, past this.
+ */
+const COOL_PASS_BYTES = 4 << 20;
 
 /** What `append` answers where it wrote nothing: no pack open yet, or the disk refused. */
 const NOT_YET = -1;
@@ -2821,6 +2830,7 @@ export async function openKeeper(options){
             Atomics.store(words, H_TICK, at);
             /** Idle bodies held and written, to leave memory once their packs are flushed. @type {number[]} */
             const cooling = [];
+            let coolingBytes = 0;
             for (let id = 0; id < words[H_COUNT]; id++)
             {
                 const word = stateWordOf(id);
@@ -2857,9 +2867,12 @@ export async function openKeeper(options){
                 }
                 else if (state === HOT && readersOf(word) === 0
                     && (get(id, R_FLAGS) & F_FOR_ROOM) === 0
-                    && age(at, get(id, R_TICK)) >= coldAfterMs && startCooling(id))
+                    && age(at, get(id, R_TICK)) >= coldAfterMs
+                    && (cooling.length === 0 || coolingBytes + get(id, R_LENGTH) <= COOL_PASS_BYTES)
+                    && startCooling(id))
                 {
                     cooling.push(id);
+                    coolingBytes += get(id, R_LENGTH);
                 }
                 else if (state === COLD && (get(id, R_FLAGS) & F_ONLY_COPY) === 0
                     && age(at, get(id, R_TICK)) >= goneAfterMs)
