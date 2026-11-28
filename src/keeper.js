@@ -1397,7 +1397,8 @@ export async function openKeeper(options){
         {
             return found;
         }
-        const own = length > large && !memory;
+        // Held memory past a quarter of a segment is a segment of its own too.
+        const own = length > large;
         // An own segment the writer has not heard of: no body's going makes it one.
         if (own && !(spares.length > 0 && spares[0] < limit))
         {
@@ -1514,14 +1515,36 @@ export async function openKeeper(options){
      * lies at the start of, the old one held (MOVING) and given back only
      * where the new one is sure to be placed: every other body in that block
      * gone first (`evict`, where each can leave), none where it is false.
-     * Within the segment's reach, a shared body for a shared body. Where it
-     * is (a place), or -1 with nothing moved.
+     * Within the segment's reach, a shared body for a shared body. A body
+     * in a segment of its own is that segment's block for a new one of as
+     * many pages or more, the budget growing it to them. Not for fewer: its
+     * buffer grows and never shrinks, and a segment holds no page more than
+     * its body - the old one's pages would stay charged and held unseen, and
+     * a body anywhere takes the pages its length does. Where it is (a place),
+     * or -1 with nothing moved.
      *
      * @param {number} id @param {number} length @param {number} limit @param {boolean} evict
      */
     const reuse = (id, length, limit, evict)=>{
         const segment = get(id, R_SEGMENT);
-        if (segment < 0 || segment >= limit || length > large || segmentAt(segment).buddy === null)
+        if (segment < 0 || segment >= limit)
+        {
+            return -1;
+        }
+        const one = segmentAt(segment);
+        if (one.buddy === null)
+        {
+            const bytes = pageOf(length);
+            if (length <= large || bytes < one.reach || (bytes > one.reach && !grow(segment, bytes)))
+            {
+                return -1;
+            }
+            // The segment the new body's from now on: not let go of with the old one.
+            set(id, R_SEGMENT, -1);
+            one.length = length;
+            return segment * segmentBytes;
+        }
+        if (length > large)
         {
             return -1;
         }

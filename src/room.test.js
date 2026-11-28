@@ -104,6 +104,45 @@ test('a body written anew in the room of its old one moves no other body', async
     assert.equal(reader.with('a', body=>body[0]), 3);
 });
 
+test('a body of its own segment written anew takes that segment where it needs its pages, and moves'
+    + ' no other body', async()=>{
+    for (const length of [8192, 6000])
+    {
+        const { reader, keeper } = await cacheOf({ budget: 16 * KIB, segmentBytes: 4 * KIB });
+        reader.put('a', bytes(8192, 1));
+        reader.put('b', bytes(8192, 2));
+        assert.equal(reader.put('a', bytes(length, 9)), true, `${length}`);
+        assert.equal(reader.look('b'), 'hot', `b stays for ${length}`);
+        assert.deepEqual(reader.with('a', body=>[body.length, body[0], body[length - 1]]), [length, 9, 9]);
+        assert.deepEqual(reader.with('b', body=>[body.length, body[0]]), [8192, 2]);
+        const figures = keeper.figures();
+        assert.equal(figures.placedBytes, 16384, 'its pages held, the rest of them rounding');
+        assert.equal(figures.roundingBytes, 8192 - length);
+    }
+    // Fewer pages are placed afresh: the segment would hold pages past its
+    // body. Beside an only copy with nowhere to go, the old body stays.
+    const { reader } = await cacheOf({ budget: 16 * KIB, segmentBytes: 4 * KIB });
+    reader.put('a', bytes(8192, 1));
+    reader.put('b', bytes(8192, 2), ONLY);
+    assert.equal(reader.put('a', bytes(4096, 9)), false);
+    assert.deepEqual(reader.with('a', body=>[body.length, body[0]]), [8192, 1], 'a as it was');
+    assert.equal(reader.look('b'), 'hot');
+});
+
+test('a body of its own segment written anew larger grows its segment where the budget has the'
+    + ' pages, and moves nothing where it has not', async()=>{
+    const { reader, keeper } = await cacheOf({ budget: 24 * KIB, segmentBytes: 4 * KIB });
+    reader.put('a', bytes(8192, 1), ONLY);
+    reader.put('b', bytes(8192, 2));
+    assert.equal(reader.put('a', bytes(12288, 9), ONLY), true, 'the budget grows it by 4 KiB');
+    assert.equal(reader.look('b'), 'hot');
+    assert.equal(keeper.figures().placedBytes, 20480);
+    // a an only copy with no disk to go to: nothing can leave for b.
+    assert.equal(reader.put('b', bytes(16384, 3)), false, 'past the budget');
+    assert.deepEqual(reader.with('b', body=>[body.length, body[0]]), [8192, 2], 'b as it was');
+    assert.deepEqual(reader.with('a', body=>[body.length, body[0]]), [12288, 9]);
+});
+
 test('a body for a segment the writer has not heard of yet moves nothing: it is refused unseen',
     async()=>{
     const { keeper, reader } = await cacheOf({ budget: 64 * KIB, segmentBytes: 16 * KIB });
@@ -133,6 +172,33 @@ test('an own segment the engine would not make once is made again when a large b
         assert.ok(keeper.figures().segmentFailures >= 1);
         assert.ok(reader.put('first', bytes(8192)) || reader.put('second', bytes(8192)),
             'a large body is placed once its segment is made again and heard of');
+    }
+    finally
+    {
+        /** @type {any} */ (globalThis).SharedArrayBuffer = Real;
+    }
+});
+
+test('large memory held with no own segment to be had moves nothing, and is had once one is', async()=>{
+    const Real = SharedArrayBuffer;
+    let refuse = 1;
+    /** @type {any} */ (globalThis).SharedArrayBuffer = new Proxy(Real, { construct(target, args){
+        if (args[1]?.maxByteLength !== undefined && args[0] === 0 && refuse-- > 0)
+        {
+            throw new RangeError('no address space');
+        }
+        return Reflect.construct(target, args);
+    } });
+    try
+    {
+        const { keeper, reader } = await cacheOf({ budget: 64 * KIB, segmentBytes: 16 * KIB });
+        assert.ok(keeper.figures().segmentFailures >= 1);
+        assert.equal(reader.put('small', bytes(4096)), true);
+        assert.equal(reader.hold('held', 8192), null, 'no segment of its own yet');
+        assert.equal(reader.look('small'), 'hot', 'and nothing went for it');
+        assert.ok(reader.hold('held', 8192) ?? reader.hold('held', 8192),
+            'held once its segment is made again and heard of');
+        assert.equal(reader.look('small'), 'hot');
     }
     finally
     {
