@@ -10,11 +10,14 @@
  * shared memory included, and the UTF-16 units a name is kept in. Text of
  * ASCII, as names and most messages are, makes nothing on the heap to write
  * and only its string to read.
+ *
+ * A browser's `TextEncoder.encodeInto` and `TextDecoder.decode` both refuse
+ * a view of shared memory, where node's take one: so text is encoded here,
+ * in place, and decoded from a copy when it lies in shared memory.
  */
 
-const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-/** Whether shared memory exists here: a browser's decoder refuses a view of it. */
+/** Whether shared memory exists here. */
 const SHARED = typeof SharedArrayBuffer === 'function';
 
 /** A surrogate with no partner: what UTF-8 cannot carry. */
@@ -30,25 +33,48 @@ export const wellFormed = text=>!LONE_SURROGATE.test(text);
 
 /**
  * Writes `text` as UTF-8 into `bytes` from `at`, as much as fits before
- * `end` (whole characters): the bytes written. A view of shared memory is
- * written in place.
+ * `end` (whole characters): the bytes written. A lone surrogate is written
+ * as U+FFFD, as `TextEncoder` writes it. A view of shared memory is written
+ * in place.
  *
  * @param {Uint8Array} bytes @param {number} at @param {string} text
  * @param {number} [end]
  */
 export const writeText = (bytes, at, text, end = bytes.length)=>{
-    const room = end - at;
-    const ascii = Math.min(text.length, room);
-    for (let n = 0; n < ascii; n++)
+    let to = at;
+    for (let n = 0; n < text.length; n++)
     {
-        const code = text.charCodeAt(n);
-        if (code >= 0x80)
+        let code = text.charCodeAt(n);
+        if (code >= 0xd800 && code < 0xe000)
         {
-            return n + encoder.encodeInto(text.slice(n), bytes.subarray(at + n, end)).written;
+            const low = text.charCodeAt(n + 1);
+            if (code < 0xdc00 && low >= 0xdc00 && low < 0xe000)
+            {
+                code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+            }
+            else
+            {
+                code = 0xfffd;
+            }
         }
-        bytes[at + n] = code;
+        const size = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+        if (to + size > end)
+        {
+            break;
+        }
+        if (size === 1)
+        {
+            bytes[to++] = code;
+            continue;
+        }
+        bytes[to++] = size === 2 ? 0xc0 | code >> 6 : size === 3 ? 0xe0 | code >> 12 : 0xf0 | code >> 18;
+        for (let shift = (size - 2) * 6; shift >= 0; shift -= 6)
+        {
+            bytes[to++] = 0x80 | code >> shift & 0x3f;
+        }
+        n += size === 4 ? 1 : 0;
     }
-    return ascii;
+    return to - at;
 };
 
 /** The most a string is made from at once: a call takes no more arguments than that. */
