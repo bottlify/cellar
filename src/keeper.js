@@ -1043,8 +1043,19 @@ export async function openKeeper(options){
         for (const id of taken)
         {
             const flags = get(id, R_FLAGS);
-            if ((flags & F_DROP) === 0 && (flags & F_ON_DISK) === 0 && !writeOut(id)
+            if ((flags & F_DROP) === 0 && (flags & F_ON_DISK) === 0 && !writeOut(id, false)
                 && (flags & F_ONLY_COPY) !== 0)
+            {
+                return giveUp();
+            }
+        }
+        // The packs the only copies lie in flushed, each once; one that fails
+        // forgets the copies it may have lost.
+        for (const id of taken)
+        {
+            const flags = get(id, R_FLAGS);
+            if ((flags & (F_DROP | F_ONLY_COPY)) === F_ONLY_COPY
+                && ((flags & F_ON_DISK) === 0 || !flushPack(get(id, R_PACK))))
             {
                 return giveUp();
             }
@@ -1600,9 +1611,18 @@ export async function openKeeper(options){
      *
      * @param {number} id
      */
-    const cool = id=>{
-        const index_ = index.at(id) + R_STATE;
-        if (Atomics.compareExchange(words, index_, stateWord(HOT), stateWord(MOVING))
+    const cool = id=>startCooling(id) && finishCooling(id);
+
+    /**
+     * The first half of `cool`, for many bodies before any finishes: the
+     * body held (HOT to MOVING, which no reader enters) and its copy written
+     * where the disk lacks one, not flushed; or, asked away, gone now. False
+     * where it is read.
+     *
+     * @param {number} id
+     */
+    const startCooling = id=>{
+        if (Atomics.compareExchange(words, index.at(id) + R_STATE, stateWord(HOT), stateWord(MOVING))
             !== stateWord(HOT))
         {
             return false;
@@ -1617,8 +1637,33 @@ export async function openKeeper(options){
             counts.gone++;
             return true;
         }
+        if ((get(id, R_FLAGS) & F_ON_DISK) === 0)
+        {
+            writeOut(id, false);
+        }
+        return true;
+    };
+
+    /**
+     * The second half: an only copy's pack flushed, once for every body a
+     * cool wrote there (a pack flushed since is not flushed again), then the
+     * body out of memory - cold, or gone where it can be made again; an only
+     * copy the disk does not hold is hot again, and the answer false.
+     *
+     * @param {number} id
+     */
+    const finishCooling = id=>{
+        if (stateOf(stateWordOf(id)) === GONE)
+        {
+            return true;
+        }
         const onlyCopy = (get(id, R_FLAGS) & F_ONLY_COPY) !== 0;
-        const onDisk = (get(id, R_FLAGS) & F_ON_DISK) !== 0 || writeOut(id);
+        if (onlyCopy && (get(id, R_FLAGS) & F_ON_DISK) !== 0)
+        {
+            // A flush that fails forgets the copies it may have lost.
+            flushPack(get(id, R_PACK));
+        }
+        const onDisk = (get(id, R_FLAGS) & F_ON_DISK) !== 0;
         if (!onDisk && onlyCopy)
         {
             store(id, HOT);
@@ -2380,6 +2425,8 @@ export async function openKeeper(options){
             letGoSeen = Atomics.load(words, H_LET_GO);
             const at = tick();
             Atomics.store(words, H_TICK, at);
+            /** Idle bodies held and written, to leave memory once their packs are flushed. @type {number[]} */
+            const cooling = [];
             for (let id = 0; id < words[H_COUNT]; id++)
             {
                 const word = stateWordOf(id);
@@ -2428,15 +2475,20 @@ export async function openKeeper(options){
                 }
                 else if (state === HOT && readersOf(word) === 0
                     && (get(id, R_FLAGS) & F_FOR_ROOM) === 0
-                    && age(at, get(id, R_TICK)) >= coldAfterMs)
+                    && age(at, get(id, R_TICK)) >= coldAfterMs && startCooling(id))
                 {
-                    cool(id);
+                    cooling.push(id);
                 }
                 else if (state === COLD && (get(id, R_FLAGS) & F_ONLY_COPY) === 0
                     && age(at, get(id, R_TICK)) >= goneAfterMs)
                 {
                     drop(id);
                 }
+            }
+            // Each pack the cooled only copies went to flushed once, not once a body.
+            for (const id of cooling)
+            {
+                finishCooling(id);
             }
             // An own segment went with its body.
             letGoEmpty(releaseAfterMs);

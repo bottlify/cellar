@@ -2065,6 +2065,34 @@ test('a sweep or a save flushes the packs written since their last flush, not ev
     assert.equal(packFlushes() - before, 1);
 });
 
+test('a sweep that cools many only copies flushes their pack once, and none leaves memory before'
+    + ' it; a flush that fails keeps them all hot', async()=>{
+    for (const failing of [false, true])
+    {
+        const disk = crashDisk();
+        const { reader, keeper, step } = await cacheOf({ disk });
+        await settle();
+        for (let i = 0; i < 5; i++)
+        {
+            reader.put(`only${i}`, bodyOf(2 * KIB, i), F_ONLY_COPY);
+        }
+        if (failing)
+        {
+            disk.failing.flush.add('pack-0');
+        }
+        const before = disk.flushes.length;
+        step(150);
+        // A flush that failed is tried again by the sweep's own, once.
+        assert.deepEqual(disk.flushes.slice(before), failing ? ['pack-0', 'pack-0'] : ['pack-0'],
+            'one flush for five');
+        for (let i = 0; i < 5; i++)
+        {
+            assert.equal(reader.look(`only${i}`), failing ? 'hot' : 'cold', `only${i}`);
+        }
+        assert.equal(keeper.figures().cooled, failing ? 0 : 5);
+    }
+});
+
 test('a save flushes each pack once, not once a body; where that flush fails, no body it wrote counts'
     + ' as the disk\'s, so an only copy is written again before it leaves memory', async()=>{
     const disk = crashDisk();

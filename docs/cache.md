@@ -105,7 +105,7 @@ The index is a binary base followed by checksummed deltas. A save appends change
 
 `readSaved([indexA, indexB])` reads the saved index without opening a Keeper or writing. Use `INDEX_FILES` for the filenames and `packFile(n)` for pack names. It reports packs and a map of named `{ pack, offset, length }` bodies, or null if neither index is valid. Validate bodies against actual pack files when reading them; the index describes the last save, not current in-memory state. Invalid entries are excluded.
 
-A short write counts as failure. After a failed pack flush, copies written since its last successful flush are not trusted: hot bodies can be written again and recreatable cold bodies can be lost (`lostOnDisk`). A short read of a cold recreatable body loses it; an only copy remains cold and the read is counted as a failure. On a subsequent open, entries outside the file are skipped (`skippedEntries`).
+An only copy leaves memory only once its copy is flushed; a sweep or a reserve that cools several writes them all, flushes each pack they went to once, and then lets them go (all hot again where that flush fails). A short write counts as failure. After a failed pack flush, copies written since its last successful flush are not trusted: hot bodies can be written again and recreatable cold bodies can be lost (`lostOnDisk`). A short read of a cold recreatable body loses it; an only copy remains cold and the read is counted as a failure. On a subsequent open, entries outside the file are skipped (`skippedEntries`).
 
 If reading an index file throws or returns short, opening the Keeper rejects and leaves the disk alone. The application may retry later or run with `disk: null` rather than overwrite a store it could not inspect.
 
