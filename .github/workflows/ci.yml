@@ -33,6 +33,13 @@ jobs:
       - run: npm run test:ordering
         env:
           CELLAR_EXPECT_REORDERING: '1'
+      # The same gates in Chrome, whose engine may move what node's does not
+      # (scripts/browser-gate.mjs): the image's own Chrome, on the arm Mac.
+      - if: matrix.os == 'macos-latest'
+        run: npm run test:browser
+        env:
+          CELLAR_EXPECT_REORDERING: '1'
+          CHROME: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 
   check-and-build:
     needs: arm64

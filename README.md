@@ -117,6 +117,8 @@ npm run check
 
 The check runs type checking, unit tests, integration gates and the build. `npm run build` writes the ES modules, declarations and checksums to `dist/`. GitHub CI runs the checks and publishes new versions as releases.
 
+`npm run test:browser` runs the gates whose answer depends on the engine in a headless Chrome: the memory-ordering gate and its mutants, and the cases where a browser treats shared memory otherwise than Node.js (its text encoder and decoder refuse a shared view, its page thread may not block, OPFS's synchronous handles take shared views). They are the same case bodies Node.js runs (`src/*.cases.fixture.js`), served cross-origin isolated and driven over the DevTools protocol, so the gate needs a Chrome and no package. `CHROME` names the browser if it is not in a usual place. It is not part of `npm run check`; CI runs it on the arm Mac.
+
 ## License
 
 [MPL-2.0](LICENSE).

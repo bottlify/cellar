@@ -5,18 +5,15 @@
  */
 
 /**
- * The threads of the ordering gate (`ordering.itest.js`): a writer and a
- * reader of the journal itself, and a writer and a reader of the two
+ * The threads of the ordering gate (`ordering.cases.fixture.js`): a writer
+ * and a reader of the journal itself, and a writer and a reader of the two
  * shapes beside it that say what the machine does - plain words with no
- * atomic at all, and a sequence check with no bracket.
+ * atomic at all, and a sequence check with no bracket. The same file is a
+ * node worker (its role in `workerData`) and a browser's module worker (its
+ * role in the first message).
  */
 
-import { parentPort, workerData } from 'node:worker_threads';
 import { openJournal } from './journal.js';
-
-const { role, memory, control } = workerData;
-const stop = new Int32Array(control);
-const stopped = ()=>Atomics.load(stop, 0) !== 0;
 
 /** Words a record or block holds; each one says the write it is of. */
 const WORDS = 16;
@@ -24,9 +21,9 @@ const WORDS = 16;
 const SEQ = 0;
 const DATA = 128;
 
-/** @type {Record<string, () => Record<string, number>>} */
+/** @type {Record<string, (memory: any, stopped: () => boolean) => Record<string, number>>} */
 const roles = {
-    journalWriter(){
+    journalWriter(memory, stopped){
         const journal = openJournal(memory);
         let written = 0;
         while (!stopped())
@@ -45,7 +42,7 @@ const roles = {
         }
         return { written };
     },
-    journalReader(){
+    journalReader(memory, stopped){
         const journal = openJournal(memory);
         let read = 0;
         let torn = 0;
@@ -85,7 +82,7 @@ const roles = {
         }
         return { read, torn };
     },
-    plainWriter(){
+    plainWriter(memory, stopped){
         const w = new Int32Array(memory);
         let k = 0;
         while (!stopped())
@@ -102,7 +99,7 @@ const roles = {
         }
         return { written: k };
     },
-    plainReader(){
+    plainReader(memory, stopped){
         const w = new Int32Array(memory);
         let read = 0;
         let torn = 0;
@@ -124,7 +121,7 @@ const roles = {
         }
         return { read, torn };
     },
-    bareWriter(){
+    bareWriter(memory, stopped){
         const w = new Int32Array(memory);
         let k = 0;
         while (!stopped())
@@ -142,7 +139,7 @@ const roles = {
         }
         return { written: k };
     },
-    bareReader(){
+    bareReader(memory, stopped){
         const w = new Int32Array(memory);
         const copy = new Int32Array(WORDS);
         let read = 0;
@@ -177,4 +174,18 @@ const roles = {
     },
 };
 
-parentPort?.postMessage(roles[role]());
+/** @param {{ role: string, memory: unknown, control: SharedArrayBuffer }} data */
+const run = ({ role, memory, control })=>{
+    const stop = new Int32Array(control);
+    return roles[role](memory, ()=>Atomics.load(stop, 0) !== 0);
+};
+
+if (typeof process === 'object' && process.versions?.node)
+{
+    const { parentPort, workerData } = await import('node:worker_threads');
+    parentPort?.postMessage(run(workerData));
+}
+else
+{
+    self.onmessage = ({ data })=>postMessage(run(data));
+}

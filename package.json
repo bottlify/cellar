@@ -48,6 +48,7 @@
     "test": "node --test --test-timeout=60000 \"src/**/*.test.js\"",
     "test:integration": "node --test --test-timeout=600000 \"src/**/*.itest.js\"",
     "test:ordering": "node scripts/ordering-mutants.mjs",
+    "test:browser": "node scripts/browser-gate.mjs",
     "typecheck": "tsc -p jsconfig.json",
     "build": "node scripts/build.mjs",
     "prepack": "node scripts/build.mjs",
