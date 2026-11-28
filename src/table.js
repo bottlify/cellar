@@ -14,9 +14,14 @@
  * (low, high; two's complement); a fraction goes in units its column's
  * name says (nanoseconds, parts per million), rounded. One thread writes a
  * table with plain stores: an add that does not carry stores the low word,
- * read whole by the standard (ECMA-262 `IsNoTearConfiguration`). A write to
- * the high word marks it busy, then stores both through `Atomics`; a reader
- * takes high, low, high until the highs agree and are not busy. A row is
+ * read whole by the standard (ECMA-262 `IsNoTearConfiguration`). The high
+ * word holds the value's high part in its low 23 bits and, above them, a
+ * version the writer moves on each change of that part: a write to it marks
+ * the word busy, then stores both through `Atomics`; a reader takes high,
+ * low, high until the two highs are the same word and not busy. Without the
+ * version, two writes between a reader's looks that left the high part as it
+ * was (-1, 5, -3) read as the first high part and the second low word; with
+ * it, that takes 128 changes of the high part between two loads. A row is
  * not read whole. The counts are atomic: a row filled before a count was
  * published is seen filled by a reader that read that count.
  *
@@ -36,6 +41,14 @@ const WRITTEN = 1;
 const HEADER_BYTES = 8;
 /** A high word no value within 2^53 has: the writer is between the words. */
 const BUSY = 0x40000000;
+/** A high word's value part, 23 bits of two's complement: every high part within 2^53. */
+const PART = 0x7fffff;
+/** A high word's version, below BUSY and above the value part. */
+const VERSION = 0x800000;
+const VERSIONS = 0x3f800000;
+const MOST = 2 ** 53;
+/** 2^53's high part. */
+const TOP = MOST / 2 ** 32;
 /** How long a reader looks at a cell whose words never agree before it says so. */
 const STUCK_MS = 1000;
 /** A slot's word: its generation above, its state in the two bits below. */
@@ -105,19 +118,23 @@ export function openTable(memory){
     const cellOf = (at, column)=>(at * width + column) * 2;
     /** The writer's: the cell at `cell` holds `value`. @param {number} cell @param {number} value */
     const put = (cell, value)=>{
-        if (!Number.isFinite(value))
+        if (!Number.isInteger(value) || Math.abs(value) > MOST)
         {
             throw new RangeError(`table: ${value} is not a number a cell holds`);
         }
-        const high = Math.floor(value / 2 ** 32) >>> 0;
-        if (words[cell + 1] !== high)
+        const part = Math.floor(value / 2 ** 32) & PART;
+        const was = words[cell + 1];
+        if ((was & PART) !== part)
         {
             Atomics.store(words, cell + 1, BUSY);
             Atomics.store(words, cell, value >>> 0);
-            Atomics.store(words, cell + 1, high);
+            Atomics.store(words, cell + 1, (was + VERSION & VERSIONS | part) >>> 0);
+            return;
         }
         words[cell] = value >>> 0;
     };
+    /** A high word's value part, its sign carried. @param {number} high */
+    const partOf = high=>(high << 9) >> 9;
     /** @param {number} at @param {number} column */
     const get = (at, column)=>{
         const cell = cellOf(at, column);
@@ -127,7 +144,7 @@ export function openTable(memory){
             const low = Atomics.load(words, cell);
             if (high !== BUSY && Atomics.load(words, cell + 1) === high)
             {
-                return (high | 0) * 2 ** 32 + low;
+                return partOf(high) * 2 ** 32 + low;
             }
             if (since > 0 && performance.now() - since > STUCK_MS)
             {
@@ -205,12 +222,13 @@ export function openTable(memory){
         add: (at, column, amount)=>{
             const cell = cellOf(at, column);
             const low = words[cell] + Math.round(amount);
-            if (low >= 0 && low <= 0xffffffff)
+            // Only 2^53's high part can be stepped past in the low word alone.
+            if (low >= 0 && low <= 0xffffffff && (words[cell + 1] & PART) !== TOP)
             {
                 words[cell] = low;
                 return;
             }
-            put(cell, (words[cell + 1] | 0) * 2 ** 32 + low);
+            put(cell, partOf(words[cell + 1]) * 2 ** 32 + low);
         },
         get,
         use: count=>{

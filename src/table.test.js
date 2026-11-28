@@ -96,6 +96,53 @@ test('a cell its writer left between its two words is said, not read as a number
     assert.throws(()=>table.get(0, 0), /half-written/);
 });
 
+test('a cell whose high word changes twice between a reader\'s two looks at it is not read torn',
+    ()=>{
+    // -1, 5 and -3 have high words 0xffffffff, 0, 0xffffffff: a reader that
+    // looked at the high word, then the low one, then the high one again, with
+    // the writer storing 5 and then -3 between, saw the same high word twice.
+    const table = openTable(createTableMemory({ rows: 1, columns: ['delta'] }));
+    table.set(0, 0, -1);
+    const load = Atomics.load;
+    let looks = 0;
+    /** @type {any} */ (Atomics).load = (/** @type {any} */ array, /** @type {number} */ index)=>{
+        const value = load(array, index);
+        if (++looks === 1)
+        {
+            table.set(0, 0, 5);
+        }
+        else if (looks === 2)
+        {
+            table.set(0, 0, -3);
+        }
+        return value;
+    };
+    let read;
+    try
+    {
+        read = table.get(0, 0);
+    }
+    finally
+    {
+        /** @type {any} */ (Atomics).load = load;
+    }
+    assert.ok([-1, 5, -3].includes(read), `${read} is a value the writer stored`);
+});
+
+test('a value past 2^53 either way is refused, not stored for a reader to stall on', ()=>{
+    // 2^62's high part would be the word a busy writer leaves.
+    const table = openTable(createTableMemory({ rows: 1, columns: ['big'] }));
+    for (const value of [2 ** 53 + 2, -(2 ** 53 + 2), 2 ** 62, -(2 ** 62)])
+    {
+        assert.throws(()=>table.set(0, 0, value), RangeError, String(value));
+    }
+    table.set(0, 0, -(2 ** 53));
+    assert.equal(table.get(0, 0), -(2 ** 53));
+    table.set(0, 0, 2 ** 53);
+    assert.equal(table.get(0, 0), 2 ** 53);
+    assert.throws(()=>table.add(0, 0, 2), RangeError, 'an add past it too');
+});
+
 test('a reader on another thread sees a counter added to across the carry into its high word',
     { timeout: 60_000 }, async()=>{
     // Each add carries every other time: a read of the low word of one value
