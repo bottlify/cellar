@@ -115,6 +115,8 @@ Packs with less than a quarter of their file occupied by live bodies are compact
 
 Files are removed when the Disk provides `remove`, otherwise truncated. `figures()` counts a pack let go of in `packsRemoved` at once, its bytes in `reclaimedBytes` only once its file is gone, and the packs let go of whose file is not gone yet (a removal pending, or one the disk failed, left to the next run) in `going`. Indexes track packs still opening or pending removal so that failed removals and crashes can be cleaned up on a later run. Pack numbers are allocated beyond those named by either recoverable index. Opening a store also releases unreferenced packs, including bodies written for the previous run only.
 
+A pack a copy could not be read from (the read threw, or an only copy came back short) is set aside for the run (`packsSetAside`): compaction does not try it again at every sweep, and a raise of a body there still reads its own copy.
+
 When disk writes are refused, the next sweep attempts to reclaim the least recently used pack that contains no only copy, discarding recreatable bodies to make room for newer ones.
 
 ## Closing and failure contracts

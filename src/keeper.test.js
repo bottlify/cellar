@@ -1468,6 +1468,34 @@ test('a pack let go of is reclaimed once its file is gone: until then, and where
     }
 });
 
+test('a pack whose only copy cannot be read is set aside: compaction tries it once, not at every'
+    + ' sweep, and a raise still tries its body', async()=>{
+    const disk = crashDisk();
+    const { reader, keeper, step } = await cacheOf({ disk, packBytes: 16 * KIB });
+    reader.put('only', bodyOf(2 * KIB, 1), F_ONLY_COPY);
+    reader.put('a', bodyOf(12 * KIB, 2));
+    step(150);
+    await settle();
+    reader.put('b', bodyOf(12 * KIB, 3));
+    step(150);
+    await settle();
+    // a written anew: pack-0 is the only copy alone, a seventh of it live.
+    reader.put('a', bodyOf(12 * KIB, 4));
+    disk.failing.read.add('pack-0');
+    const failures = keeper.figures().diskFailures;
+    for (let i = 0; i < 4; i++)
+    {
+        step(1);
+    }
+    assert.equal(keeper.figures().diskFailures - failures, 1, 'read once');
+    assert.equal(keeper.figures().packsSetAside, 1);
+    assert.equal(reader.look('only'), 'cold', 'the only copy stays where it is');
+    assert.equal(keeper.raise('only'), false);
+    assert.equal(keeper.figures().diskFailures - failures, 2, 'a raise reads it again');
+    disk.failing.read.clear();
+    assert.deepEqual(reader.with('only', body=>[...body], { wait: true }), [...bodyOf(2 * KIB, 1)]);
+});
+
 test('a keeper opening an index lets go of the packs no body of it is in: what the run before'
     + ' wrote for itself', async()=>{
     const disk = memoryDisk();

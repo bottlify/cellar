@@ -1382,6 +1382,16 @@ export async function openKeeper(options){
         }
     };
 
+    /**
+     * Packs a copy could not be read from in this run (the read threw, or an
+     * only copy came back short): not compacted any more, as the same read
+     * would fail at every sweep and hold up the packs behind it. A raise
+     * still tries its own body there.
+     *
+     * @type {Set<number>}
+     */
+    const setAside = new Set();
+
     /** @param {number} number @param {number} bytes */
     const addLive = (number, bytes)=>{
         live.set(number, (live.get(number) ?? 0) + bytes);
@@ -1566,6 +1576,7 @@ export async function openKeeper(options){
         live.delete(number);
         filled.delete(number);
         durable.delete(number);
+        setAside.delete(number);
         if (number === pack)
         {
             pack = -1;
@@ -1807,6 +1818,7 @@ export async function openKeeper(options){
                 return false;
             }
             counts.diskFailures++;
+            setAside.add(get(id, R_PACK));
             store(id, COLD);
             return false;
         }
@@ -1906,6 +1918,7 @@ export async function openKeeper(options){
                 if (read !== length)
                 {
                     counts.diskFailures++;
+                    setAside.add(number);
                     return;
                 }
             }
@@ -1941,7 +1954,7 @@ export async function openKeeper(options){
         for (const [number, bytes] of filled)
         {
             const share = /** @type {number} */ (live.get(number)) / bytes;
-            if (number !== pack && bytes > 0 && share > 0 && share < COMPACT_LIVE
+            if (number !== pack && !setAside.has(number) && bytes > 0 && share > 0 && share < COMPACT_LIVE
                 && (emptiest < 0 || share < /** @type {number} */ (live.get(emptiest))
                     / /** @type {number} */ (filled.get(emptiest))))
             {
@@ -2718,6 +2731,7 @@ export async function openKeeper(options){
             live.clear();
             filled.clear();
             durable.clear();
+            setAside.clear();
             changed.clear();
             slots.length = 0;
             readyPack = null;
@@ -2773,6 +2787,7 @@ export async function openKeeper(options){
                 packs: packs.size,
                 // Let go of, the file not gone yet: removal pending, or failed and left to the next run.
                 going: going.size,
+                packsSetAside: setAside.size,
                 diskBytes: [...filled.values()].reduce((sum, bytes)=>sum + bytes, 0),
                 liveDiskBytes: [...live.values()].reduce((sum, bytes)=>sum + bytes, 0),
                 ...counts,
