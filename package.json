@@ -49,11 +49,12 @@
     "test:integration": "node --test --test-timeout=600000 \"src/**/*.itest.js\"",
     "test:ordering": "node scripts/ordering-mutants.mjs",
     "test:browser": "node scripts/browser-gate.mjs",
+    "test:bench": "node scripts/bench-gate.mjs",
     "typecheck": "tsc -p jsconfig.json",
     "build": "node scripts/build.mjs",
     "prepack": "node scripts/build.mjs",
     "prepare": "node scripts/build.mjs",
-    "check": "npm run typecheck && npm test && npm run test:integration && npm run build"
+    "check": "npm run typecheck && npm test && npm run test:integration && npm run test:bench && npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
