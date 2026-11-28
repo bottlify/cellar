@@ -15,6 +15,9 @@
  * `makeRoom` on its own thread, a remote keeper's elsewhere): the keeper lets
  * cold bodies go until the sum fits. Only where that makes none is the take
  * refused, counted on the account and on its kind, and told (`onRefused`).
+ * What its holder cannot do without (code the program runs) is taken past
+ * the limit instead (`overdraw`): counted, the account over its limit for all
+ * to see, and told (`onOverdrawn`) - never held uncounted.
  *
  * A kind may have a ceiling of its own inside the limit (the cache's
  * segments, say): its sum never passes it, whatever room the limit has.
@@ -45,6 +48,7 @@ const REFUSED = 3;
 const ROOM_ASKED = 4;
 const ROOM_MADE = 5;
 const KINDS = 6;
+const OVERDRAWN = 7;
 const HEADER = 8;
 /** Each kind's words: what it holds, its ceiling, the most it held, takes refused. */
 const K_HELD = 0;
@@ -125,6 +129,7 @@ export function createAccountMemory({ limit, kinds }){
  * @property {number} refused  takes refused
  * @property {number} roomAsked  takes that asked for room
  * @property {number} roomMade  of them, those room was made for
+ * @property {number} overdrawn  takes made past the limit (`overdraw`)
  * @property {Record<string, { bytes: number, ceiling: number | null, peak: number,
  *     refused: number }>} kinds
  * @property {Record<string, Record<string, number>>} holders  each holder out but
@@ -138,6 +143,8 @@ export function createAccountMemory({ limit, kinds }){
  * @property {(bytes: number, kind: string) => boolean} take  room for `bytes`
  *     more of `kind`, room asked for where it does not fit; false and nothing
  *     taken where none was made
+ * @property {(bytes: number, kind: string) => void} overdraw  `bytes` more of `kind`
+ *     taken whatever the limit and the ceiling, counted and told
  * @property {(bytes: number, kind: string) => void} give  never more than the holder holds
  * @property {(bytes: number, kind: string, to: number) => void} move  what this
  *     holder holds handed to holder `to`, the sum unchanged
@@ -155,15 +162,19 @@ export function createAccountMemory({ limit, kinds }){
 /**
  * The account seen from one thread, taking for `holder`. `room(bytes)`: make
  * room for `bytes` more, true where it did (the keeper's `makeRoom`);
- * `onRefused`: a take refused once room was asked for.
+ * `onRefused`: a take refused once room was asked for; `onOverdrawn`: a take
+ * made past the limit.
  *
  * @param {AccountMemory} memory
  * @param {{ holder?: number, room?: ((bytes: number) => boolean) | null,
  *     onRefused?: (refusal: { kind: string, bytes: number, used: number,
+ *     limit: number | null }) => void,
+ *     onOverdrawn?: (refusal: { kind: string, bytes: number, used: number,
  *     limit: number | null }) => void }} [options]
  * @returns {Account}
  */
-export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefused = ()=>{} } = {}){
+export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefused = ()=>{},
+    onOverdrawn = ()=>{} } = {}){
     const words = new Int32Array(memory.buffer, 0, WORDS);
     const count = words[KINDS];
     if (memory.kinds.length !== count)
@@ -300,6 +311,17 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             onRefused({ kind, bytes, used: load(USED) * ACCOUNT_UNIT, limit: bytesOrNone(load(LIMIT)) });
             return false;
         },
+        overdraw(bytes, kind){
+            const at = indexOf(kind);
+            const units = unitsOf(bytes);
+            add(KINDS_AT + at * KIND_WORDS + K_HELD, units);
+            add(USED, units);
+            add(holderWord(holder, at), units);
+            add(OVERDRAWN, 1);
+            notePeak(PEAK, load(USED));
+            notePeak(KINDS_AT + at * KIND_WORDS + K_PEAK, load(KINDS_AT + at * KIND_WORDS + K_HELD));
+            onOverdrawn({ kind, bytes, used: load(USED) * ACCOUNT_UNIT, limit: bytesOrNone(load(LIMIT)) });
+        },
         give(bytes, kind){
             const at = indexOf(kind);
             const given = takeFrom(holderWord(holder, at), unitsOf(bytes));
@@ -385,7 +407,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             }
             return { limit: bytesOrNone(load(LIMIT)), used: load(USED) * ACCOUNT_UNIT,
                 peak: load(PEAK) * ACCOUNT_UNIT, refused: load(REFUSED), roomAsked: load(ROOM_ASKED),
-                roomMade: load(ROOM_MADE), kinds, holders };
+                roomMade: load(ROOM_MADE), overdrawn: load(OVERDRAWN), kinds, holders };
         },
     };
 }
@@ -398,7 +420,8 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
  * compiled code beside its wasm bytes).
  *
  * @param {Account} account @param {string} kind @param {number} [weight]
- * @returns {{ take(bytes: number): boolean, give(bytes: number): void, held(): number }}
+ * @returns {{ take(bytes: number): boolean, overdraw(bytes: number): void,
+ *     give(bytes: number): void, held(): number }}
  */
 export function openCharge(account, kind, weight = 1){
     let held = 0;
@@ -413,6 +436,14 @@ export function openCharge(account, kind, weight = 1){
             }
             held += bytes;
             return true;
+        },
+        overdraw(bytes){
+            const more = unitsFor(held + bytes) - unitsFor(held);
+            if (more > 0)
+            {
+                account.overdraw(more * ACCOUNT_UNIT, kind);
+            }
+            held += bytes;
         },
         give(bytes){
             const fewer = unitsFor(held) - unitsFor(Math.max(0, held - bytes));

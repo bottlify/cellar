@@ -83,6 +83,23 @@ test('a take that does not fit asks for room once, and is taken where room was m
     assert.deepEqual([report.roomAsked, report.roomMade, report.refused], [2, 1, 1]);
 });
 
+test('what cannot be done without is taken past the limit: counted, the account over it, told', ()=>{
+    const memory = createAccountMemory({ limit: 64 * KIB, kinds: { translation: Infinity } });
+    /** @type {any[]} */
+    const told = [];
+    const account = openAccount(memory, { onOverdrawn: one=>told.push(one) });
+    const charge = openCharge(account, 'translation');
+    assert.equal(charge.take(64 * KIB), true);
+    assert.equal(charge.take(ACCOUNT_UNIT), false, 'the limit reached');
+    charge.overdraw(ACCOUNT_UNIT);
+    const report = account.report();
+    assert.equal(report.used, 68 * KIB, 'held past the limit, never uncounted');
+    assert.equal(report.overdrawn, 1);
+    assert.deepEqual(told, [{ kind: 'translation', bytes: ACCOUNT_UNIT, used: 68 * KIB, limit: 64 * KIB }]);
+    charge.give(68 * KIB);
+    assert.equal(account.report().used, 0);
+});
+
 test('a charge of any size takes whole units only where its sum crosses one, weighed', ()=>{
     const account = openAccount(createAccountMemory({ limit: 1 * MIB, kinds: { translation: Infinity } }));
     const charge = openCharge(account, 'translation', 4);
