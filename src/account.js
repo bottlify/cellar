@@ -181,7 +181,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
     {
         throw new RangeError(`account: ${memory.kinds.length} kinds named, the memory holds ${count}`);
     }
-    if (!(holder >= 0 && holder < HOLDERS))
+    if (!Number.isInteger(holder) || holder < 0 || holder >= HOLDERS)
     {
         throw new RangeError(`account: no holder ${holder}`);
     }
@@ -204,6 +204,21 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
     };
     /** @param {number} who @param {number} kind */
     const holderWord = (who, kind)=>HOLDERS_AT + who * HOLDER_WORDS + 1 + kind;
+    /**
+     * A holder named by a caller: one of the account's numbers, and out where
+     * something is handed to it. Anything else would be another word of the
+     * shared account, or units waiting for whoever claims that number next.
+     *
+     * @param {number} who @param {boolean} out
+     */
+    const named = (who, out)=>{
+        if (!Number.isInteger(who) || who < 0 || who >= HOLDERS
+            || (out && load(HOLDERS_AT + who * HOLDER_WORDS) === 0))
+        {
+            throw new RangeError(`account: no holder ${who}${out ? ' out' : ''}`);
+        }
+        return who;
+    };
     /** @param {number} at @param {number} value */
     const notePeak = (at, value)=>{
         for (;;)
@@ -331,7 +346,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             }
         },
         move(bytes, kind, to){
-            if (to === holder)
+            if (named(to, true) === holder)
             {
                 return;
             }
@@ -353,7 +368,7 @@ export function openAccount(memory, { holder = RUN_HOLDER, room = null, onRefuse
             return RUN_HOLDER;
         },
         release(who){
-            if (who === RUN_HOLDER)
+            if (named(who, false) === RUN_HOLDER)
             {
                 return 0;
             }

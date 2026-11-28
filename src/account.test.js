@@ -184,3 +184,24 @@ test('a keeper with a budget alone holds an account of its own', async()=>{
     await assert.rejects(()=>cacheOf({ budget: undefined,
         account: createAccountMemory({ limit: Infinity, kinds: { cache: Infinity } }) }), /a keeper needs a bound/);
 });
+
+test('a move or a release names a holder that is out, or is refused before any word is touched', ()=>{
+    const memory = createAccountMemory({ limit: 1 << 20, kinds: { code: Infinity, heap: Infinity } });
+    const account = openAccount(memory);
+    const who = account.claim();
+    account.take(8192, 'code');
+    const before = JSON.stringify(account.report());
+    for (const to of [-1, -17, 128, 1.5, NaN, who + 1])
+    {
+        assert.throws(()=>account.move(4096, 'code', to), RangeError, `move to ${to}`);
+    }
+    for (const holder of [-1, -17, 128, 2.5])
+    {
+        assert.throws(()=>account.release(holder), RangeError, `release ${holder}`);
+    }
+    assert.equal(JSON.stringify(account.report()), before, 'nothing counted changed');
+    account.move(4096, 'code', who);
+    assert.equal(openAccount(memory, { holder: who }).heldBy('code'), 4096);
+    assert.equal(account.release(who), 4096);
+    assert.equal(account.release(who), 0, 'a holder released again gives nothing back');
+});
