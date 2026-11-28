@@ -811,3 +811,37 @@ test('a blocking call in place with a time waits that long in all, for its slot 
     const took = performance.now() - started;
     assert.ok(took >= 190 && took < 5000, `${took.toFixed(0)} ms`);
 });
+
+test('a call in place refused by a side that cannot block brings its failure whole, behind any '
+    + 'records that side had still to send', { timeout: 30000 }, async()=>{
+    // The answering side is a page's own thread: Atomics.wait throws there.
+    // It has sent the asking side long calls the ring has no room for yet,
+    // and refuses the word call that comes; its failure is a record behind
+    // those, and the answer's count must not be published before it is out.
+    const { a, b } = createLinkMemory({ capacity: 256, words: 1, slots: 1 });
+    const worker = kept(new Worker(`
+        const { workerData, parentPort } = require('node:worker_threads');
+        Atomics.wait = ()=>{ throw new TypeError('a page does not block'); };
+        import(workerData.module).then(({ openLink })=>{
+            const link = openLink(workerData.end, {}, { words: ()=>{
+                throw Object.assign(new Error('refused'), { code: 7 });
+            } });
+            for (let i = 0; i < 40; i++)
+            {
+                link.call('sink', 'take', ['x'.repeat(300)]).catch(()=>{});
+            }
+            link.serve();
+            parentPort.postMessage('serving');
+        });`, { eval: true, workerData: { module: LINK, end: a } }));
+    await new Promise(resolve=>worker.once('message', resolve));
+    let taken = 0;
+    const asking = open(b, { sink: { take: ()=>{
+        taken++;
+        return null;
+    } } });
+    asking.request[0] = 1;
+    asking.sendWords();
+    assert.throws(()=>asking.waitWords(10000), (/** @type {any} */ e)=>e.message === 'refused' && e.code === 7,
+        'the failure the other side threw, not "a call in place failed"');
+    assert.ok(taken > 0, 'the records before it were read on the way');
+});

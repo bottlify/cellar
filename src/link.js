@@ -374,6 +374,10 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         {
             flushing = false;
         }
+        if (answersOwed && unsent.length === 0)
+        {
+            publishAnswers();
+        }
     };
     /** @param {Uint8Array} record */
     const send = record=>{
@@ -559,6 +563,24 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
         words[at + FAILED] = failure === undefined ? 0 : 1;
         words[at + ANSWER_BYTES] = failure === undefined ? length : 0;
         callsTaken = (callsTaken + 1) | 0;
+        publishAnswers();
+    };
+    /** Whether answers in place are given and their count not published yet. */
+    let answersOwed = false;
+    /**
+     * Publishes the count of the other side's calls answered, once what this
+     * side sent before them is all in the ring: a failure goes as a record
+     * before its answer, and a side that cannot block keeps what has no room
+     * yet for its next pump (`unsent`); published sooner, the asker would see
+     * the answer and look for a failure not there.
+     */
+    const publishAnswers = ()=>{
+        if (unsent.length > 0)
+        {
+            answersOwed = true;
+            return;
+        }
+        answersOwed = false;
         Atomics.store(words, theirs + ANSWERED, callsTaken);
         sent(outbound.bell.ring());
     };
@@ -986,6 +1008,8 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
             while (state.serving)
             {
                 const seen = bell.seen();
+                // Read before the pump writes what waits: room freed after it is a change past this.
+                const room = outbound.room();
                 const handled = pump();
                 // Closed here, or by the other side: it writes nothing more.
                 if (!state.serving || inbound.closed())
@@ -996,6 +1020,13 @@ export function openLink(end, handlers = {}, { words: wordsHandler, spinMs, afte
                 // the page's own thread does not look for it.
                 if (handled > 0 && canBlock && bell.wait(seen, SPIN_MS, SPIN_MS) !== 'timed-out')
                 {
+                    continue;
+                }
+                // Records still to send wait for the other side to read: its
+                // freeing room is as much a turn as a word sent here.
+                if (unsent.length > 0)
+                {
+                    await Promise.race([bell.waitAsync(seen), outbound.roomAsync(room)]);
                     continue;
                 }
                 await bell.waitAsync(seen);

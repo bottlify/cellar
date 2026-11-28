@@ -60,7 +60,7 @@ for (const command of commands)
 ring.commit(end - at);
 ```
 
-The batch must fit the ring's maximum record size. `reserve(length)` returns an offset or -1 if there is no room. `reserveWaiting` and `reserveWaitingAsync` wait for room; handle timeout before writing if a deadline is supplied. Only one reservation is active per writer. `commit(length)` may publish fewer bytes than reserved; `abandon()` cancels the reservation. Do not access reserved space after committing or abandoning it. `write()` performs the same operation with an intermediate copy.
+The batch must fit the ring's maximum record size. `reserve(length)` returns an offset or -1 if there is no room. `reserveWaiting` and `reserveWaitingAsync` wait for room; handle timeout before writing if a deadline is supplied. `room()` is the count the reader moves as it frees room, and `roomAsync(seen)` settles once it moved past `seen` (or the ring closed), reserving nothing: a writer on an event loop with records waiting reads `room()` before it tries to write, then waits on it. Only one reservation is active per writer. `commit(length)` may publish fewer bytes than reserved; `abandon()` cancels the reservation. Do not access reserved space after committing or abandoning it. `write()` performs the same operation with an intermediate copy.
 
 ## Reading and backpressure
 

@@ -797,3 +797,25 @@ test('memory that is not a ring of this layout is refused at open, not read as c
         /not a ring/, 'a control block too short');
     assert.equal(openRing(a).capacity, 64);
 });
+
+test('a writer waiting on the event loop for room is woken when the reader frees some, and only then',
+    async()=>{
+    const memory = createRingMemory(64);
+    const writer = openRing(memory);
+    const reader = openRing(memory);
+    while (writer.write(new Uint8Array(16)))
+    {
+        // Filled.
+    }
+    const seen = writer.room();
+    let woke = false;
+    const waiting = writer.roomAsync(seen).then(()=>{
+        woke = true;
+    });
+    await new Promise(resolve=>setTimeout(resolve, 20));
+    assert.equal(woke, false, 'no room freed, no wake');
+    reader.drain(()=>{});
+    await waiting;
+    assert.equal(woke, true);
+    assert.notEqual(writer.room(), seen);
+});

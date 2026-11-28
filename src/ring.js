@@ -287,6 +287,17 @@ export function openRing(memory){
             }
         },
 
+        /** The count the reader moves when it frees room: what `roomAsync` waits past. */
+        room: ()=>Atomics.load(control, ROOM),
+        /**
+         * Settles once the reader has freed room since the count was `seen`
+         * (`room`), or the ring closed: for a writer with records waiting for
+         * room and an event loop to keep, which reserves nothing by waiting.
+         *
+         * @param {number} seen @returns {Promise<string>}
+         */
+        roomAsync: seen=>waitForAsync(control, ROOM, seen, ROOM_SLEEPS, Infinity, CLOSED),
+
         /**
          * `reserveWaiting` without blocking the thread: for a writer with an
          * event loop to keep, a page's own above all.
