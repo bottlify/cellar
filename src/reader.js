@@ -117,6 +117,14 @@ export function createReader({ shared, segments = [], keeper }){
      */
     let writing = new Map();
     const GRANTED = 0;
+    /**
+     * Where the keeper writes its answer: a record that never moves, copied
+     * to `GRANTED` once the reserve is back. A reserve that waits on a link
+     * may meet a call that reserves here too and outgrows `places`; an
+     * answer written into the array it was asked with would land in the one
+     * let go of.
+     */
+    const granted = new Int32Array(PLACE_WORDS);
     const counts = {
         hits: 0, misses: 0, cold: 0, moving: 0, unseen: 0, raisedWaiting: 0, reserved: 0,
         refused: 0, abandoned: 0, late: 0,
@@ -333,11 +341,12 @@ export function createReader({ shared, segments = [], keeper }){
     const reserveRoom = (name, length, flags)=>{
         // A second reserve of a name not committed yet replaces the first.
         self.abandon(name);
-        if (!keeper.reserve(name, length, flags, heard, places))
+        if (!keeper.reserve(name, length, flags, heard, granted))
         {
             counts.refused++;
             return false;
         }
+        places.set(granted, GRANTED);
         const view = views[places[GRANTED + P_SEGMENT]];
         if (view === null || view === undefined)
         {

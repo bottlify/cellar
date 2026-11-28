@@ -1013,3 +1013,50 @@ test('memory let go of gives its room back at the next reserve of any name, not 
     assert.ok(reader.reserve('frame/3', 1000), 'a reserve too');
     assert.equal(keeper.figures().placedBytes, grainsOf(1000), 'frame/3 alone is placed');
 });
+
+test('a reserve made while another waits for the keeper, growing the places held, leaves the '
+    + 'waiting one its own room', async()=>{
+    // A remote keeper's reserve waits on a link that serves calls meanwhile,
+    // and one of them may reserve here too: enough of them to outgrow the
+    // reader's places, and the outer answer must still be the outer's.
+    const { keeper } = await cacheOf();
+    let nested = /** @type {(() => void) | null} */ (null);
+    const reader = createReader({
+        shared: keeper.shared, segments: keeper.segmentBuffers(),
+        keeper: {
+            reserve: (name, length, flags, known, place)=>{
+                const inner = nested;
+                nested = null;
+                inner?.();
+                return keeper.reserve(name, length, flags, known, place);
+            },
+            raise: name=>keeper.raise(name),
+            raiseLater: name=>{
+                keeper.raise(name);
+            },
+            drop: name=>{
+                keeper.drop(name);
+            },
+        },
+    });
+    /** @type {Uint8Array[]} */
+    const inner = [];
+    nested = ()=>{
+        for (let i = 0; i < 12; i++)
+        {
+            inner.push(/** @type {Uint8Array} */ (reader.reserve(`inner-${i}`, 512)));
+        }
+    };
+    const outer = /** @type {Uint8Array} */ (reader.reserve('outer', 512));
+    for (const view of inner)
+    {
+        assert.notEqual(view.byteOffset, outer.byteOffset, 'the outer view is no inner one\'s room');
+    }
+    outer.fill(7);
+    assert.equal(reader.commit('outer'), true);
+    inner.forEach((view, i)=>{
+        view.fill(i);
+        assert.equal(reader.commit(`inner-${i}`), true);
+    });
+    assert.deepEqual([.../** @type {any} */ (reader.with('outer', body=>body.slice()))], Array(512).fill(7));
+});
