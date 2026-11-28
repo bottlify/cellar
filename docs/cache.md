@@ -111,7 +111,7 @@ If reading an index file throws or returns short, opening the Keeper rejects and
 
 ## Pack reclamation
 
-Packs with less than a quarter of their file occupied by live bodies are compacted: remaining bodies are appended to a current pack, including hot bodies with a persistent copy. A subsequent save releases packs with no remaining references, unless a recoverable index still names an only copy there.
+Packs with less than a quarter of their file occupied by live bodies are compacted: remaining bodies are appended to a current pack, including hot bodies with a persistent copy. A sweep moves at most 1 MiB past its first body; the rest moves at the next sweeps. A subsequent save releases packs with no remaining references, unless a recoverable index still names an only copy there.
 
 Files are removed when the Disk provides `remove`, otherwise truncated. Indexes track packs still opening or pending removal so that failed removals and crashes can be cleaned up on a later run. Pack numbers are allocated beyond those named by either recoverable index. Opening a store also releases unreferenced packs, including bodies written for the previous run only.
 

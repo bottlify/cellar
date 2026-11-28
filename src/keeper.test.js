@@ -1406,6 +1406,40 @@ test('a pack its bodies fill less than a quarter of is compacted: what is left m
     }
 });
 
+test('a pass compacts a mebibyte at most past its first body; the next sweep moves on, and every'
+    + ' body is read back where it moved', async()=>{
+    const MIB = 1024 * KIB;
+    const { reader, keeper, step } = await cacheOf({ disk: memoryDisk(), packBytes: 8 * MIB,
+        budget: 32 * MIB, segmentBytes: 2 * MIB, goneAfterMs: 1e9 });
+    for (let i = 0; i < 15; i++)
+    {
+        reader.put(`a${i}`, bodyOf(512 * KIB, i));
+    }
+    step(100);
+    await settle();
+    // Past what pack-0 has left: pack-1 is the one bodies go to.
+    reader.put('b', bodyOf(600 * KIB, 99));
+    step(100);
+    assert.equal(keeper.figures().packs, 2);
+    // Three bodies of 512 KiB left live in pack-0: a fifth of its file.
+    for (let i = 3; i < 15; i++)
+    {
+        reader.put(`a${i}`, bodyOf(512 * KIB, 50 + i));
+    }
+    step(1);
+    assert.equal(keeper.figures().compactedBytes, MIB, 'two bodies, the third past the pass');
+    step(1);
+    assert.equal(keeper.figures().compactedBytes, 1.5 * MIB, 'the rest at the next sweep');
+    step(1);
+    assert.equal(keeper.figures().compactedBytes, 1.5 * MIB);
+    for (let i = 0; i < 3; i++)
+    {
+        const want = bodyOf(512 * KIB, i);
+        assert.equal(reader.with(`a${i}`, body=>body.every((byte, at)=>byte === want[at]), { wait: true }),
+            true, `a${i}`);
+    }
+});
+
 test('a keeper opening an index lets go of the packs no body of it is in: what the run before'
     + ' wrote for itself', async()=>{
     const disk = memoryDisk();

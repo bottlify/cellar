@@ -115,6 +115,12 @@ export function readSaved(files){
  * free the rest writes at most a third of a byte for each byte given back.
  */
 const COMPACT_LIVE = 1 / 4;
+/**
+ * Bytes a pass moves from one pack to another at most, past its first body:
+ * the pass is the keeper's thread's, between its other work, and a pack of
+ * 64 MiB a quarter live is 16 MiB moved. The rest moves at the next sweep.
+ */
+const COMPACT_PASS_BYTES = 1 << 20;
 
 /** What `append` answers where it wrote nothing: no pack open yet, or the disk refused. */
 const NOT_YET = -1;
@@ -1776,12 +1782,14 @@ export async function openKeeper(options){
      * there the disk's (a hot one from its segment, a cold one read from
      * here), or, where `evict` says so and it can be made again, a cold one
      * goes and a hot one forgets its copy (memory holds it). Stops where the
-     * disk will not take a body now: what is left stays.
+     * disk will not take a body now, or `COMPACT_PASS_BYTES` are moved: what
+     * is left stays.
      *
      * @param {number} number @param {boolean} evict
      */
     const empty = (number, evict)=>{
         const from = /** @type {DiskFile} */ (packs.get(number));
+        let moved = 0;
         for (let id = 0; id < words[H_COUNT] && live.get(number) !== 0; id++)
         {
             if (get(id, R_PACK) !== number || (get(id, R_FLAGS) & F_ON_DISK) === 0)
@@ -1810,6 +1818,10 @@ export async function openKeeper(options){
                 continue;
             }
             const length = get(id, R_LENGTH);
+            if (moved > 0 && moved + length > COMPACT_PASS_BYTES)
+            {
+                return;
+            }
             /** @type {Uint8Array} */
             let bytes;
             if (state === HOT)
@@ -1855,6 +1867,7 @@ export async function openKeeper(options){
             {
                 return;
             }
+            moved += length;
             addLive(number, -length);
             addLive(pack, length);
             set(id, R_PACK, pack);
