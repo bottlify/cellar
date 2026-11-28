@@ -24,7 +24,7 @@
  * segment costs the budget only as far as its blocks reach. A thread
  * learns of a segment by a message (`announce`), and a message reaches a
  * thread only between its turns, so the keeper keeps segments announced
- * before they are needed - a shared one of each kind with nothing in it, own
+ * before they are needed - two shared ones of each kind with nothing in it, own
  * ones with no bytes yet, each grown to the body it is given - and places a
  * writer's body only in a segment the writer says it has (`known`).
  *
@@ -695,22 +695,27 @@ export async function openKeeper(options){
         .some(at=>at >= known);
 
     /**
-     * A shared segment of `list` that holds nothing yet, announced ahead of
-     * need where the last one has taken memory: address space only, so a
-     * thread that has heard of it is placed there and a quiet run keeps no
-     * room of the budget for a burst that may not come.
+     * Two shared segments of `list` that hold nothing yet, announced ahead
+     * of need: address space only, so a quiet run keeps no room of the
+     * budget for a burst that may not come. Two, so that a thread told of
+     * every segment by its last turn has one to be placed in after the
+     * first takes memory, while it hears of the one made then.
      *
      * @param {number[]} list  `liveSegments` or `heldSegments`
      */
     const keepSpare = list=>{
-        const last = list[list.length - 1];
-        if (last !== undefined && segmentAt(last).reach === 0)
+        for (;;)
         {
-            return;
-        }
-        const buffer = take(()=>sharedBuffer(segmentBytes), 0);
-        if (buffer !== null)
-        {
+            let spare = 0;
+            for (let i = list.length - 1; i >= 0 && segmentAt(list[i]).reach === 0; i--)
+            {
+                spare++;
+            }
+            const buffer = spare >= 2 ? null : take(()=>sharedBuffer(segmentBytes), 0);
+            if (buffer === null)
+            {
+                return;
+            }
             list.push(addSegment(buffer, createBuddy(segmentBytes)));
         }
     };

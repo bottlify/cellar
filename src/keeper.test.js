@@ -974,10 +974,10 @@ test('a segment the engine will not make is counted, and room found by cooling a
     });
     try
     {
-        // Four bodies fill a segment: the first and the spare made before
-        // are filled, the next spare is refused, and the next write cools
-        // what it must.
-        for (const name of ['b', 'c', 'd', 'e', 'f', 'g', 'h'])
+        // Four bodies fill a segment: the first and the two spares made
+        // before are filled, the next spare is refused, and the next write
+        // cools what it must.
+        for (const name of ['b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm'])
         {
             assert.equal(reader.put(name, bodyOf(16 * KIB, 3)), true, name);
         }
