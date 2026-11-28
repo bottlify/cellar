@@ -47,11 +47,11 @@ import { UNIT, blockOf, checkSegmentBytes, createBuddy, grainsOf } from './buddy
 import { BASE, DELTA, chunkWriter, readIndexFile } from './index-file.js';
 import {
     COLD, F_DROP, F_FOR_ROOM, F_HELD, F_NO_DISK, F_ONLY_COPY, F_ON_DISK, F_THIS_RUN, GONE, HEADER_WORDS, HOT,
-    CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_LET_GO, H_NAMES, H_TICK, MAX_RECORDS,
+    CACHE_LAYOUT, H_COUNT, H_LAYOUT, H_LET_GO, H_NAMES, H_NAMES_EPOCH, H_TICK, MAX_RECORDS,
     MOVING, RECORD_WORDS, RETIRED, RETIRED_WRITING, R_FLAGS, R_HASH_A, R_HASH_B, R_LENGTH, R_NAME,
     R_NAME_LENGTH, R_OFFSET, R_PACK, R_PACK_OFFSET, R_SEGMENT, R_STATE, R_TICK, WRITING,
     P_ID, P_MARK, P_OFFSET, P_SEGMENT, checkFlags, checkName, growableShared, growTo, sharedBuffer,
-    hashName, readersOf, stateOf, stateWord, viewIndex,
+    TABLE_LEFT, hashName, readersOf, stateOf, stateWord, tableBuffer, tableSlots, viewIndex,
 } from './shared.js';
 
 const MIB = 1024 * 1024;
@@ -61,6 +61,12 @@ const MAX_NAME_UNITS = 1 << 25;
 /** The reservations' marks run from 1 to this, then round again (`WRITING`). */
 const MAX_MARK = 0xffffff;
 const FIRST_TABLE = 1024;
+/**
+ * Units of names no record names any more past which the keeper packs the
+ * names together, where they are as many as the names held too: a pack
+ * costs a copy of the names held, done once the dead ones are as many.
+ */
+const PACK_NAMES_UNITS = 1 << 16;
 /** Packs a run opens at most: 64 TiB of the default packs. */
 const MAX_PACKS = 1 << 20;
 /** The keeper's two index files: a save goes to the one not holding the last whole base. */
@@ -250,7 +256,7 @@ export async function openKeeper(options){
         records: growableShared((HEADER_WORDS + 1024 * RECORD_WORDS) * 4,
             (HEADER_WORDS + MAX_RECORDS * RECORD_WORDS) * 4),
         names: growableShared(64 * 1024, MAX_NAME_UNITS * 2),
-        table: sharedBuffer(FIRST_TABLE * 4),
+        table: tableBuffer(FIRST_TABLE, 0),
     };
     new Int32Array(shared.records, 0, HEADER_WORDS)[H_LAYOUT] = CACHE_LAYOUT;
     const index = viewIndex(shared);
@@ -358,7 +364,7 @@ export async function openKeeper(options){
     const counts = {
         reserved: 0, refusedRoom: 0, refusedLarge: 0, refusedUnseen: 0,
         replaced: 0, raised: 0, raiseFailed: 0, cooled: 0, written: 0, writtenBytes: 0, gone: 0,
-        loaded: 0, saved: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
+        loaded: 0, saved: 0, namesPacked: 0, segmentsMade: 0, segmentsLetGo: 0, letGoBytes: 0, deadDiskBytes: 0,
         diskFailures: 0, lostOnDisk: 0, abandoned: 0, skippedEntries: 0, announceFailures: 0,
         segmentFailures: 0, wholeSaves: 0, savedBytes: 0, compactedBytes: 0, packsRemoved: 0,
         reclaimedBytes: 0, evicted: 0, lostAtClose: 0, takenBack: 0, oldestListed: 0,
@@ -440,6 +446,12 @@ export async function openKeeper(options){
     const free = [];
     /** Names in the table: what it is sized by (each name leads to one record). */
     let named = 0;
+    /** Slots of the table a name left (`TABLE_LEFT`): a lookup passes over them as over a name. */
+    let left = 0;
+    /** The table's generation: a reader takes a later one only. */
+    let tableGeneration = 0;
+    /** Units of the names in the table: the names a pack keeps, but for a record retired. */
+    let namedUnits = 0;
     /** The mark the next reservation takes (`WRITING`). */
     let nextMark = 1;
 
@@ -453,6 +465,10 @@ export async function openKeeper(options){
         if (known >= 0)
         {
             return known;
+        }
+        if (words[H_NAMES] + name.length > MAX_NAME_UNITS)
+        {
+            packNames();
         }
         const from = words[H_NAMES];
         // Room for its record first: a name written for none would be spent.
@@ -469,6 +485,7 @@ export async function openKeeper(options){
         const [a, b] = hashName(name);
         const id = newRecord(a, b, from, name.length);
         insert(id, a);
+        namedUnits += name.length;
         return id;
     };
 
@@ -567,7 +584,95 @@ export async function openKeeper(options){
         set(id, R_FLAGS, 0);
         // No name leads to it: nothing of it is the saved index's.
         changed.delete(id);
+        giveName(id);
+    };
+
+    /**
+     * Record `id`, gone, kept for another name: it names nothing, so a
+     * reader that remembers it finds it is not its name's (`holds`), and a
+     * pack of the names leaves its name out.
+     *
+     * @param {number} id
+     */
+    const giveName = id=>{
+        set(id, R_NAME, -1);
+        set(id, R_NAME_LENGTH, 0);
         free.push(id);
+    };
+
+    /**
+     * The name of record `id`, gone with nothing of it left - no room, no
+     * copy on the disk, nothing owed to a save - leads to no record any more:
+     * its slot left (`TABLE_LEFT`), its record given back, its units dead
+     * until the names are packed. A name put only once and dropped holds
+     * nothing after, so the index is the size of the names held, not of
+     * every name a run ever wrote.
+     *
+     * @param {number} id
+     */
+    const forgetName = id=>{
+        const table = index.table();
+        const mask = table.length - 1;
+        for (let slot = get(id, R_HASH_A) & mask; ; slot = (slot + 1) & mask)
+        {
+            const entry = table[slot];
+            if (entry === id + 1)
+            {
+                Atomics.store(table, slot, TABLE_LEFT);
+                break;
+            }
+            if (entry === 0)
+            {
+                throw new Error(`cache: record ${id} is gone and named, and no name leads to it`);
+            }
+        }
+        named--;
+        left++;
+        namedUnits -= get(id, R_NAME_LENGTH);
+        giveName(id);
+    };
+
+    /**
+     * The names records name, packed together from the first unit: the
+     * units of names gone are room again. The epoch moves first, so a reader
+     * that remembers a place from before finds it is not its name's
+     * (`holds`), and one looking up meanwhile looks again (odd); stored and
+     * loaded again before a unit is written over, which keeps those writes
+     * after it (see the journal), and moved again once all is written.
+     */
+    const packNames = ()=>{
+        /** @type {number[]} */
+        const naming = [];
+        for (let id = 0; id < words[H_COUNT]; id++)
+        {
+            if (get(id, R_NAME) >= 0)
+            {
+                naming.push(id);
+            }
+        }
+        // A record retired shares its name with the one its name leads to now.
+        naming.sort((x, y)=>get(x, R_NAME) - get(y, R_NAME));
+        Atomics.store(words, H_NAMES_EPOCH, Atomics.load(words, H_NAMES_EPOCH) + 1);
+        Atomics.load(words, H_NAMES_EPOCH);
+        let to = 0;
+        let lastFrom = -1;
+        let lastTo = 0;
+        for (const id of naming)
+        {
+            const from = get(id, R_NAME);
+            if (from !== lastFrom)
+            {
+                const length = get(id, R_NAME_LENGTH);
+                names.copyWithin(to, from, from + length);
+                lastFrom = from;
+                lastTo = to;
+                to += length;
+            }
+            set(id, R_NAME, lastTo);
+        }
+        words[H_NAMES] = to;
+        Atomics.store(words, H_NAMES_EPOCH, Atomics.load(words, H_NAMES_EPOCH) + 1);
+        counts.namesPacked++;
     };
 
     /**
@@ -589,17 +694,20 @@ export async function openKeeper(options){
     /** @param {number} id @param {number} first */
     const insert = (id, first)=>{
         let table = index.table();
-        if ((named + 1) * 2 > table.length)
+        if ((named + left + 1) * 2 > table.length)
         {
-            const larger = sharedBuffer(table.length * 2 * 4);
-            const into = new Int32Array(larger);
+            // Made again of the same size where it is mostly slots names
+            // left, so names put and dropped never grow it.
+            const slots = (named + 1) * 4 > table.length ? table.length * 2 : table.length;
+            const larger = tableBuffer(slots, ++tableGeneration);
+            const into = tableSlots(larger);
             const mask = into.length - 1;
             // What the table leads to now, not every record: a retired one
             // is no name's any more, and put back it would lead its name to
             // a body written over since.
             for (const entry of table)
             {
-                if (entry === 0)
+                if (entry <= 0)
                 {
                     continue;
                 }
@@ -613,13 +721,26 @@ export async function openKeeper(options){
             index.adoptTable(larger);
             shared.table = larger;
             table = into;
+            left = 0;
             tell({ table: larger });
         }
         const mask = table.length - 1;
+        // The first slot a name left on the way, else the empty one at its
+        // end: a lookup of a name further on passes over either.
         let slot = first & mask;
+        let at = -1;
         while (table[slot] !== 0)
         {
+            if (at < 0 && table[slot] === TABLE_LEFT)
+            {
+                at = slot;
+            }
             slot = (slot + 1) & mask;
+        }
+        if (at >= 0)
+        {
+            slot = at;
+            left--;
         }
         Atomics.store(table, slot, id + 1);
         named++;
@@ -2870,6 +2991,12 @@ export async function openKeeper(options){
                     counts.abandoned++;
                     continue;
                 }
+                if (state === GONE && get(id, R_NAME) >= 0 && (get(id, R_FLAGS) & F_ON_DISK) === 0
+                    && !changed.has(id))
+                {
+                    forgetName(id);
+                    continue;
+                }
                 if (state !== HOT && state !== COLD)
                 {
                     continue;
@@ -2897,6 +3024,11 @@ export async function openKeeper(options){
             for (const id of cooling)
             {
                 finishCooling(id);
+            }
+            const deadUnits = words[H_NAMES] - namedUnits;
+            if (deadUnits >= PACK_NAMES_UNITS && deadUnits >= namedUnits)
+            {
+                packNames();
             }
             // An own segment went with its body.
             letGoEmpty(releaseAfterMs);

@@ -62,10 +62,11 @@ const STALE = 5;
 const KNOWN_MOST = 1 << 16;
 
 /**
- * What a reader remembers of a name it found: its record, and where the name
- * lies, which a record is checked against once inside.
+ * What a reader remembers of a name it found: its record, where the name
+ * lies and the names' epoch it lay there in, which a record is checked
+ * against once inside.
  *
- * @typedef {{ id: number, nameAt: number }} Found
+ * @typedef {{ id: number, nameAt: number, epoch: number }} Found
  */
 
 /** Entries of ended reservations a reader keeps by name, at most (`writing`). */
@@ -147,7 +148,15 @@ export function createReader({ shared, segments = [], keeper }){
      * @param {string} name @returns {Found | undefined}
      */
     const lookUp = name=>{
-        const id = index.find(name);
+        let epoch = index.epoch();
+        let id = index.find(name);
+        // The keeper packing the names meanwhile: looked up again once it
+        // is done, which it is in the time of a copy of them.
+        while ((epoch & 1) !== 0 || index.epoch() !== epoch)
+        {
+            epoch = index.epoch();
+            id = index.find(name);
+        }
         if (id < 0)
         {
             return undefined;
@@ -156,7 +165,7 @@ export function createReader({ shared, segments = [], keeper }){
         {
             known.clear();
         }
-        const found = { id, nameAt: index.matched() };
+        const found = { id, nameAt: index.matched(), epoch };
         known.set(name, found);
         return found;
     };
@@ -231,7 +240,7 @@ export function createReader({ shared, segments = [], keeper }){
             // The state first, then whose it is: a record taken for another
             // name since had that name written before its state.
             const state = index.state(id);
-            if (!index.holds(id, found.nameAt, length))
+            if (!index.holds(id, found.nameAt, length, found.epoch))
             {
                 return STALE;
             }
@@ -239,7 +248,7 @@ export function createReader({ shared, segments = [], keeper }){
         }
         try
         {
-            if (!index.holds(id, found.nameAt, length))
+            if (!index.holds(id, found.nameAt, length, found.epoch))
             {
                 return STALE;
             }
@@ -269,7 +278,7 @@ export function createReader({ shared, segments = [], keeper }){
     const whereIs = (found, length)=>{
         const id = found.id;
         const state = index.state(id);
-        if (!index.holds(id, found.nameAt, length))
+        if (!index.holds(id, found.nameAt, length, found.epoch))
         {
             return undefined;
         }

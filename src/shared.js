@@ -51,8 +51,18 @@ export const H_LAYOUT = 3;
  * count moved, so memory let go of is room again at once, not at a sweep.
  */
 export const H_LET_GO = 4;
+/**
+ * Moved by the keeper around each time it packs the names together (odd
+ * while it does): a name lies where it was written until then, and a place
+ * a reader remembers from before may be another name's after.
+ */
+export const H_NAMES_EPOCH = 5;
 /** The layout these words are in: changed with any word's meaning. */
-export const CACHE_LAYOUT = 0x43430c02;
+export const CACHE_LAYOUT = 0x43430c03;
+
+/** A slot of the table a name left: passed over by a lookup, taken by the next name put there. */
+export const TABLE_LEFT = -1;
+
 
 /** One record, in 32-bit words. */
 export const RECORD_WORDS = 12;
@@ -278,6 +288,23 @@ export const sharedBuffer = bytes=>/** @type {SharedArrayBuffer} */ (canShare()
     ? new SharedArrayBuffer(bytes) : new ArrayBuffer(bytes));
 
 /**
+ * A table of `slots` slots (a power of two), its generation in a word after
+ * them: a reader takes a table of a later generation than its own, whatever
+ * order the keeper's messages reach it in.
+ *
+ * @param {number} slots @param {number} generation
+ */
+export const tableBuffer = (slots, generation)=>{
+    const buffer = sharedBuffer((slots + 1) * 4);
+    new Int32Array(buffer)[slots] = generation;
+    return buffer;
+};
+/** @param {SharedArrayBuffer} buffer */
+export const tableSlots = buffer=>new Int32Array(buffer, 0, buffer.byteLength / 4 - 1);
+/** @param {SharedArrayBuffer} buffer */
+const generationOf = buffer=>new Int32Array(buffer)[buffer.byteLength / 4 - 1];
+
+/**
  * @param {number} bytes @param {number} most
  * @returns {Growable}
  */
@@ -334,8 +361,8 @@ export function viewIndex(shared){
     // read several times slower (V8). The buffers only grow.
     let words = new Int32Array(shared.records, 0, shared.records.byteLength >> 2);
     let names = new Uint16Array(shared.names, 0, shared.names.byteLength >> 1);
-    let table = new Int32Array(shared.table);
-    let tableBuffer = shared.table;
+    let table = tableSlots(shared.table);
+    let generation = generationOf(shared.table);
     /** The lanes of the name being looked up. */
     const lanes = new Int32Array(2);
     /** Where the name `find` matched last lies in `names`. */
@@ -373,6 +400,10 @@ export function viewIndex(shared){
             if (entry === 0)
             {
                 return -1;
+            }
+            if (entry === TABLE_LEFT)
+            {
+                continue;
             }
             const view = cover(entry - 1);
             const base = at(entry - 1);
@@ -421,10 +452,10 @@ export function viewIndex(shared){
         matched: ()=>matched,
         /** @param {SharedArrayBuffer} buffer */
         adoptTable(buffer){
-            if (buffer.byteLength > tableBuffer.byteLength)
+            if (generationOf(buffer) > generation)
             {
-                tableBuffer = buffer;
-                table = new Int32Array(buffer);
+                generation = generationOf(buffer);
+                table = tableSlots(buffer);
             }
         },
         table: ()=>table,
@@ -456,18 +487,26 @@ export function viewIndex(shared){
         },
         /** @param {number} id */
         state: id=>stateOf(Atomics.load(cover(id), at(id) + R_STATE)),
+        /** The names' epoch now (`H_NAMES_EPOCH`): odd while the keeper packs them. */
+        epoch: ()=>Atomics.load(words, H_NAMES_EPOCH),
         /**
          * Whether record `id`, entered or its state read just before, is the
-         * name that lies at `nameAt`, `length` units long: a name is written
-         * once and never moved, so where it lies says which it is. Inside a
-         * record the answer holds until this thread leaves; outside, for the
-         * state read before it.
+         * name that lies at `nameAt`, `length` units long, found at names'
+         * epoch `epoch`: a name stays where it was written until the keeper
+         * packs the names, which moves the epoch first, so within one where it
+         * lies says which it is. Inside a record the answer holds until this
+         * thread leaves; outside, for the state read before it. The epoch is
+         * loaded last: the state the thread saw was stored after any packing
+         * that gave the record to a name of another epoch, so the load sees it
+         * moved; and the entering, a read-modify-write, keeps the lookup's
+         * plain reads of the names before it.
          *
-         * @param {number} id @param {number} nameAt @param {number} length
+         * @param {number} id @param {number} nameAt @param {number} length @param {number} epoch
          */
-        holds(id, nameAt, length){
+        holds(id, nameAt, length, epoch){
             const base = at(id);
-            return words[base + R_NAME] === nameAt && words[base + R_NAME_LENGTH] === length;
+            return words[base + R_NAME] === nameAt && words[base + R_NAME_LENGTH] === length
+                && Atomics.load(words, H_NAMES_EPOCH) === epoch;
         },
         /** @param {number} id */
         stamp(id){

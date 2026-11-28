@@ -31,6 +31,16 @@ const stateIndex = (keeper, id)=>{
 
 /** The record `name` leads to now. @param {any} keeper @param {string} name */
 const recordOf = (keeper, name)=>viewIndex(keeper.shared).find(name);
+/**
+ * Where `name` lies in the names.
+ *
+ * @param {any} keeper @param {string} name
+ */
+const placeOfName = (keeper, name)=>{
+    const index = viewIndex(keeper.shared);
+    index.find(name);
+    return index.matched();
+};
 
 /**
  * Units 2 to 7 of a segment of eight held by only copies that never leave:
@@ -249,6 +259,77 @@ test('a record given to another name between a reader\'s lookup and its entering
     assert.equal(recordOf(keeper, 'y'), first, 'y took the record x had');
     assert.equal(read, undefined, 'a miss, not y\'s body');
     assert.deepEqual(fresh.with('x', body=>[...body]), [...bodyOf(200, 2)]);
+});
+
+test('names put once and dropped leave no record, table entry or name behind: the index is the size'
+    + ' of the names held, not of every name ever written', async()=>{
+    const { keeper, reader, step } = await cacheOf({ coldAfterMs: 1e6, goneAfterMs: 1e6 });
+    reader.put('kept', bodyOf(64, 1));
+    /** @type {number[]} */
+    const sizes = [];
+    for (let round = 0; round < 40; round++)
+    {
+        for (let i = 0; i < 1000; i++)
+        {
+            const name = `frames/${round}/${i}/a-name-long-enough-to-take-room`;
+            assert.equal(reader.put(name, bodyOf(64, i)), true);
+            reader.drop(name);
+        }
+        step(1);
+        sizes.push(keeper.figures().indexBytes);
+    }
+    const figures = keeper.figures();
+    assert.equal(figures.names, 1, 'only the name held is in the table');
+    assert.ok(figures.records <= 1001, `${figures.records} records for 40000 names written and dropped`);
+    assert.equal(figures.freeRecords, figures.records - 1, 'all but the name held kept for another');
+    assert.equal(sizes.at(-1), sizes[4], `the index stopped growing: ${sizes.join(' ')}`);
+    assert.deepEqual(reader.with('kept', body=>[...body]), [...bodyOf(64, 1)]);
+    assert.equal(reader.look('frames/0/0/a-name-long-enough-to-take-room'), null);
+});
+
+test('a reader that remembers a name gone, its record and the place of its name taken since by'
+    + ' another name of its length, misses: it never reads the other name\'s body', async()=>{
+    const { keeper, reader, step, said } = await cacheOf({ coldAfterMs: 1e6, goneAfterMs: 1e6 });
+    const other = createReader({ shared: keeper.shared, segments: keeper.segmentBuffers(),
+        keeper: { reserve: ()=>false, raise: ()=>false, raiseLater: ()=>{}, drop: ()=>{} } });
+    // The keeper's messages reach the other reader, as in its own thread.
+    let heard = 0;
+    const hear = ()=>{
+        for (; heard < said.length; heard++)
+        {
+            other.adopt(said[heard]);
+        }
+    };
+    /** Names put and dropped, as many as make the names worth packing. @param {string} wave */
+    const junk = wave=>{
+        for (let i = 0; i < 4000; i++)
+        {
+            const name = `junk/${wave}/${i}/long-enough-to-make-the-dead-names-worth-moving`;
+            reader.put(name, bodyOf(16, i));
+            reader.drop(name);
+        }
+    };
+    // a's record after the junk's, its name packed to the first unit.
+    junk('before');
+    reader.put('a', bodyOf(100, 1));
+    step(1);
+    const first = recordOf(keeper, 'a');
+    const nameAt = placeOfName(keeper, 'a');
+    hear();
+    assert.equal(other.with('a', body=>body[1]), (31 + 1) & 255, 'remembered by the other reader');
+    assert.equal(other.look('a'), 'hot');
+    // Junk in the records given back, below a's, so a's is the one given out next.
+    junk('after');
+    reader.drop('a');
+    step(1);
+    // No name held: the names start again where a's lay.
+    reader.put('b', bodyOf(100, 2));
+    assert.equal(recordOf(keeper, 'b'), first, 'b took the record a had');
+    assert.equal(placeOfName(keeper, 'b'), nameAt, 'b\'s name lies where a\'s lay');
+    hear();
+    assert.equal(other.with('a', body=>[...body]), undefined, 'a miss, not b\'s body');
+    assert.equal(other.look('a'), null);
+    assert.deepEqual(other.with('b', body=>[...body]), [...bodyOf(100, 2)]);
 });
 
 test('memory held is never taken back: written and read in place by its holder for as long as it '

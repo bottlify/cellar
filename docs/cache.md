@@ -140,6 +140,6 @@ Only one Keeper may manage a directory. OPFS sync handles lock files; custom Dis
 | `packBytes` | Positive, below 2 GiB. |
 | Body length | Positive integer, within the budget and below 2 GiB (`refusedLarge`). A body larger than `packBytes` takes a pack of its own on the disk. |
 | Idle and reservation spans | Below half the 32-bit millisecond clock range (about 24.8 days). |
-| Names | Strings only; 2^20 names and 2^25 UTF-16 units per run. |
+| Names | Strings only; 2^20 names and 2^25 UTF-16 units held at once. |
 
-Names are not reused during a run. Retired records can be reused after their readers leave. The budget refers to hot body segments, not total process RSS or index storage.
+A name dropped, with no copy on disk and nothing owed to the next save, leaves the index at the next sweep: its record is reused for another name, and once dead names are at least 64 Ki units and as many as the live ones, a sweep packs the live names together (`figures().namesPacked`). The index is sized by the names held, not by every name a run wrote. A reader that remembered a name gone misses; it never reads the body of the name its record went to. Retired records can be reused after their readers leave. The budget refers to hot body segments, not total process RSS or index storage.
