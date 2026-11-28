@@ -156,27 +156,41 @@ export function createBuddy(bytes){
     return {
         bytes,
         /**
-         * Room for `length` bytes: its offset, or -1 where no block holds it.
+         * Room for `length` bytes ending at `below` at most: its offset, or
+         * -1 where no block holds it. A segment that holds memory only up to
+         * `below` is placed in within that.
          *
-         * @param {number} length
+         * @param {number} length @param {number} [below]
          */
-        place(length){
+        place(length, below = bytes){
             if (!(length > 0) || length > bytes)
             {
                 return -1;
             }
             const count = Math.ceil(length / GRAIN);
             const order = orderOf(count);
+            /** The last grain a body may start at. */
+            const last = Math.floor(below / GRAIN) - count;
+            let start = -1;
             let at = order;
-            while (at <= top && heads[at] < 0)
+            for (; at <= top; at++)
             {
-                at++;
+                // The body lies at its block's start: a block running past
+                // `below` holds it where that start is low enough. Below the
+                // whole segment, the first block of a list is.
+                for (let block = heads[at]; block >= 0 && start < 0; block = next[block])
+                {
+                    start = block <= last ? block : -1;
+                }
+                if (start >= 0)
+                {
+                    break;
+                }
             }
-            if (at > top)
+            if (start < 0)
             {
                 return -1;
             }
-            const start = heads[at];
             takeFree(start);
             // Split down to the order asked, the upper halves left free.
             while (at > order)

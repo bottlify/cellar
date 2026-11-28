@@ -97,12 +97,12 @@ test('a body of 40 MiB is read in place on another thread, cooled to the disk an
         assert.equal(cache.reader.put('big', bytes), true);
         assert.deepEqual((await other.read('big')).found, summed(bytes), 'read where it lies');
         const placed = cache.keeper.figures();
-        assert.equal(placed.segmentBytes, 16 * MIB + 40 * MIB, 'a shared segment and its own');
+        assert.equal(placed.segmentBytes, 40 * MIB, 'its own segment, the shared spare holding none');
         assert.equal(placed.placedBytes, 40 * MIB);
         cache.step(100);
         assert.equal(cache.reader.look('big'), 'cold');
         const cooled = cache.keeper.figures();
-        assert.equal(cooled.segmentBytes, 16 * MIB, 'its segment went with it');
+        assert.equal(cooled.segmentBytes, 0, 'its segment went with it');
         assert.equal(cooled.writtenBytes, 40 * MIB);
         assert.deepEqual((await other.read('big', true)).found, summed(bytes), 'raised by the thread');
         assert.equal(cache.keeper.figures().raised, 1);
@@ -142,14 +142,14 @@ test('memory of 20 MiB is held, written in place, and its segment goes the momen
         held.set(pattern(20 * MIB, 9));
         assert.equal(held[20 * MIB - 1], pattern(20 * MIB, 9)[20 * MIB - 1], 'read back in place');
         const holding = keeper.figures();
-        assert.equal(holding.segments, 2);
-        assert.equal(holding.segmentBytes, 36 * MIB);
+        assert.equal(holding.segments, 1);
+        assert.equal(holding.segmentBytes, 20 * MIB);
         assert.deepEqual(keeper.release('owner/1/'), { bodies: 1, bytes: 20 * MIB, waiting: 0 });
         const after = keeper.figures();
-        assert.equal(after.segments, 1, 'no sweep between');
-        assert.equal(after.segmentBytes, 16 * MIB);
+        assert.equal(after.segments, 0, 'no sweep between');
+        assert.equal(after.segmentBytes, 0);
         assert.equal(after.letGoBytes - holding.letGoBytes, 20 * MIB);
-        assert.equal(after.peakSegmentBytes, 36 * MIB);
+        assert.equal(after.peakSegmentBytes, 20 * MIB);
     });
 
 test('a large hold is counted at its length rounded to a page, not to a power of two', async()=>{
@@ -165,14 +165,14 @@ test('a large hold is counted at its length rounded to a page, not to a power of
 });
 
 test('large bodies over a small budget: the old ones make room, holds past it are refused and said'
-    + ' so, and the segments are back to the spare once they go', async()=>{
+    + ' so, and the segments hold nothing once they go', async()=>{
     const { keeper, reader } = await runCache({});
     for (let i = 0; i < 10; i++)
     {
         assert.equal(reader.put(`body${i}`, pattern(20 * MIB, i)), true, `body${i}`);
     }
-    // The shared spare is kept for small bodies: 48 MiB of the 64 for large ones.
-    assert.equal(keeper.figures().gone, 8, 'two of 20 MiB beside the spare, the rest made room');
+    // The shared spare holds nothing: the 64 MiB are the large ones'.
+    assert.equal(keeper.figures().gone, 7, 'three of 20 MiB, the rest made room');
     assert.ok(keeper.figures().segmentBytes <= 64 * MIB);
     assert.equal(reader.with('body9', body=>body[12345]), pattern(20 * MIB, 9)[12345]);
     /** @type {(Uint8Array | null)[]} */
@@ -181,8 +181,8 @@ test('large bodies over a small budget: the old ones make room, holds past it ar
     {
         holds.push(reader.hold(`owner/1/${i}`, 20 * MIB));
     }
-    assert.equal(holds.filter(Boolean).length, 2, 'two of 20 MiB beside the spare');
-    assert.equal(keeper.figures().refusedRoom, 3, 'the rest refused, counted');
+    assert.equal(holds.filter(Boolean).length, 3, 'three of 20 MiB');
+    assert.equal(keeper.figures().refusedRoom, 2, 'the rest refused, counted');
     assert.equal(reader.look('body9'), null, 'bodies that can be made again made room for them');
     assert.ok(keeper.figures().segmentBytes <= 64 * MIB);
     keeper.release('owner/1/');
@@ -193,7 +193,7 @@ test('large bodies over a small budget: the old ones make room, holds past it ar
     const left = keeper.figures();
     assert.equal(left.placedBytes, 0);
     assert.equal(left.hot + left.cold, 0);
-    assert.equal(left.segments, 1, 'the shared spare alone');
-    assert.equal(left.segmentBytes, 16 * MIB);
+    assert.equal(left.segments, 0, 'the spares alone, holding nothing');
+    assert.equal(left.segmentBytes, 0);
     assert.equal(reader.put('small', pattern(UNIT, 1)), true, 'a small body in the spare');
 });

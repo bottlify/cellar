@@ -187,3 +187,19 @@ test('small bodies lie several to a page, a body takes its length rounded to a g
         assert.deepEqual([buddy.place(UNIT), buddy.place(UNIT)].sort((a, b)=>a - b), [0, 7 * UNIT],
             'the page is whole again, beside the end the 9000 left');
     });
+
+test('a body is placed below a bound where a block there holds it, and refused where none does', ()=>{
+    const buddy = createBuddy(64 * 1024);
+    // The first quarter and a block past the half taken, the second quarter freed.
+    const a = buddy.place(16 * 1024);
+    const b = buddy.place(16 * 1024);
+    const c = buddy.place(32 * 1024);
+    assert.deepEqual([a, b, c], [0, 16 * 1024, 32 * 1024]);
+    buddy.give(b, 16 * 1024);
+    buddy.give(c, 32 * 1024);
+    // Free now: 16 KiB at 16 KiB and 32 KiB at 32 KiB, listed as given back.
+    assert.equal(buddy.place(4096, 16 * 1024), -1, 'nothing free below 16 KiB');
+    assert.equal(buddy.place(4096, 20 * 1024), 16 * 1024, 'the block that starts low enough');
+    assert.equal(buddy.place(8192, 20 * 1024), -1, 'its rest runs past the bound');
+    assert.equal(buddy.place(8192), 24 * 1024, 'unbounded, the smallest block that holds it');
+});

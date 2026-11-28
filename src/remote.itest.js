@@ -238,7 +238,7 @@ test('a body of a segment of its own placed from the worker, read here in place'
             assert.equal(put.put, true);
             assert.equal(put.sum, put.expected);
             const figures = other.cache.keeper.figures();
-            assert.ok(figures.segmentBytes >= 16 * MIB + 20 * MIB, `${figures.segmentBytes}`);
+            assert.equal(figures.segmentBytes, 20 * MIB, 'its own segment alone');
             assert.equal(other.cache.reader.with('big', body=>body.length), 20 * MIB);
         }
         finally

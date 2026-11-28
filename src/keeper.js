@@ -19,12 +19,14 @@
  * body over a quarter of that (`large`) has a segment of its own instead, of
  * its length rounded to a page, made for it and let go of when it goes: a
  * block of half a segment or more is a half no other body can share, and a
- * body past a segment has no block at all. A thread
+ * body past a segment has no block at all. Held memory, which never leaves,
+ * is placed apart from bodies, in shared segments of its own. A shared
+ * segment costs the budget only as far as its blocks reach. A thread
  * learns of a segment by a message (`announce`), and a message reaches a
  * thread only between its turns, so the keeper keeps segments announced
- * before they are needed - a shared one with no body in it, own ones with no
- * bytes yet, each grown to the body it is given - and places a writer's body
- * only in a segment the writer says it has (`known`).
+ * before they are needed - a shared one of each kind with nothing in it, own
+ * ones with no bytes yet, each grown to the body it is given - and places a
+ * writer's body only in a segment the writer says it has (`known`).
  *
  * The cold part is packs on the disk, `packBytes` each, bodies appended; a
  * body written once stays valid there until its name is written anew, so a
@@ -234,13 +236,29 @@ export async function openKeeper(options){
      * through its old view and never sees another body under that number.
      *
      * A segment of one body (`own`) has no `buddy`; `length`, its body's.
+     * `reach`: the bytes of it the budget counts (`grow`).
      *
      * @type {({ buffer: SharedArrayBuffer, bytes: Uint8Array, buddy: import('./buddy.js').Buddy | null,
-     *     emptySince: number, length: number } | null)[]}
+     *     emptySince: number, length: number, reach: number } | null)[]}
      */
     const segments = [];
-    /** The numbers of the shared segments not let go, in order: what is placed in. @type {number[]} */
+    /**
+     * The numbers of the shared segments not let go, in order: what is placed
+     * in. The budget counts each to the page past its last block (`grow`),
+     * the last one holding none yet (`keepSpare`).
+     *
+     * @type {number[]}
+     */
     const liveSegments = [];
+    /**
+     * The numbers of the shared segments of held memory, as `liveSegments`
+     * are of bodies. Held memory is never taken back, cooled or moved:
+     * placed among bodies that can leave, it would keep their whole segment
+     * from going; placed apart, it costs the budget its own room alone.
+     *
+     * @type {number[]}
+     */
+    const heldSegments = [];
     /** Bytes of every segment holding memory, as the account holds them of `kind`. */
     let heldBytes = 0;
     /**
@@ -585,12 +603,11 @@ export async function openKeeper(options){
      */
     const large = Math.max(UNIT, segmentBytes / 4);
     /**
-     * The largest own segment: the budget but the shared spare's room
-     * (`letGoEmpty`), within the 32-bit words a body's length and place are
-     * kept in. A body past it is refused before anything moves for it.
+     * The largest own segment: the budget, within the 32-bit words a body's
+     * length and place are kept in. A body past it is refused before
+     * anything moves for it.
      */
-    const ownMost = Math.min(Math.floor((budget >= segmentBytes ? budget - segmentBytes : budget) / UNIT)
-        * UNIT, 2 ** 31 - UNIT);
+    const ownMost = Math.min(Math.floor(budget / UNIT) * UNIT, 2 ** 31 - UNIT);
     /** @param {number} length */
     const pageOf = length=>Math.ceil(length / UNIT) * UNIT;
     /** The bytes a body of `length` takes in memory: its grains, or its own segment. @param {number} length */
@@ -611,7 +628,7 @@ export async function openKeeper(options){
     const addSegment = (buffer, buddy)=>{
         const at = segments.length;
         segments.push({ buffer, bytes: new Uint8Array(buffer, 0, buffer.byteLength), buddy,
-            emptySince: tick(), length: 0 });
+            emptySince: tick(), length: 0, reach: 0 });
         counts.segmentsMade++;
         tell({ segment: at, buffer });
         return at;
@@ -644,18 +661,6 @@ export async function openKeeper(options){
         return made;
     };
 
-    /** A new shared segment, announced, or -1 past the budget. */
-    const makeSegment = ()=>{
-        const buffer = !account.fits(segmentBytes, kind) ? null
-            : take(()=>sharedBuffer(segmentBytes), segmentBytes);
-        if (buffer === null)
-        {
-            return -1;
-        }
-        liveSegments.push(addSegment(buffer, createBuddy(segmentBytes)));
-        return liveSegments[liveSegments.length - 1];
-    };
-
     /**
      * Segment `at` let go of: no body is in it, and it holds no memory any
      * more once every thread has heard so.
@@ -663,7 +668,7 @@ export async function openKeeper(options){
      * @param {number} at
      */
     const letGoSegment = at=>{
-        const bytes = segmentAt(at).bytes.length;
+        const bytes = segmentAt(at).reach;
         segments[at] = null;
         heldBytes -= bytes;
         account.give(bytes, kind);
@@ -676,23 +681,30 @@ export async function openKeeper(options){
      * Whether a segment that could hold a body of `length` is made that a
      * thread knowing the first `known` does not have.
      *
-     * @param {number} known @param {number} length
+     * @param {number} known @param {number} length @param {boolean} held
      */
-    const beyond = (known, length)=>(length > large ? spares : liveSegments).some(at=>at >= known);
+    const beyond = (known, length, held)=>(length > large ? spares : held ? heldSegments : liveSegments)
+        .some(at=>at >= known);
 
     /**
-     * One shared segment no body is in, announced ahead of need, where the
-     * budget has room: one made now, or -1.
+     * A shared segment of `list` that holds nothing yet, announced ahead of
+     * need where the last one has taken memory: address space only, so a
+     * thread that has heard of it is placed there and a quiet run keeps no
+     * room of the budget for a burst that may not come.
+     *
+     * @param {number[]} list  `liveSegments` or `heldSegments`
      */
-    const keepSpare = ()=>{
-        for (let i = 0; i < liveSegments.length; i++)
+    const keepSpare = list=>{
+        const last = list[list.length - 1];
+        if (last !== undefined && segmentAt(last).reach === 0)
         {
-            if (buddyOf(liveSegments[i]).empty())
-            {
-                return -1;
-            }
+            return;
         }
-        return makeSegment();
+        const buffer = take(()=>sharedBuffer(segmentBytes), 0);
+        if (buffer !== null)
+        {
+            list.push(addSegment(buffer, createBuddy(segmentBytes)));
+        }
     };
 
     /**
@@ -720,35 +732,64 @@ export async function openKeeper(options){
     };
 
     /**
-     * Shared segments no body is in let go of but the first, the spare, those
-     * empty `idleMs` at least: the sweep's after a while, for the bodies of a
-     * burst to come; a large body wanting the budget takes them at once. The
-     * spare stays: a thread that has heard of it is placed there, and one
-     * made for a reserve is one the asking thread may not have heard of.
+     * Segment `at` holding `bytes` from now on, where the budget has room:
+     * false where it has none. An own segment's buffer grows to them; a
+     * shared one is address space of `segmentBytes` from the start, a fixed
+     * buffer as a host's API takes (an OPFS handle, and any declared without
+     * resizable buffers, refuses a view of a growable one), and a page of it
+     * is memory only once written: the budget counts it to the page past
+     * its last block, which never comes back down while it is held.
      *
-     * @param {number} idleMs @param {boolean} [spareToo]  the spare as well (`makeRoom`)
+     * @param {number} at @param {number} bytes
      */
-    const letGoEmpty = (idleMs, spareToo = false)=>{
-        const at = tick();
-        let spare = spareToo;
-        let kept = 0;
-        for (const s of liveSegments)
+    const grow = (at, bytes)=>{
+        const one = segmentAt(at);
+        const own = one.buddy === null;
+        const buffer = /** @type {import('./shared.js').Growable} */ (one.buffer);
+        if (take(()=>(own ? growTo(buffer, bytes) : undefined), bytes - one.reach) === null)
         {
-            if (buddyOf(s).empty())
-            {
-                if (!spare)
-                {
-                    spare = true;
-                }
-                else if (age(at, segmentAt(s).emptySince) >= idleMs)
-                {
-                    letGoSegment(s);
-                    continue;
-                }
-            }
-            liveSegments[kept++] = s;
+            return false;
         }
-        liveSegments.length = kept;
+        one.reach = bytes;
+        if (own)
+        {
+            one.bytes = new Uint8Array(one.buffer, 0, bytes);
+        }
+        return true;
+    };
+
+    /**
+     * Shared segments no body is in that hold memory let go of, those empty
+     * `idleMs` at least: the sweep's after a while, kept meanwhile for the
+     * bodies of a burst to come; one wanting the budget takes them at once.
+     * True where one went.
+     *
+     * @param {number} idleMs
+     */
+    const letGoEmpty = idleMs=>{
+        // Both kinds, with no array made for them, and the clock read only
+        // for one that is empty: a reserve of a full cache comes here.
+        const went = letGoEmptyOf(liveSegments, idleMs);
+        return letGoEmptyOf(heldSegments, idleMs) || went;
+    };
+    /** @param {number[]} list @param {number} idleMs */
+    const letGoEmptyOf = (list, idleMs)=>{
+        let kept = 0;
+        for (let i = 0; i < list.length; i++)
+        {
+            const s = list[i];
+            const one = segmentAt(s);
+            if (one.reach > 0 && buddyOf(s).empty()
+                && (idleMs === 0 || age(tick(), one.emptySince) >= idleMs))
+            {
+                letGoSegment(s);
+                continue;
+            }
+            list[kept++] = s;
+        }
+        const went = kept < list.length;
+        list.length = kept;
+        return went;
     };
 
     /*
@@ -763,24 +804,39 @@ export async function openKeeper(options){
     const offsetOf = place=>place % segmentBytes;
 
     /**
-     * Room for `length` bytes in a segment below `limit`: where it is (a
-     * place, `segmentOf`, `offsetOf`), or -1.
+     * Room for `length` bytes in a segment of `list` below `limit`: where it
+     * is (a place, `segmentOf`, `offsetOf`), or -1. Within the memory the
+     * segments hold first, so that none grows while another has room; then
+     * in one grown to the page past the block, where the budget has room.
      *
-     * @param {number} length @param {number} limit
+     * @param {number[]} list @param {number} length @param {number} limit
      */
-    const placeIn = (length, limit)=>{
-        for (let i = 0; i < liveSegments.length; i++)
+    const placeIn = (list, length, limit)=>{
+        for (let i = 0; i < list.length && list[i] < limit; i++)
         {
-            const at = liveSegments[i];
-            if (at >= limit)
-            {
-                break;
-            }
-            const offset = buddyOf(at).place(length);
+            const at = list[i];
+            const offset = buddyOf(at).place(length, segmentAt(at).reach);
             if (offset >= 0)
             {
                 return at * segmentBytes + offset;
             }
+        }
+        // A segment grows by a page at least: past the budget, none can.
+        for (let i = 0; i < list.length && list[i] < limit && account.fits(UNIT, kind); i++)
+        {
+            const at = list[i];
+            const offset = buddyOf(at).place(length);
+            if (offset < 0)
+            {
+                continue;
+            }
+            if (!grow(at, Math.max(segmentAt(at).reach, pageOf(offset + grainsOf(length)))))
+            {
+                buddyOf(at).give(offset, length);
+                continue;
+            }
+            keepSpare(list);
+            return at * segmentBytes + offset;
         }
         return -1;
     };
@@ -804,37 +860,37 @@ export async function openKeeper(options){
         {
             letGoEmpty(0);
         }
-        const one = segmentAt(at);
-        const buffer = /** @type {import('./shared.js').Growable} */ (one.buffer);
-        if (take(()=>growTo(buffer, bytes), bytes) === null)
+        if (!grow(at, bytes))
         {
             return -1;
         }
-        one.bytes = new Uint8Array(one.buffer, 0, bytes);
-        one.length = length;
+        segmentAt(at).length = length;
         spares.shift();
         keepSpareOwn();
         return at * segmentBytes;
     };
 
     /**
-     * Room for `length` bytes below segment `limit` as it is now, a segment
-     * made for it where the budget has room: where it is (a place), or -1.
+     * Room for `length` bytes below segment `limit` as it is now, empty
+     * segments let go of where the budget has none for it: where it is (a
+     * place), or -1.
      *
-     * @param {number} length @param {number} limit
+     * @param {number} length @param {number} limit @param {boolean} held  of held memory
      */
-    const placeNow = (length, limit)=>{
+    const placeNow = (length, limit, held)=>{
         if (length > large)
         {
             return placeOwn(length, limit);
         }
-        const found = placeIn(length, limit);
-        if (found >= 0 || !account.fits(segmentBytes, kind))
+        const list = held ? heldSegments : liveSegments;
+        const found = placeIn(list, length, limit);
+        if (found >= 0)
         {
             return found;
         }
-        const made = keepSpare();
-        return made >= 0 && made < limit ? placeIn(length, limit) : -1;
+        // A spare the engine would not make before is asked for again.
+        keepSpare(list);
+        return letGoEmpty(0) ? placeIn(list, length, limit) : -1;
     };
 
     /**
@@ -1048,19 +1104,21 @@ export async function openKeeper(options){
      * only with every other in the block of the size asked it lies in, and
      * only where all of them can leave; a large body's block is a whole
      * shared segment, let go of for the budget, and a body in an own segment
-     * frees the segment. A request no block can be formed for moves nothing.
-     * Where it is (a place, as `placeIn`'s), or -1.
+     * frees the segment; so is held memory's, which grows a segment of its
+     * own kind. A request no block can be formed for moves nothing. Where it
+     * is (a place, as `placeIn`'s), or -1.
      *
      * @param {number} length @param {number} limit  segments a writer has
      * @param {number} [spare]  the record the room is for, never cooled for it
+     * @param {boolean} [memory]  held memory (`F_HELD`)
      */
-    const room = (length, limit, spare = -1)=>{
-        let found = placeNow(length, limit);
+    const room = (length, limit, spare = -1, memory = false)=>{
+        let found = placeNow(length, limit, memory);
         if (found >= 0)
         {
             return found;
         }
-        const block = length > large ? segmentBytes : blockOf(length);
+        const block = length > large || memory ? segmentBytes : blockOf(length);
         /** Blocks found holding a body that cannot leave, by segment and offset: each looked at once. */
         /** @type {Set<number> | null} */
         let held = null;
@@ -1075,7 +1133,7 @@ export async function openKeeper(options){
                     fruitless.clear();
                     fruitlessTick = now;
                 }
-                const asked = `${placedOf(length)}:${limit}:${spare}`;
+                const asked = `${placedOf(length)}:${limit}:${spare}:${memory}`;
                 if (listed)
                 {
                     // A list made while the record spared was held for its
@@ -1127,7 +1185,7 @@ export async function openKeeper(options){
                     continue;
                 }
             }
-            found = placeNow(length, limit);
+            found = placeNow(length, limit, memory);
             if (found >= 0)
             {
                 return found;
@@ -1151,7 +1209,7 @@ export async function openKeeper(options){
             return true;
         }
         counts.roomAsked++;
-        letGoEmpty(0, true);
+        letGoEmpty(0);
         /** Shared segments found holding a body that cannot leave. @type {Set<number>} */
         const held = new Set();
         listOldest();
@@ -1174,7 +1232,7 @@ export async function openKeeper(options){
                 held.add(segment);
                 continue;
             }
-            letGoEmpty(0, true);
+            letGoEmpty(0);
         }
         const made = account.fits(bytes);
         counts[made ? 'roomMade' : 'roomRefused']++;
@@ -1661,7 +1719,7 @@ export async function openKeeper(options){
         if (found < 0)
         {
             store(id, COLD);
-            counts[beyond(known, length) ? 'refusedUnseen' : 'raiseFailed']++;
+            counts[beyond(known, length, false) ? 'refusedUnseen' : 'raiseFailed']++;
             return false;
         }
         const one = segmentAt(segment);
@@ -1699,7 +1757,6 @@ export async function openKeeper(options){
         set(id, R_TICK, tick());
         store(id, HOT);
         counts.raised++;
-        keepSpare();
         return true;
     };
 
@@ -2040,8 +2097,9 @@ export async function openKeeper(options){
     try
     {
         await load();
-        keepSpare();
+        keepSpare(liveSegments);
         keepSpareOwn();
+        keepSpare(heldSegments);
         openNextPack();
     }
     catch (e){
@@ -2114,15 +2172,16 @@ export async function openKeeper(options){
             // reservation refused leaves the name's body as it was.
             const held = state === HOT && Atomics.compareExchange(words, index.at(id) + R_STATE,
                 stateWord(HOT), stateWord(MOVING)) === stateWord(HOT);
+            const memory = (flags & F_HELD) !== 0;
             // The name's own body is not cooled for it: a reader that leaves
             // it meanwhile does not make it a candidate.
-            let found = room(length, known, id);
-            if (found < 0 && held && get(id, R_SEGMENT) < known && length <= large
+            let found = room(length, known, id, memory);
+            if (found < 0 && held && !memory && get(id, R_SEGMENT) < known && length <= large
                 && get(id, R_LENGTH) <= large && blockOf(length) <= blockOf(get(id, R_LENGTH)))
             {
                 // Its own block holds the new body: written over in place.
                 giveBack(id);
-                found = placeIn(length, known);
+                found = placeIn(liveSegments, length, known);
             }
             if (found < 0)
             {
@@ -2130,7 +2189,7 @@ export async function openKeeper(options){
                 {
                     store(id, HOT);
                 }
-                counts[beyond(known, length) ? 'refusedUnseen' : 'refusedRoom']++;
+                counts[beyond(known, length, memory) ? 'refusedUnseen' : 'refusedRoom']++;
                 return false;
             }
             if (held)
@@ -2167,7 +2226,6 @@ export async function openKeeper(options){
             nextMark = nextMark === MAX_MARK ? 1 : nextMark + 1;
             Atomics.store(words, index.at(id) + R_STATE, stateWord(WRITING, mark));
             counts.reserved++;
-            keepSpare();
             place[P_ID] = id;
             place[P_SEGMENT] = segment;
             place[P_OFFSET] = offset;
@@ -2599,8 +2657,8 @@ export async function openKeeper(options){
 
         /**
          * Hot bytes, segments, cold bytes and what was done, for the report:
-         * `segments` and `segmentBytes` those holding memory (a spare own
-         * segment holds none), `segmentsMade` and `segmentsLetGo` every one
+         * `segments` and `segmentBytes` those holding memory (a spare holds
+         * none), `segmentsMade` and `segmentsLetGo` every one
          * announced.
          */
         figures(){
@@ -2622,15 +2680,18 @@ export async function openKeeper(options){
                     coldBytes += get(id, R_LENGTH);
                 }
             }
-            const shares = liveSegments.map(buddyOf);
-            // The spares among them, of no bytes.
+            const sharedOnes = [...liveSegments, ...heldSegments];
+            const shares = sharedOnes.map(buddyOf);
+            // The own spares among them, of no bytes.
             const own = /** @type {NonNullable<typeof segments[0]>[]} */ (
                 segments.filter(one=>one?.buddy === null));
             const ownBytes = own.reduce((sum, one)=>sum + one.bytes.length, 0);
             return {
                 records: words[H_COUNT], names: named, freeRecords: free.length, hot, hotBytes, cold,
                 coldBytes,
-                segments: shares.length + own.filter(one=>one.length > 0).length,
+                // The spares among them, of no bytes, hold no memory.
+                segments: sharedOnes.filter(at=>segmentAt(at).reach > 0).length
+                    + own.filter(one=>one.length > 0).length,
                 segmentBytes: heldBytes,
                 placedBytes: shares.reduce((sum, one)=>sum + one.used(), ownBytes),
                 roundingBytes: shares.reduce((sum, one)=>sum + one.wasted(),

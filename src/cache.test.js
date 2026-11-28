@@ -253,12 +253,13 @@ test('a record given to another name between a reader\'s lookup and its entering
 
 test('memory held is never taken back: written and read in place by its holder for as long as it '
     + 'holds it, counted under its name, its room given back when it lets go', async()=>{
+    // A segment for the bodies, and the held memory's own room beside it.
     const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 10,
-        goneAfterMs: 20, budget: 8 * UNIT, segmentBytes: 8 * UNIT });
+        goneAfterMs: 20, budget: 10 * UNIT, segmentBytes: 8 * UNIT });
     const held = reader.hold('sound/table', 2 * UNIT);
     assert.ok(held, 'room for it');
-    // Half the segment held by bodies that never leave.
-    for (const name of ['pin1', 'pin2'])
+    // Three quarters of the segment held by bodies that never leave.
+    for (const name of ['pin1', 'pin2', 'pin3'])
     {
         assert.equal(reader.put(name, bodyOf(2 * UNIT, 9), F_ONLY_COPY | F_NO_DISK), true);
     }
@@ -275,10 +276,12 @@ test('memory held is never taken back: written and read in place by its holder f
     assert.equal(reader.put('b', bodyOf(2 * UNIT, 2)), true, 'a goes for b, the held memory stays');
     assert.equal(reader.look('a'), null);
     assert.equal(held[0], 77);
-    // Let go of, its room is the next body's.
+    // Let go of, its room is the budget's again.
+    assert.equal(keeper.figures().segmentBytes, 10 * UNIT);
     reader.abandon('sound/table');
     step(1);
-    assert.equal(reader.put('c', bodyOf(2 * UNIT, 3)), true, 'its room given back');
+    step(50);
+    assert.equal(keeper.figures().segmentBytes, 8 * UNIT, 'its room given back, its segment let go');
     assert.deepEqual(keeper.under('sound/').bodies, 0);
 });
 
@@ -380,7 +383,7 @@ test('a reader that reserved many names keeps the reservations still open and th
 test('an owner released takes its held memory with it: the room is the next body\'s at once, its'
     + ' holder\'s view no longer the cache\'s', async()=>{
     const { keeper, reader, step } = await cacheOf({ abandonAfterMs: 1000, coldAfterMs: 1e6,
-        goneAfterMs: 1e6, budget: 8 * UNIT, segmentBytes: 8 * UNIT });
+        goneAfterMs: 1e6, budget: 12 * UNIT, segmentBytes: 8 * UNIT });
     // An owner - a worker, a process - that went without letting its holds go.
     assert.ok(reader.hold('scratch/7/rows', 2 * UNIT));
     assert.ok(reader.hold('scratch/7/texels', 2 * UNIT));
@@ -504,8 +507,8 @@ test('a reserve no block can be formed for cools nothing', async()=>{
     {
         assert.equal(reader.look(`n${i}`), 'hot', `n${i}`);
     }
-    // Past what the budget holds beside the spare: refused before anything is looked at.
-    assert.equal(reader.reserve('larger', 32 * KIB), null);
+    // Past what the budget holds: refused before anything is looked at.
+    assert.equal(reader.reserve('larger', 64 * KIB + 1), null);
     assert.equal(keeper.figures().refusedLarge, 1);
 });
 
@@ -997,7 +1000,7 @@ test('memory let go of gives its room back at the next reserve of any name, not 
     {
         assert.ok(reader.hold(`rows/${i}`, 16 * 1024));
     }
-    assert.equal(reader.hold('frame/2', 16 * 1024), null, 'one segment, held whole');
+    assert.equal(reader.hold('frame/2', 16 * 1024), null, 'the budget held whole');
     reader.abandon('rows/0');
     assert.ok(reader.hold('frame/2', 16 * 1024), 'the room rows/0 let go of, with no sweep between');
     assert.equal(keeper.figures().abandoned, 1);

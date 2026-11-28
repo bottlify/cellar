@@ -99,7 +99,8 @@ for (const carrier of /** @type {const} */ (['channel', 'link']))
                 reserveFlags({ onlyCopy: true, disk: 'run', idle: 'stay' }), 1);
             assert.ok(place && Number.isInteger(place.id) && place.segment === 0);
             assert.deepEqual(calls.at(-1), ['reserve', 'a/1', 1000, F_ONLY_COPY | F_THIS_RUN | F_FOR_ROOM, 1]);
-            assert.equal(placeOf(client.keeper, 'a/2', 10, F_NO_DISK | F_HELD)?.segment, 0);
+            assert.notEqual(placeOf(client.keeper, 'a/2', 10, F_NO_DISK | F_HELD)?.segment ?? 0, 0,
+                'held memory apart from the bodies');
             assert.deepEqual(calls.at(-1).slice(3), [F_NO_DISK | F_HELD, Infinity], 'no segments said: every one');
             assert.equal(placeOf(client.keeper, 'a/3', 1 << 30), null, 'refused: past the budget');
 

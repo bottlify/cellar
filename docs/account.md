@@ -41,7 +41,7 @@ Options of `openAccount`: `holder`, the holder this view takes for (`RUN_HOLDER`
 
 `openKeeper({ account, kind })` takes its segments from the account as `kind` (`cache` unless said), bounded by that kind's ceiling or, without one, the limit; an account that bounds the kind by neither is refused. `openKeeper({ budget })` without an account makes one of its own, its kind's ceiling the budget. Either way `figures().account` is the account's report.
 
-`keeper.makeRoom(bytes)` is what a take of another kind asks for: empty segments let go, the spare among them, then the bodies no one reads, least recently read first, each with every other body of its shared segment so that the segment goes (a body of its own segment goes with it), to the disk where it goes there and out where it can be made again. A segment holding a body being read, or an only copy the disk cannot take, stays. True where the account has the room now; `figures()` counts `roomAsked`, `roomMade` and `roomRefused`.
+`keeper.makeRoom(bytes)` is what a take of another kind asks for: empty segments let go, then the bodies no one reads, least recently read first, each with every other body of its shared segment so that the segment goes (a body of its own segment goes with it), to the disk where it goes there and out where it can be made again. A segment holding a body being read, or an only copy the disk cannot take, stays. True where the account has the room now; `figures()` counts `roomAsked`, `roomMade` and `roomRefused`.
 
 ## Limits
 

@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ACCOUNT_UNIT, RUN_HOLDER, createAccountMemory, openAccount, openCharge } from './account.js';
 import { bodyOf, cacheOf } from './cache.fixture.js';
+import { memoryDisk } from './disk.fixture.js';
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
@@ -148,6 +149,32 @@ test('the keeper\'s segments are a kind of the account: a take of another that d
     assert.equal(refused, false);
     assert.equal(keeper.figures().roomRefused, 1);
     assert.equal(guest.report().refused, 1);
+});
+
+test('held memory pins only its own room: a take of another kind has every segment of bodies go'
+    + ' around a scratch held among them', async()=>{
+    const memory = createAccountMemory({ limit: 256 * KIB, kinds: { cache: 256 * KIB, guest: Infinity } });
+    const { keeper, reader } = await cacheOf({ account: memory, disk: memoryDisk() });
+    const guest = openAccount(memory, { room: bytes=>keeper.makeRoom(bytes) });
+    let n = 0;
+    for (; n < 20; n++)
+    {
+        assert.equal(reader.put(`b/${n}`, bodyOf(4 * KIB, n)), true);
+    }
+    const scratch = reader.hold('scratch/1', 4 * KIB);
+    assert.ok(scratch);
+    scratch.fill(7);
+    for (; n < 64; n++)
+    {
+        assert.equal(reader.put(`b/${n}`, bodyOf(4 * KIB, n)), true);
+    }
+    assert.equal(guest.take(252 * KIB, 'guest'), true, 'every byte but the scratch\'s');
+    const figures = keeper.figures();
+    assert.equal(figures.segmentBytes, 4 * KIB, 'the scratch\'s page, not a segment of 64 KiB');
+    assert.equal(figures.hot, 1);
+    assert.deepEqual([...scratch], Array(4 * KIB).fill(7), 'still its holder\'s, where it was');
+    assert.equal(reader.look('b/0'), 'cold', 'the bodies on the disk');
+    assert.equal(reader.look('b/63'), 'cold');
 });
 
 test('a keeper with a budget alone holds an account of its own', async()=>{
